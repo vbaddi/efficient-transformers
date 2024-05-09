@@ -17,12 +17,12 @@ from transformers.models.llama.modeling_llama import (
     LlamaDecoderLayer,
     LlamaForCausalLM,
     LlamaModel,
-    LlamaRMSNorm,
     apply_rotary_pos_emb,
     logger,
     repeat_kv,
 )
 
+from QEfficient.transformers.modeling_attn_mask_utils import QEffAttentionMaskConverter
 from QEfficient.transformers.modeling_outputs import (
     QEffBaseModelOutputWithPast,
     QEffCausalLMOutputWithPast,
@@ -66,7 +66,12 @@ def _make_causal_mask(
                 torch.tensor(min_val, dtype=dtype),
                 torch.tensor(0.0, dtype=dtype),
             )
-            return mask[None, None, :, :].expand(bsz, 1, tgt_len, past_key_values_length)
+            # agokhale CB
+            # RuntimeError: The expanded size of the tensor (3) must match the existing size (6) at non-singleton dimension 2.  Target sizes: [2, 1, 3, 128].  Tensor sizes: [1, 1, 6, 128]
+            # return mask[None, None, :, :].expand(bsz, 1, tgt_len, past_key_values_length)
+
+            return mask[:, None, :, :].expand(bsz, 1, tgt_len, past_key_values_length)
+
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 
 
@@ -99,11 +104,11 @@ class QEffLlamaAttention(LlamaAttention):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         cache_index: Optional[torch.LongTensor] = None,
+        batch_index: Optional[torch.LongTensor] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
-
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
@@ -144,16 +149,105 @@ class QEffLlamaAttention(LlamaAttention):
             if cache_index is not None:
                 seq_length = key_states.shape[2]
                 assert value_states.shape[2] == seq_length
-                kv_indices = torch.arange(seq_length) + cache_index
-                past_key_value[0][:, :, kv_indices] = key_states
-                past_key_value[1][:, :, kv_indices] = value_states
-                key_states, value_states = past_key_value
+                # vbaddi CB original code
+                kv_indices = torch.arange(seq_length).unsqueeze(0) + cache_index
+                # Sol 1 Start
+                # first permute past-kv so that the batch idx and kv indices are consecutive (onnx error for aten index_put())
+                past_key_value = tuple(
+                    [tensor.permute(0, 2, 1, 3) for tensor in (past_key_value[0], past_key_value[1])]
+                )
+                past_key_value[0][batch_index, kv_indices] = key_states.transpose(1, 2)
+                past_key_value[1][batch_index, kv_indices] = value_states.transpose(1, 2)
+                past_key_value = tuple(
+                    [tensor.permute(0, 2, 1, 3) for tensor in (past_key_value[0], past_key_value[1])]
+                )
+                # Sol 1 End
 
+                # Sol 1 Refactor Start
+                # past_k = past_key_value[0].permute(0, 2, 1, 3)
+                # past_v = past_key_value[1].permute(0, 2, 1, 3)
+                # past_k[batch_index, kv_indices] = key_states.transpose(1,2)
+                # past_v[batch_index, kv_indices] = value_states.transpose(1,2)
+                # past_k = past_k.permute(0, 2, 1, 3)
+                # past_v = past_v.permute(0, 2, 1, 3)
+                # TODO is there a way we can completely do away with this torch stack below?
+                # past_key_value = tuple(torch.stack([past_k,past_v], dim=0))
+                # breakpoint()
+                # Sol 1 Refactor End
+
+                # Sol 1 Flatten Start
+                # past_key_value = tuple(torch.stack([tensor.permute(0, 2, 1, 3) for tensor in (past_key_value[0], past_key_value[1])], dim=0))
+                # breakpoint()
+                # idx = range(bsz)
+                # past_key_value[0][batch_index.view(-1), :,kv_indices[idx]] = key_states.transpose(1,2)
+                # past_key_value[1][batch_index.view(-1), :,kv_indices[idx]] = value_states.transpose(1,2)
+                # past_key_value = tuple(torch.stack([tensor.permute(0, 2, 1, 3) for tensor in (past_key_value[0], past_key_value[1])], dim=0))
+                # Sol 1 Flatten End
+
+                # Sol 2 start
+                # for idx, bi in enumerate(batch_index.view(-1)):
+                #     # print(idx, bi)
+                #     # breakpoint()
+                #     past_key_value[0][bi,:,kv_indices[idx]] = key_states[bi]#.transpose(1,2)
+                #     past_key_value[1][bi,:,kv_indices[idx]] = value_states[bi]#.transpose(1,2)
+                # Sol2 end
+                # now reverse the permute
+
+                # ###separate prefill
+                # if batch_index.shape[0] == 1:
+                # #     # breakpoint()
+                #     past_key_value[0][batch_index[0,0],:,kv_indices] = key_states
+                #     past_key_value[1][batch_index[0,0],:,kv_indices] = value_states
+                # #     # breakpoint()
+
+                # else:
+                #     ###separate decode
+                #     for idx in range(4):#batch_index.shape[0]):
+                #         past_key_value[0][idx,:,kv_indices[idx]] = key_states[idx]
+                #         past_key_value[1][idx,:,kv_indices[idx]] = value_states[idx]
+
+                key_states = past_key_value[0][batch_index.view(-1)]
+                value_states = past_key_value[1][batch_index.view(-1)]
+
+            """
+            for i in range(4):
+                past_key_value[0][i, :, kv_indices] = key_states[0] if batch_index.view(-1)[0] == i else key_states[i]
+                if batch_index.view(-1)[0] == i:
+                    past_key_value[0][i,:,kv_indices[0]] = key_states[0]
+                else:
+                    past_key_value[0][i,:,kv_indices[i]] = key_states[i]
+                past_key_value[1][i, :, kv_indices] = value_states[0] if batch_index.view(-1).shape == 1 and batch_index.view(-1)[0] == i else value_states[i]
+            """
+            # agokhale CB new change to resolve the mismatch in kv shapes due to decode batch size and batch size difference with prefill specialization
+            # original code start:
+            # if cache_index is None:
+            #     print("concatenating past kv to key value states")
+            #     breakpoint()
+            #     key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            #     value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            # breakpoint()
+            # agokhale CB original code end
+
+            # if use_cache is True:
+            #     if cache_index is not None:
+            #         #past_key_value remains as is: concatenation of current kv and past kv
+            #         pass
+            #     else:
+            #         past_key_value = (key_states, value_states)
+            # else:
+            #     past_key_value = None
+
+        # agokhale CB original code
+        # past_key_value = (key_states, value_states) if use_cache else None
+        # agokhale CB new code start
+        if use_cache is True:
             if cache_index is None:
-                key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+                past_key_value = (key_states, value_states)
+            # else past key value remains the same: full history of kv cache for ctx len
+        else:
+            past_key_value = None
 
-        past_key_value = (key_states, value_states) if use_cache else None
+        # breakpoint()
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -172,7 +266,9 @@ class QEffLlamaAttention(LlamaAttention):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
+            # agokhale CB
+            # attn_weights = attn_weights + attention_mask
+            attn_weights = torch.where(attention_mask, torch.tensor(-10000.0, dtype=torch.float32), attn_weights)
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -214,6 +310,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         cache_index: Optional[torch.LongTensor] = None,
+        batch_index: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
@@ -242,6 +339,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
             position_ids=position_ids,
             past_key_value=past_key_value,
             cache_index=cache_index,
+            batch_index=batch_index,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
@@ -278,6 +376,7 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         cache_index: Optional[torch.LongTensor] = None,
+        batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -317,13 +416,13 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             cache_index=cache_index,
+            batch_index=batch_index,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -413,17 +512,14 @@ class QEffLlamaModel(LlamaModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         cache_index: Optional[torch.LongTensor] = None,
+        batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, QEffBaseModelOutputWithPast]:
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -449,8 +545,10 @@ class QEffLlamaModel(LlamaModel):
             seq_length_with_past = seq_length_with_past + past_key_values_length
             if cache_index is not None:
                 seq_length_with_past = past_key_values_length
-
+        # agokhale CB FIXME need to handle these cases where cache index, attn mask or position ids are none
+        # currently assuming they are always given as input
         if cache_index is not None:
+            # print("cache_index", cache_index)
             if position_ids is None:
                 if attention_mask is None:
                     device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -463,9 +561,13 @@ class QEffLlamaModel(LlamaModel):
                     position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
                 else:
                     # we are always passing attention_mask
+                    # print("attention_mask", attention_mask)
                     position_ids = (torch.cumsum(attention_mask, 1) - 1) * attention_mask
+                    # print(position_ids)
+                    # print("past_key_values_length", past_key_values_length)
                     if past_key_values_length > 0:
                         position_ids = position_ids[:, cache_index].unsqueeze(1)
+                        # print("position ids not getting updated here", position_ids)
 
         # kv prefill
         if position_ids is None:
@@ -492,16 +594,35 @@ class QEffLlamaModel(LlamaModel):
             )
 
         if past_key_values_length > 0 and cache_index is not None:
-            attention_mask[:, cache_index + seq_length - 1] = True
+            # agokhale CB
+            # attention_mask[:, cache_index + seq_length - 1] = True
+            # Can be skipped as part of future CB changes
+            attention_mask[batch_index, cache_index + seq_length - 1] = True
 
         pre_prepare_attention_mask = attention_mask
-        attention_mask = self._prepare_decoder_attention_mask(
+        # agokhale CB
+        # replacing with to_4d from modeling_attn_mask_utils for proper batch dimension
+        # attention_mask = self._prepare_decoder_attention_mask(
+        #     attention_mask,
+        #     (batch_size, seq_length),
+        #     inputs_embeds,
+        #     past_key_values_length,
+        #     cache_index,
+        # )
+        # agokhale CB new change
+        if batch_index is not None:
+            attention_mask = attention_mask[batch_index.view(-1)]
+        # breakpoint()
+        attention_mask = QEffAttentionMaskConverter(True).to_4d(
             attention_mask,
-            (batch_size, seq_length),
-            inputs_embeds,
-            past_key_values_length,
+            seq_length,
+            torch.float32,
+            past_key_values_length if past_key_values_length > 0 else seq_length,
             cache_index,
         )
+        # breakpoint()
+
+        # print(attention_mask.min(), attention_mask.max())
 
         hidden_states = inputs_embeds
 
@@ -551,6 +672,7 @@ class QEffLlamaModel(LlamaModel):
                     position_ids=position_ids,
                     past_key_value=past_key_value,
                     cache_index=cache_index,
+                    batch_index=batch_index,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                 )

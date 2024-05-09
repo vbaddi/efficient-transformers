@@ -1,10 +1,3 @@
-# -----------------------------------------------------------------------------
-#
-# Copyright (c)  2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-#
-# -----------------------------------------------------------------------------
-
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -54,7 +47,7 @@ class QEffAttentionMaskConverter(AttentionMaskConverter):
         key_value_length) shape and by adding a large negative bias to not-attended positions. If attention_mask is
         causal, a causal mask will be added.
 
-        Also, For Cloud AI 100:
+        Also, For Cloud AI100:
         Copied from AttentionMaskConverter: https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_attn_mask_utils.py
         The only differences are:
         - add new args cache idx for the kv retention
@@ -87,6 +80,13 @@ class QEffAttentionMaskConverter(AttentionMaskConverter):
         expanded_attn_mask = self._expand_mask(attention_mask_2d, dtype, tgt_len=input_shape[-1]).to(
             attention_mask_2d.device
         )
+        # if causal_4d_mask is not None:
+        #     print("Causal 4D Mask : ", causal_4d_mask.shape, causal_4d_mask)
+        #     print("expanded_attn_mask : ", expanded_attn_mask.shape, expanded_attn_mask)
+        #     expanded_attn_mask = causal_4d_mask | expanded_attn_mask
+
+        # # expanded_attn_mask + causal_4d_mask can cause some overflow
+        # expanded_4d_mask = expanded_attn_mask
         expanded_4d_mask = expanded_attn_mask if causal_4d_mask is None else expanded_attn_mask | causal_4d_mask
         return expanded_4d_mask
 
@@ -102,23 +102,26 @@ class QEffAttentionMaskConverter(AttentionMaskConverter):
         """
         Make causal mask used for bi-directional self-attention.
 
-        Also, For Cloud AI 100:
+        Also, For Cloud AI100:
         Copied from AttentionMaskConverter: https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_attn_mask_utils.py
         The only differences are:
         - add new args cache idx for the kv retention
         """
         bsz, tgt_len = input_ids_shape
         src_len = past_key_values_length if past_key_values_length > 0 else tgt_len + past_key_values_length
-        query_indices = torch.arange(tgt_len, device=device) + (cache_index if cache_index is not None else 0)
+        query_indices = torch.arange(tgt_len, device=device).expand(bsz, tgt_len) + (
+            cache_index if cache_index is not None else 0
+        )
         key_indices = torch.arange(src_len, device=device)
-        mask = query_indices.view(-1, 1) < key_indices.view(1, -1)
+        mask = query_indices.view(bsz, -1, 1) < key_indices.view(1, -1)
 
         # add lower triangular sliding window mask if necessary
         if sliding_window is not None:
             window_indices = query_indices - sliding_window + 1
             mask = mask | (key_indices.view(1, -1) < window_indices.view(-1, 1))
 
-        return mask[None, None, :, :].expand(bsz, 1, tgt_len, src_len)
+        # return mask[None, None, :, :].expand(bsz, 1, tgt_len, src_len)
+        return mask[:, None, :, :]
 
     @staticmethod
     def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):

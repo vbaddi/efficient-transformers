@@ -54,6 +54,7 @@ def main(
     cache_dir: str = Constants.CACHE_DIR,
     hf_token: str = None,
     batch_size: int = 1,
+    decode_batch_size: int = None,
     prompt_len: int = 32,
     ctx_len: int = 128,
     mxfp6: bool = False,
@@ -89,7 +90,14 @@ def main(
     if qpc_exists(qpc_dir_path):
         # execute
         logger.info("Pre-compiled qpc found! Trying to execute with given prompt")
-        cloud_ai_100_exec_kv(tokenizer=tokenizer, qpc=qpc_dir_path, device_id=device_group, prompt=prompt)
+        if decode_batch_size:
+            # Skip running the exising execution api, Since this requires handling application in different way
+            # for continous batching support.
+            # todo: vbaddi: integrate schduler app, once its up
+            logger.warning(f"Execution for CB is not available yet. But qpc path is here {qpc_dir_path}")
+            return
+        else:
+            cloud_ai_100_exec_kv(tokenizer=tokenizer, qpc=qpc_dir_path, device_id=device_group, prompt=prompt)
         return
 
     if onnx_exists(onnx_model_path):
@@ -100,6 +108,7 @@ def main(
             qpc_path=os.path.dirname(qpc_dir_path),
             num_cores=num_cores,
             batch_size=batch_size,
+            decode_batch_size=decode_batch_size,
             prompt_len=prompt_len,
             ctx_len=ctx_len,
             mxfp6=mxfp6,
@@ -110,7 +119,14 @@ def main(
         assert (
             generated_qpc_path == qpc_dir_path
         ), f"QPC files were generated at an unusual location, expected {qpc_dir_path}; got {generated_qpc_path}"
-        cloud_ai_100_exec_kv(tokenizer=tokenizer, qpc=generated_qpc_path, device_id=device_group, prompt=prompt)
+        if decode_batch_size:
+            # Skip running the exising execution api, Since this requires handling application in different way
+            # for continous batching support.
+            # todo: vbaddi: integrate schduler app, once its up
+            logger.warning(f"Execution for CB is not available yet. But qpc path is here {generated_qpc_path}")
+            return
+        else:
+            cloud_ai_100_exec_kv(tokenizer=tokenizer, qpc=generated_qpc_path, device_id=device_group, prompt=prompt)
         return
 
     #############################################
@@ -144,6 +160,7 @@ def main(
         qpc_path=os.path.dirname(qpc_dir_path),
         num_cores=num_cores,
         batch_size=batch_size,
+        decode_batch_size=decode_batch_size,
         prompt_len=prompt_len,
         ctx_len=ctx_len,
         mxfp6=mxfp6,
@@ -157,7 +174,14 @@ def main(
     logger.info(f"Compiled qpc files can be found at : {generated_qpc_path}")
 
     # Execute
-    cloud_ai_100_exec_kv(tokenizer=tokenizer, qpc=generated_qpc_path, device_id=device_group, prompt=prompt)
+    if decode_batch_size:
+        # Skip running the exising execution api, Since this requires handling application in different way
+        # for continous batching support.
+        # todo: vbaddi: integrate schduler app, once its up
+        logger.warning(f"Execution for CB is not available yet. But qpc path is here {generated_qpc_path}")
+        return
+    else:
+        cloud_ai_100_exec_kv(tokenizer=tokenizer, qpc=generated_qpc_path, device_id=device_group, prompt=prompt)
 
 
 if __name__ == "__main__":
@@ -172,6 +196,13 @@ if __name__ == "__main__":
         "--hf-token", "--hf_token", default=None, type=str, required=False, help="HF token id for private HF models"
     )
     parser.add_argument("--batch-size", "--batch_size", type=int, default=1, help="Batch size for text generation")
+    parser.add_argument(
+        "--decode-batch-size",
+        "--decode_batch_size",
+        type=int,
+        default=None,
+        help="Decode Batch size for text generation",
+    )
     parser.add_argument(
         "--prompt-len", "--prompt_len", default=32, type=int, help="Sequence length for text generation."
     )
