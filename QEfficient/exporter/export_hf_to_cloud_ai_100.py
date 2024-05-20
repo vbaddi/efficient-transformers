@@ -310,17 +310,24 @@ def convert_to_cloud_kvstyle(
     cache_index = torch.tensor(prompt_len)
 
     cache_index = torch.tensor([[prompt_len], [prompt_len], [prompt_len], [prompt_len]])
+    # todo: vbaddi: remove hard coding for the batch idx.
     batch_size = 4
     batch_index = torch.arange(batch_size).view(-1, 1)
 
     # inputs["input_ids"] = pt_outputs.logits.detach().argmax(2)
-    inputs["input_ids"] = tokenizer(["I have"] * 4, return_tensors="pt").input_ids
+    inputs["input_ids"] = tokenizer(["I have"] * batch_size, return_tensors="pt").input_ids
     inputs["position_ids"] = inputs["attention_mask"].sum(1, keepdim=True)
     import numpy as np
 
-    inputs["position_ids"] = torch.tensor(
-        np.arange(inputs["position_ids"][0, 0], inputs["position_ids"][0, 0] + 3).reshape((1, 3)), dtype=torch.int64
-    )
+    # todo: vbaddi: check the below code for scalability, currently workable for mistral and llama configs.
+    if model.config.architectures[0] == "MistralForCausalLM":
+        inputs["position_ids"] = torch.tensor(
+            np.arange(inputs["position_ids"][0, 0], inputs["position_ids"][0, 0] + 2).reshape((1, 2)), dtype=torch.int64
+        )
+    elif model.config.architectures[0] == "LlamaForCausalLM":
+        inputs["position_ids"] = torch.tensor(
+            np.arange(inputs["position_ids"][0, 0], inputs["position_ids"][0, 0] + 3).reshape((1, 3)), dtype=torch.int64
+        )
 
     inputs["position_ids"] = inputs["position_ids"].repeat(4, 1)
     inputs["attention_mask"] = inputs["attention_mask"].bool().repeat(2, 1)
@@ -341,6 +348,7 @@ def convert_to_cloud_kvstyle(
         pt_outputs = model(**inputs)
         inputs_cb = {}
         cache_index = torch.tensor([[prompt_len], [prompt_len], [prompt_len], [prompt_len]])
+        # todo: vbaddi: remove hard coding for the batch idx.
         batch_index = torch.arange(4).view(-1, 1)
         inputs_cb["input_ids"] = tokenizer(["I have"] * 4, return_tensors="pt").input_ids[:, :1]
         inputs_cb["position_ids"] = inputs["attention_mask"].sum(1, keepdim=True)
@@ -357,6 +365,7 @@ def convert_to_cloud_kvstyle(
         )
         output_names = list(pt_outputs.keys())
     except Exception as e:
+        # todo: vbaddi: raise a pytorch exception.
         print(f"Model {model_name} Execution failed in pytorch:%s", e)
 
     # Add pkv into output_names

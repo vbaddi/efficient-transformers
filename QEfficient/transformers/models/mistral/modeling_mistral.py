@@ -423,10 +423,13 @@ class QEffMistralModel(MistralModel):
         if cache_index is not None:
             attention_mask[batch_index, cache_index + seq_length - 1] = True
             attention_mask_RetainedState = attention_mask
-            attention_mask = attention_mask[batch_index.view(-1)]
+
         if past_key_values_length > 0 and cache_index is not None:
             # CB requirment
             attention_mask[batch_index, cache_index + seq_length - 1] = True
+
+        if batch_index is not None:
+            attention_mask = attention_mask[batch_index.view(-1)]
 
         if getattr(self.config, "_flash_attn_2_enabled", False):
             # 2d mask is passed through the layers
