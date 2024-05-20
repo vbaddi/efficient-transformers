@@ -15,21 +15,20 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
-
 from transformers.models.mistral.modeling_mistral import (
-    logger,
     MistralAttention,
     MistralConfig,
     MistralDecoderLayer,
     MistralFlashAttention2,
+    MistralForCausalLM,
     MistralMLP,
     MistralModel,
-    MistralForCausalLM,
+    logger,
 )
 
 from QEfficient.customop import CustomRMSNormAIC
 from QEfficient.transformers.modeling_attn_mask_utils import (
-    _qeff_prepare_4d_causal_attention_mask,
+    QEffAttentionMaskConverter,
 )
 from QEfficient.transformers.modeling_outputs import (
     QEffBaseModelOutputWithPast,
@@ -156,6 +155,7 @@ class QEffMistralAttention(MistralAttention):
         sin: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         cache_index: Optional[torch.LongTensor] = None,
+        batch_index: Optional[torch.LongTensor] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
@@ -184,10 +184,13 @@ class QEffMistralAttention(MistralAttention):
             # reuse k, v, self_attention
             kv_indices = torch.arange(q_len) + cache_index
             kv_indices = kv_indices % self.config.sliding_window
-            past_key_value[0][:, :, kv_indices] = key_states
-            past_key_value[1][:, :, kv_indices] = value_states
-            key_states, value_states = past_key_value
-
+            # todo: irajagop to introduce the custom op to fix the transpose and gather
+            past_key_value = tuple([tensor.permute(0, 2, 1, 3) for tensor in (past_key_value[0], past_key_value[1])])
+            past_key_value[0][batch_index, kv_indices] = key_states.transpose(1, 2)
+            past_key_value[1][batch_index, kv_indices] = value_states.transpose(1, 2)
+            past_key_value = tuple([tensor.permute(0, 2, 1, 3) for tensor in (past_key_value[0], past_key_value[1])])
+            key_states = past_key_value[0][batch_index.view(-1)]
+            value_states = past_key_value[1][batch_index.view(-1)]
         past_key_value = (key_states, value_states) if use_cache else None
 
         # repeat k/v heads if n_kv_heads < n_heads
@@ -278,6 +281,7 @@ class QEffMistralDecoderLayer(MistralDecoderLayer):
         sin: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         cache_index: Optional[torch.LongTensor] = None,
+        batch_index: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         **kwargs,
@@ -311,6 +315,7 @@ class QEffMistralDecoderLayer(MistralDecoderLayer):
             sin=sin,
             past_key_value=past_key_value,
             cache_index=cache_index,
+            batch_index=batch_index,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
@@ -347,6 +352,7 @@ class QEffMistralModel(MistralModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         cache_index: Optional[torch.LongTensor] = None,
+        batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -415,20 +421,33 @@ class QEffMistralModel(MistralModel):
                 )
 
         if cache_index is not None:
-            attention_mask[:, cache_index + seq_length - 1] = True
+            attention_mask[batch_index, cache_index + seq_length - 1] = True
             attention_mask_RetainedState = attention_mask
+            attention_mask = attention_mask[batch_index.view(-1)]
+        if past_key_values_length > 0 and cache_index is not None:
+            # CB requirment
+            attention_mask[batch_index, cache_index + seq_length - 1] = True
 
         if getattr(self.config, "_flash_attn_2_enabled", False):
             # 2d mask is passed through the layers
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
         else:
             # 4d mask is passed through the layers
-            attention_mask = _qeff_prepare_4d_causal_attention_mask(
+            # attention_mask = _qeff_prepare_4d_causal_attention_mask(
+            #     attention_mask,
+            #     (batch_size, seq_length),
+            #     inputs_embeds,
+            #     past_key_values_length,
+            #     self.config.sliding_window,
+            #     cache_index,
+            # )
+            if batch_index is not None:
+                attention_mask = attention_mask[batch_index.view(-1)]
+            attention_mask = QEffAttentionMaskConverter(True).to_4d(
                 attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_key_values_length,
-                self.config.sliding_window,
+                seq_length,
+                torch.float32,
+                past_key_values_length if past_key_values_length > 0 else seq_length,
                 cache_index,
             )
 
@@ -470,6 +489,7 @@ class QEffMistralModel(MistralModel):
                     sin=sin,
                     past_key_value=past_key_value,
                     cache_index=cache_index,
+                    batch_index=batch_index,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                 )
@@ -514,6 +534,7 @@ class QEffMistralForCausalLM(MistralForCausalLM):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         cache_index: Optional[torch.LongTensor] = None,
+        batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -560,6 +581,7 @@ class QEffMistralForCausalLM(MistralForCausalLM):
             position_ids=position_ids,
             past_key_values=past_key_values,
             cache_index=cache_index,
+            batch_index=batch_index,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
