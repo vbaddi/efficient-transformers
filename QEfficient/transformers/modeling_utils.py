@@ -84,6 +84,13 @@ my_architectures = ModelArchitectures(
     ]
 )
 
+get_lists_of_cb_qeff_models = ModelArchitectures(
+    [
+        LlamaForCausalLM.__name__,
+        MistralForCausalLM.__name__,
+    ]
+)
+
 # Define a transformers layers to QEff layers dictionary
 # While onboarding new models make sure to add the new layer maps to this dictionary.
 TransformersToQEffModulesDict = {
@@ -159,13 +166,12 @@ def transform(model: nn.Module, form_factor: str = "cloud") -> nn.Module:
     Returns:
     torch.nn.Module: PyTorch Module with replaced QEff layers.
     """
-    
+
     # Introducnig qeff_transformed attribue in model to check status of transform
     if getattr(model, "qeff_transformed", False):
         print("Model is already transformed")
         return model
 
-    
     if form_factor == "cloud":
         # Get Hash of all params for checking later
         prior_params_hash = get_params_hash(model)
@@ -192,7 +198,7 @@ def transform(model: nn.Module, form_factor: str = "cloud") -> nn.Module:
         transformers.modeling_attn_mask_utils._prepare_4d_attention_mask = _qeff_prepare_4d_attention_mask
         transformers.modeling_attn_mask_utils._prepare_4d_causal_attention_mask = _qeff_prepare_4d_causal_attention_mask
 
-        setattr(model,'qeff_transformed',True)
+        setattr(model, "qeff_transformed", True)
         return model.eval()
 
     elif form_factor == "edge":
