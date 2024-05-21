@@ -16,6 +16,7 @@ from typing import Dict, List, Tuple, Union
 import numpy as np
 import onnx
 import onnxruntime
+import onnxsim
 import torch
 from onnx import external_data_helper, numpy_helper
 
@@ -64,9 +65,12 @@ def export_onnx(
             dynamic_axes[iname] = {0: "batch_size", 1: "decoder_seq_len"}
         elif iname.startswith("past_"):
             # KV-cache (batch_size, num_heads, past_len, embed_dim)
-            dynamic_axes[iname] = {0: "batch_size", 2: "ctx_len"}
+            dynamic_axes[iname] = {0: "decode_batch_size", 2: "ctx_len"}
+        elif iname.endswith("_index"):
+            dynamic_axes[iname] = {0: "batch_size"}
+            # dynamic_axes[iname] = {0: "decode_batch_size"}
     if "past_key.0" in input_names and "attention_mask" in input_names:
-        dynamic_axes["attention_mask"] = {0: "batch_size", 1: "ctx_len"}
+        dynamic_axes["attention_mask"] = {0: "decode_batch_size", 1: "ctx_len"}
 
     # return input_names, output_names, model_base_name
     os.makedirs(f"{gen_models_path}_tmp", exist_ok=True)
@@ -80,7 +84,7 @@ def export_onnx(
             output_names=output_names,
             dynamic_axes=dynamic_axes,
             opset_version=13,
-            custom_opsets={"com.qti.aisw.onnx": 1},
+            verbose=False,
         )
     except Exception as e:
         error("Exporting to ONNX failed. {}".format(e))
@@ -99,19 +103,19 @@ def export_onnx(
     info("ONNX model uses external data. Saving as external data.")
     onnx.save_model(
         loaded_model,
-        os.path.join(gen_models_path, f"{model_base_name}.onnx"),
+        f"{gen_models_path}/{model_base_name}.onnx",
         save_as_external_data=True,
         all_tensors_to_one_file=True,
         location=f"{model_base_name}.onnxweights.data",
         size_threshold=1024,
         convert_attribute=False,
     )
-    onnx.checker.check_model(os.path.join(gen_models_path, f"{model_base_name}.onnx"))
+    onnx.checker.check_model(f"{gen_models_path}/{model_base_name}.onnx")
 
     # Run shape inference in intial model itself
     onnx.shape_inference.infer_shapes_path(
-        os.path.join(gen_models_path, f"{model_base_name}.onnx"),
-        os.path.join(gen_models_path, f"{model_base_name}.onnx"),
+        f"{gen_models_path}/{model_base_name}.onnx",
+        f"{gen_models_path}/{model_base_name}.onnx",
         True,
         True,
         True,
@@ -148,6 +152,12 @@ def save_onnx(model: Union[onnx.ModelProto, str], gen_models_path: str, model_ba
         onnx.save(model, f=f"{gen_models_path}/{model_base_name}.onnx")
 
     return model_base_name
+
+
+def simplify_onnx(gen_models_path: str, model_base_name: str, **kwargs) -> str:
+    simple_model, check = onnxsim.simplify(f"{gen_models_path}/{model_base_name}.onnx", **kwargs)
+    assert check, "Failed verification of simplified model"
+    return save_onnx(simple_model, gen_models_path, model_base_name + "_simplified")
 
 
 def remove_temp_file(file_path_model, file_path_weights):
