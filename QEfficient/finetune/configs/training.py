@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class train_config:
+class TrainConfig:
     model_name: str = "meta-llama/Llama-3.2-1B"
     tokenizer_name: str = "meta-llama/Llama-3.2-1B"
     run_validation: bool = True
@@ -27,7 +27,7 @@ class train_config:
     use_fp16: bool = True
     use_autocast: bool = True
     val_batch_size: int = 1
-    dataset = "samsum_dataset"
+    dataset = "gsm8k_dataset"
     peft_method: str = "lora"
     use_peft: bool = True  # use parameter efficient fine tuning
     from_peft_checkpoint: str = ""  # if not empty and use_peft=True, will load the peft checkpoint and resume the fine-tuning on that checkpoint
