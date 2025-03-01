@@ -127,6 +127,20 @@ from QEfficient.transformers.models.codegen.modeling_codegen import (
     QEffCodeGenForCausalLM,
     QEffCodeGenModel,
 )
+from QEfficient.transformers.models.deepseek.modeling_deepseek import (
+    QEffDeepseekV3Attention,
+    QEffDeepseekV3DecoderLayer,
+    QEffDeepseekV3ForCausalLM,
+    QEffDeepseekV3Model,
+    QEffDeepseekV3RotaryEmbedding,
+)
+from QEfficient.transformers.models.deepseek.modeling_deepseek_orig import (
+    DeepseekV3Attention,
+    DeepseekV3DecoderLayer,
+    DeepseekV3ForCausalLM,
+    DeepseekV3Model,
+    DeepseekV3RotaryEmbedding,
+)
 from QEfficient.transformers.models.falcon.modeling_falcon import (
     QEffFalconAttention,
     QEffFalconDecoderLayer,
@@ -258,6 +272,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         Phi3RMSNorm: CustomRMSNormAIC,
         Qwen2RMSNorm: CustomRMSNormAIC,
         MllamaTextRMSNorm: CustomRMSNormAIC,
+        DeepseekV3Attention: CustomRMSNormAIC,
     }
 
 
@@ -363,6 +378,12 @@ class KVCacheTransform(ModuleMappingTransform):
         WhisperDecoder: QEffWhisperDecoder,
         WhisperModel: QEffWhisperModel,
         WhisperForConditionalGeneration: QEffWhisperForConditionalGeneration,
+        # Deepseek
+        DeepseekV3Model: QEffDeepseekV3Model,
+        DeepseekV3Attention: QEffDeepseekV3Attention,
+        DeepseekV3DecoderLayer: QEffDeepseekV3DecoderLayer,
+        DeepseekV3ForCausalLM: QEffDeepseekV3ForCausalLM,
+        DeepseekV3RotaryEmbedding: QEffDeepseekV3RotaryEmbedding,
     }
 
     @classmethod
