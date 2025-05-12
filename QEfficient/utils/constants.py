@@ -17,7 +17,7 @@ ONNX_EXPORT_EXAMPLE_BATCH_SIZE = 1
 ONNX_EXPORT_EXAMPLE_SEQ_LEN = 32
 ONNX_EXPORT_EXAMPLE_FBS = 4
 ONNX_EXPORT_EXAMPLE_NLK = 2  # Number of Logits to Keep
-ONNX_EXPORT_OPSET = 13
+ONNX_EXPORT_OPSET = 14
 ONNX_EXPORT_MAX_NUM_IMAGES = 1
 ONNX_EXPORT_MAX_IMAGE_TILES = 4
 ONNX_EXPORT_IMAGE_WIDTH = 560
@@ -60,7 +60,7 @@ ONNX_EXPORT_EXAMPLE_BATCH_SIZE = 1
 ONNX_EXPORT_EXAMPLE_SEQ_LEN = 32
 ONNX_EXPORT_EXAMPLE_FBS = 4
 ONNX_EXPORT_EXAMPLE_NLK = 2  # Number of Logits to Keep
-ONNX_EXPORT_OPSET = 13
+ONNX_EXPORT_OPSET = 14
 
 COMPILER = ["/opt/qti-aic/exec/qaic-exec", "-aic-hw", "-aic-hw-version=2.0"]
 
@@ -92,15 +92,12 @@ class Constants:
     SEQ_LEN = 32
     CTX_LEN = 32
     PROMPT_LEN = 8
-    INPUT_STR = ["My name is"]
+    INPUT_STR = ["Who are you?"]
     GB = 2**30
     MAX_QPC_LIMIT = 30
     MAX_RETRIES = 10  # This constant will be used set the maximum number of retry attempts for downloading a model using huggingface_hub snapshot_download
     NUM_SPECULATIVE_TOKENS = 2
-    SDK_APPS_XML = "/opt/qti-aic/versions/apps.xml"  # This xml file is parsed to find out the SDK apps version.
-    SDK_PLATFORM_XML = (
-        "/opt/qti-aic/versions/platform.xml"  # This xml file is parsed to find out the SDK platform version.
-    )
+    SDK_APPS_XML = "/opt/qti-aic/versions/apps.xml"  # This xml file is parsed to find out the SDK version.
 
 
 @dataclass

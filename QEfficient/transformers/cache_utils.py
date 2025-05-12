@@ -36,6 +36,11 @@ class QEffDynamicCache(DynamicCache):
 
     """
 
+    # Return length actually usable by the layer
+
+    # def get_usable_length(self, kv_seq_len: int, layer_idx: int, sliding_window: Optional[int]):
+    #     return min(kv_seq_len, sliding_window) if sliding_window else kv_seq_len
+
     def write_only(self, key_states, value_states, layer_idx, cache_kwargs):
         """
         Write in the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
@@ -186,6 +191,11 @@ class QEffDynamicCache(DynamicCache):
             v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
 
         return k_out, v_out
+
+        # return key_states, value_states
+        # is_sliding = bool((layer_idx + 1) % 6)
+        # return_kvs = k_out, v_out if not is_sliding else key_states, value_states
+        # return return_kvs
 
     def update3D(
         self,

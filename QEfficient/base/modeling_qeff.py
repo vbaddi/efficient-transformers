@@ -345,6 +345,7 @@ class QEFFBaseModel(ABC):
             command.append(f"-mdp-load-partition-config={mdp_ts_json}")
 
         command.append(f"-aic-binary-dir={qpc_path}")
+        print(f"Compile Command: {command}")
         logger.info(f"Running compiler: {' '.join(command)}")
         try:
             subprocess.run(command, capture_output=True, check=True)
