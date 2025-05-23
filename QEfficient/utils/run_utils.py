@@ -51,7 +51,8 @@ class ApiRunner:
             full_batch_size=full_batch_size,
         )
 
-        self.gen_len = self.input_handler.ctx_len - self.input_handler.prompt_len
+        # self.gen_len = self.input_handler.ctx_len - self.input_handler.prompt_len
+        self.gen_len = 64
 
     @torch.no_grad()
     def run_hf_model_on_pytorch_CB(self, model_hf):
