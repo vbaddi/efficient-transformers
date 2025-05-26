@@ -842,7 +842,10 @@ class QEffTextGenerationBase:
             self._session.set_buffers({"logits": logits_out_placeholder})
         finished_sequences = decode_inputs["input_ids"] == self.tokenizer.eos_token_id
         num_token = 0
+        print(f'The total generation len is {generation_len}')
         for num_token in range(1, generation_len):
+            if num_token == 4096:
+                print(f'Crossing SLIDING WINDOW NOW: {num_token}')
             if streamer:
                 streamer.put(decode_inputs["input_ids"][0])
             outputs = self._session.run(decode_inputs)

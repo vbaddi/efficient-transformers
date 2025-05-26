@@ -6,6 +6,7 @@
 # -----------------------------------------------------------------------------
 
 
+# from sys import last_type
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -23,6 +24,73 @@ from QEfficient.customop import (
 )
 
 
+class QEffSlidingWindowCache(DynamicCache):
+
+   # -----------------------------------------------------------
+   def update(
+       self,
+       key_states:  torch.Tensor,          # (B, H, 1, D)
+       value_states: torch.Tensor,        # (B, H, 1, D)
+       layer_idx: int,
+       cache_kwargs: Optional[Dict[str, Any]] = None,
+   ):
+        # Update the cache
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+            k_out, v_out = key_states, value_states
+        else:
+            cache_kwargs = cache_kwargs or {}
+            position_ids = cache_kwargs.get("position_ids")# (1, N)
+            batch_index  = cache_kwargs.get("batch_index")
+            sliding_window = cache_kwargs.get("sliding_window")
+
+            # -------- 0. book-keep ------------------------------------------------
+            B, H, _, D = key_states.shape
+            ctx_len = self.key_cache[layer_idx].shape[2]
+
+            # -------- 1. write current token --------------------------------------
+            # pos       = int(position_ids[position_ids != -1][-1])  # absolute
+            w_idx       = torch.where(position_ids < 0, position_ids, position_ids % sliding_window)
+
+
+            CtxScatterFunc.apply(self.key_cache[layer_idx], w_idx, key_states)
+            CtxScatterFunc.apply(self.value_cache[layer_idx], w_idx, value_states)
+
+            # -------- 2. build gather list (chronological order) ------------------
+            last_valid_position = int(position_ids.max(1, keepdim=True).values.unsqueeze(1))
+            if last_valid_position + 1 <= sliding_window:
+                kv_len = last_valid_position + 1
+                gather_valid = torch.arange(kv_len)
+            else:
+                kv_len = sliding_window
+                base = (int(w_idx) + 1) % sliding_window
+                gather_valid = (torch.arange(kv_len) + base) % sliding_window
+
+            # -------- 3. pad to CL & make invalid mask ----------------------------
+            gather_full = torch.full((sliding_window,), -1, dtype=torch.long)
+            gather_full[:kv_len] = gather_valid
+            invalid_mask = gather_full.eq(-1)
+            safe_idx = gather_full.clamp(min=0)          # ONNX dislikes -1
+
+            # ----------- 3. build gather list, Onnx Safe
+            # ----------------------------------------------------------
+            # Step 4 – ONNX-friendly gather list + invalid_mask
+            # ----------------------------------------------------------
+
+            # -------- 4. gather contiguous view, zero invalid cols ----------------
+            if batch_index is not None:
+                k_view = CtxGatherFuncCB.apply(self.key_cache[layer_idx], batch_index, safe_idx)
+                v_view = CtxGatherFuncCB.apply(self.value_cache[layer_idx], batch_index, safe_idx)
+            else:
+                k_view = CtxGatherFunc.apply(self.key_cache[layer_idx], safe_idx)
+                v_view = CtxGatherFunc.apply(self.value_cache[layer_idx], safe_idx)
+
+            k_view.masked_fill_(invalid_mask.view(1, 1, -1, 1), 0)
+            v_view.masked_fill_(invalid_mask.view(1, 1, -1, 1), 0)
+
+            return k_view, v_view
+    
 class QEffDynamicCache(DynamicCache):
     """
     A cache that grows dynamically as more tokens are generated. This is the default for generative models.
@@ -146,7 +214,6 @@ class QEffDynamicCache(DynamicCache):
             batch_index = cache_kwargs.get("batch_index", None)  # Check and fetch batch index value form the kwargs
             sliding_window = cache_kwargs.get("sliding_window")
 
-            ring_ids = torch.where(position_ids < 0, position_ids, position_ids % sliding_window)
 
             # Scatter
             # if batch_index is not None:
@@ -161,8 +228,8 @@ class QEffDynamicCache(DynamicCache):
             #         self.value_cache[layer_idx], batch_index, scatter_position_ids, value_states
             #     )
             # else:
-            self.key_cache[layer_idx] = CtxScatterFunc.apply(self.key_cache[layer_idx], ring_ids, key_states)
-            self.value_cache[layer_idx] = CtxScatterFunc.apply(self.value_cache[layer_idx], ring_ids, value_states)
+            self.key_cache[layer_idx] = CtxScatterFunc.apply(self.key_cache[layer_idx], position_ids, key_states)
+            self.value_cache[layer_idx] = CtxScatterFunc.apply(self.value_cache[layer_idx], position_ids, value_states)
 
             k_out, v_out = self.key_cache[layer_idx], self.value_cache[layer_idx]
 

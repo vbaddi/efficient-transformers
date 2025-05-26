@@ -29,7 +29,7 @@ from transformers.models.mistral.modeling_mistral import (
     rotate_half,
 )
 
-from QEfficient.transformers.cache_utils import QEffDynamicCache
+from QEfficient.transformers.cache_utils import QEffDynamicCache, QEffSlidingWindowCache
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 
 
@@ -321,12 +321,13 @@ class QEffMistralModel(MistralModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        if position_ids.numel() == 1:
-            print("Decode Stage")
+        # if position_ids.numel() == 1:
+        #     print("Decode Stage")
 
         target_length = attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else past_seen_tokens
+        sliding_window_length = min(self.config.sliding_window, target_length)
         causal_mask = _create_causal_mask(
-            position_ids=position_ids, target_length=target_length, sliding_window=self.config.sliding_window
+            position_ids=position_ids, target_length=sliding_window_length, sliding_window=self.config.sliding_window
         )
 
         # print(f'= Causal Mask: {causal_mask.int()}')

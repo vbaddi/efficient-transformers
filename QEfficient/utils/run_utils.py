@@ -52,7 +52,7 @@ class ApiRunner:
         )
 
         # self.gen_len = self.input_handler.ctx_len - self.input_handler.prompt_len
-        self.gen_len = 64
+        self.gen_len = 8192
 
     @torch.no_grad()
     def run_hf_model_on_pytorch_CB(self, model_hf):
@@ -103,22 +103,33 @@ class ApiRunner:
         Return:
             :numpy.ndarray: Generated output tokens
         """
-        input_ids = self.input_handler.tokenizer.encode(self.input_handler.prompt[0], return_tensors="pt")
+        # input_ids = self.input_handler.tokenizer.encode(self.input_handler.prompt[0], return_tensors="pt")
 
-        input_ids_len = len(input_ids[0])
+        # input_ids_len = len(input_ids[0])
 
-        for _ in range(self.gen_len):
-            outputs = model_hf(input_ids)
-            logits = outputs.logits[:, -1, :]
-            predicted_token_id = torch.argmax(logits, dim=-1)
-            input_ids = torch.cat([input_ids, predicted_token_id.unsqueeze(1)], dim=-1)
+        # for _ in range(self.gen_len):
+        #     outputs = model_hf(input_ids)
+        #     logits = outputs.logits[:, -1, :]
+        #     predicted_token_id = torch.argmax(logits, dim=-1)
+        #     input_ids = torch.cat([input_ids, predicted_token_id.unsqueeze(1)], dim=-1)
 
-        generated_ids = input_ids[0][input_ids_len:].detach().numpy()
-        generated_text = self.input_handler.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # generated_ids = input_ids[0][input_ids_len:].detach().numpy()
+        # generated_text = self.input_handler.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # print("Original HF Model Outputs (Torch CPU): \n")
+        # print("Prompt:", repr(self.input_handler.prompt))
+        # print("Completion:", repr(generated_text))
+        # return generated_ids
+        model_inputs = self.input_handler.tokenizer(self.input_handler.prompt[0], return_tensors="pt")
+        input_len = model_inputs["input_ids"].shape[-1]
+        with torch.inference_mode():
+            generation = model_hf.generate(**model_inputs, max_new_tokens=self.gen_len, do_sample=False)
+            generation = generation[0][input_len:]
+
+        decoded = self.input_handler.tokenizer.decode(generation, skip_special_tokens=True)
         print("Original HF Model Outputs (Torch CPU): \n")
         print("Prompt:", repr(self.input_handler.prompt))
-        print("Completion:", repr(generated_text))
-        return generated_ids
+        print("Completion:", repr(decoded))
+        return decoded
 
     def run_kv_model_on_pytorch(self, model):
         """
