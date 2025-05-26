@@ -29,7 +29,7 @@ from transformers.models.mistral.modeling_mistral import (
     rotate_half,
 )
 
-from QEfficient.transformers.cache_utils import QEffDynamicCache
+from QEfficient.transformers.cache_utils import QEffDynamicCache, QEffSlidingWindowCache
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 
 
@@ -159,13 +159,25 @@ class QEffMistralAttention(MistralAttention):
         kv_seq_len = key_states.shape[-2]
 
         kv_seq_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len * 2 + self.config.sliding_window)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len * 10)
+
+        # print(f'= Rope Ids: {position_ids}')
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+        sliding_window = min(self.config.sliding_window, kv_seq_len)
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "batch_index": batch_index, "position_ids": position_ids}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            cache_kwargs = {
+                "sin": sin,
+                "cos": cos,
+                "batch_index": batch_index,
+                "position_ids": position_ids,
+                "sliding_window": sliding_window,
+            }
+            key_states, value_states = past_key_value.sliding_update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
         attention_interface: Callable = eager_attention_forward
 
@@ -309,10 +321,16 @@ class QEffMistralModel(MistralModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
+        # if position_ids.numel() == 1:
+        #     print("Decode Stage")
+
         target_length = attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else past_seen_tokens
+        sliding_window_length = min(self.config.sliding_window, target_length)
         causal_mask = _create_causal_mask(
-            position_ids=position_ids, target_length=target_length, sliding_window=self.config.sliding_window
+            position_ids=position_ids, target_length=sliding_window_length, sliding_window=self.config.sliding_window
         )
+
+        # print(f'= Causal Mask: {causal_mask.int()}')
 
         hidden_states = inputs_embeds
 

@@ -10,6 +10,33 @@ from typing import Optional
 import torch
 
 
+def _create_causal_mask_sliding(
+    position_ids: torch.Tensor,  # (bs, qlen)
+    sliding_window: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Returns a boolean mask of shape **(bs, 1, qlen, width)**
+
+    • dense mode  (`sliding_window=None`) reproduces a full causal mask.
+    • sliding-window mode keeps only the previous `W` tokens visible.
+    """
+    # ------------------------------- dense causal ---------------------------
+    if sliding_window is None:
+        q = position_ids.unsqueeze(-1)  # (bs,qlen,1)
+        k = torch.arange(position_ids.shape[-1], device=q.device)  # (width,)
+        k = k.view(1, 1, -1)
+        return (k > q).unsqueeze(1)  # masked=1
+
+    # ------------------------- sliding-window causal ------------------------
+    W = sliding_window
+    q = position_ids  # (bs,qlen)
+    window_lo = (q.unsqueeze(-1) - (W - 1)).clamp(min=0)  # (bs,qlen,1).
+    kv_abs = window_lo + torch.arange(W)  # (bs,qlen,W)
+    too_new = kv_abs > q.unsqueeze(-1)
+    too_old = kv_abs < window_lo
+    return (too_new | too_old).unsqueeze(1)
+
+
 def _create_causal_mask(
     position_ids,
     target_length,
@@ -35,6 +62,7 @@ def _create_causal_mask(
         attention_mask = causal_mask
 
         window_indices = query_indices - sliding_window + 1
+        # window_indices = query_indices - sliding_window
         window_mask = kv_indices < window_indices
         attention_mask = attention_mask | window_mask
         attention_mask = attention_mask.unsqueeze(1)
