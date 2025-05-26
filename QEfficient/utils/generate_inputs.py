@@ -12,6 +12,7 @@ import torch
 from QEfficient.utils import (
     get_num_layers_from_config,
     get_padding_shape_from_config,
+    get_sliding_window_shapes,
     padding_check_and_fix,
 )
 
@@ -41,6 +42,11 @@ class InputHandler:
         # self.padding_shape = get_padding_shape_from_config(
         #     config=config, batch_size=full_batch_size if full_batch_size else batch_size, seq_len=ctx_len
         # )
+        layer_switch = config.sliding_window_pattern if hasattr(config, "sliding_window_pattern") else 2 
+        self.is_sliding = torch.tensor([bool((i + 1) % layer_switch) for i in range(config.num_hidden_layers)], dtype=torch.bool)
+        self.global_shape, self.sliding_shape = get_sliding_window_shapes(
+            config=config, batch_size=full_batch_size if full_batch_size else batch_size, seq_len=ctx_len
+        )
         self.past_key_values = get_padding_shape_from_config(
             config=config, batch_size=full_batch_size if full_batch_size else batch_size, seq_len=ctx_len
         )
@@ -159,8 +165,9 @@ class InputHandler:
         ).astype(np.int64)
 
         for i in range(self.n_layer):
-            inputs["past_key." + str(i)] = np.zeros((self.padding_shape), dtype=np.float32)
-            inputs["past_value." + str(i)] = np.zeros((self.padding_shape), dtype=np.float32)
+            cache_shape = self.global_shape if not self.is_sliding[i] else self.sliding_shape
+            inputs["past_key." + str(i)] = np.zeros((cache_shape), dtype=np.float32)
+            inputs["past_value." + str(i)] = np.zeros((cache_shape), dtype=np.float32)
 
         return inputs
 

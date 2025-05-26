@@ -48,7 +48,7 @@ from QEfficient.transformers.quantizers.quant_transforms import (
     FP8DeQuantLinearToLinearTransform,
     GPTQToMatmulNbitsTransform,
 )
-from QEfficient.utils import constants, get_padding_shape_from_config
+from QEfficient.utils import constants, get_padding_shape_from_config, get_sliding_window_shapes
 from QEfficient.utils.cache import to_hashable
 from QEfficient.utils.logging_utils import logger
 
@@ -1436,9 +1436,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         """
         bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
         seq_len: int = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
-        sliding_param: int = 32
         fbs = constants.ONNX_EXPORT_EXAMPLE_FBS
-        kv_cache_shape = get_padding_shape_from_config(
+        kv_global_shape, kv_sliding_shape = get_sliding_window_shapes(
             self.model.config, fbs if self.continuous_batching else bs, seq_len
         )
         example_inputs = {
@@ -1450,7 +1449,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             "input_ids": {0: "batch_size", 1: "seq_len"},
             "position_ids": {0: "batch_size", 1: "seq_len"},
         }
-        if len(kv_cache_shape) == 3:  # For GPTBigCode arch the pkv is 3d
+        if len(kv_global_shape) == 3:  # For GPTBigCode arch the pkv is 3d
             pkv_dynamic_axes = {
                 0: "full_batch_size" if self.continuous_batching else "batch_size",
                 1: "ctx_len",
@@ -1473,12 +1472,12 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         is_sliding = torch.tensor(
             [bool((i + 1) % layer_switch) for i in range(self.model.config.num_hidden_layers)], dtype=torch.bool
         )
-        global_cache_shape = [1, 4, seq_len, 256]
-        sliding_cache_shape = [1, 4, sliding_param, 256]
+        # global_cache_shape = [1, 4, seq_len, 256]
+        # sliding_cache_shape = [1, 4, sliding_param, 256]
 
         for i in range(self.model.config.num_hidden_layers):
             for kv in ["key", "value"]:
-                cache_shape = global_cache_shape if not is_sliding[i] else sliding_cache_shape
+                cache_shape = kv_global_shape if not is_sliding[i] else kv_sliding_shape
                 apply_dynamic_axes = pkv_dynamic_axes if not is_sliding[i] else pkv_dynamic_sliding_axes
                 example_inputs["past_key_values"][i].append(torch.zeros(cache_shape, dtype=torch.float32))
                 dynamic_axes[f"past_{kv}.{i}"] = apply_dynamic_axes

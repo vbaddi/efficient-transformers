@@ -233,47 +233,27 @@ class QEffGemma3Attention(Gemma3Attention):
             kv_seq_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
         if self.is_sliding:
-            cos, sin = self.rotary_emb_local(value_states, seq_len=kv_seq_len)
-            # pos_ids = position_ids % self.sliding_window
+            cos, sin = self.rotary_emb_local(value_states, seq_len=past_key_value[5][0].shape[-2] * 2)
         else:
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-            # pos_ids = position_ids
+            cos, sin = self.rotary_emb(value_states, seq_len=past_key_value[5][0].shape[-2] * 2)
 
-        # 2  rotary
-        # past_len = past_key_value.get_seq_length() if past_key_value is not None else 0
-        # kv_seq_len = past_len + q_len
-        # window = self.window
-        # if window is not None and kv_seq_len > window:
-        #     pos_ids = (position_ids % window) if position_ids is not None else None
-        #     kv_seq_len_eff = window
-        #     cos, sin = self.rotary_emb_local(query_states, seq_len=kv_seq_len_eff)
-        # else:
-        #     pos_ids = position_ids
-        #     kv_seq_len_eff = kv_seq_len
-        #     cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len_eff)
 
+        sliding_window = min(self.config.sliding_window, kv_seq_len)
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "batch_index": batch_index, "position_ids": position_ids}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # 4  window crop (safety if cache is “static”)
-        # if window is not None and key_states.size(-2) > window:
-        #     key_states = key_states[:, :, -window:, :]
-        #     value_states = value_states[:, :, -window:, :]
+            if self.is_sliding:
+                cache_kwargs = {"sin": sin, "cos": cos, "batch_index": batch_index, "position_ids": position_ids, "sliding_window": sliding_window}
+                key_states, value_states = past_key_value.sliding_update(key_states, value_states, self.layer_idx, cache_kwargs)
+            else:
+                cache_kwargs = {"sin": sin, "cos": cos, "batch_index": batch_index, "position_ids": position_ids}
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
 
-        # attention_mask = _create_causal_mask_sliding_window(
-        #     q_len=pos_ids,
-        #     k_len=key_states.size(-2),
-        #     dtype=hidden_states.dtype,
-        #     sliding_window=window,
-        # )
         if attention_mask is not None:  # no matter the length, we just slice it
             attn_weights = torch.where(attention_mask.bool(), torch.tensor(-10000.0, dtype=torch.float32), attn_weights)
 
@@ -301,7 +281,8 @@ class QEffGemma3DecoderLayer(Gemma3DecoderLayer):
         hidden_states: torch.Tensor,
         position_embeddings_global: torch.Tensor,
         position_embeddings_local: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask_global: Optional[torch.Tensor] = None,
+        attention_mask_local: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         batch_index: Optional[torch.LongTensor] = None,
@@ -311,58 +292,63 @@ class QEffGemma3DecoderLayer(Gemma3DecoderLayer):
         last_cache_position: int = 0,
         **kwargs,
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        def custom_tril(x):
-            n, m = x.shape[-2], x.shape[-1]
-            row_indices = torch.arange(n).view(-1, 1)
-            col_indices = torch.arange(m).view(1, -1)
-            mask = col_indices <= row_indices - self.sliding_window
-            return x * mask
+        # def custom_tril(x):
+        #     n, m = x.shape[-2], x.shape[-1]
+        #     row_indices = torch.arange(n).view(-1, 1)
+        #     col_indices = torch.arange(m).view(1, -1)
+        #     mask = col_indices <= row_indices - self.sliding_window
+        #     return x * mask
 
-        # if self.is_sliding and attention_mask is not None:  # efficient SDPA and no padding
-        #     # In prefill, we may be larger than sliding window
-        #     effective_seq_len = max(position_ids.shape[0], self.sliding_window)
+        # # if self.is_sliding and attention_mask is not None:  # efficient SDPA and no padding
+        # #     # In prefill, we may be larger than sliding window
+        # #     effective_seq_len = max(position_ids.shape[0], self.sliding_window)
 
-        #     # effective_seq_len = cache_position.shape[0]
+        # #     # effective_seq_len = cache_position.shape[0]
 
-        #     # For FA2, the mask is 2D and is of shape [bs, processed_tokens] (not [bs, max_cache_len]),
-        #     # thus we must slice from the right (at most `effective_seq_len` elements)
-        #     if self.config._attn_implementation == "flash_attention_2":
-        #         attention_mask = attention_mask[:, -effective_seq_len:]
-        #     # Otherwise, the mask is 4D of shape [bs, 1, query_len, max_cache_len] thus we must slice
-        #     # from the left, with an offset if we are beyond the sliding window
-        #     else:
-        #         min_dtype = -10000.0
-        #         # sliding_window_mask = torch.tril(
-        #         #     torch.ones_like(attention_mask, dtype=torch.bool), diagonal=-self.sliding_window
-        #         # )
-        #         sliding_window_mask = custom_tril(torch.ones_like(attention_mask, dtype=torch.bool))
-        #         attention_mask = torch.where(sliding_window_mask, min_dtype, attention_mask)
-        #         # In case we are beyond the sliding window, we need to correctly offset the mask slicing
-        #         # `last_cache_position` is equivalent to `cache_position[-1]` but without breaking dynamo
-        #         offset = last_cache_position - effective_seq_len
-        #         # Should only be used when beyond the sliding window (i.e. offset > 0)
-        #         offset = max(0, offset)
-        #         attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]
+        # #     # For FA2, the mask is 2D and is of shape [bs, processed_tokens] (not [bs, max_cache_len]),
+        # #     # thus we must slice from the right (at most `effective_seq_len` elements)
+        # #     if self.config._attn_implementation == "flash_attention_2":
+        # #         attention_mask = attention_mask[:, -effective_seq_len:]
+        # #     # Otherwise, the mask is 4D of shape [bs, 1, query_len, max_cache_len] thus we must slice
+        # #     # from the left, with an offset if we are beyond the sliding window
+        # #     else:
+        # #         min_dtype = -10000.0
+        # #         # sliding_window_mask = torch.tril(
+        # #         #     torch.ones_like(attention_mask, dtype=torch.bool), diagonal=-self.sliding_window
+        # #         # )
+        # #         sliding_window_mask = custom_tril(torch.ones_like(attention_mask, dtype=torch.bool))
+        # #         attention_mask = torch.where(sliding_window_mask, min_dtype, attention_mask)
+        # #         # In case we are beyond the sliding window, we need to correctly offset the mask slicing
+        # #         # `last_cache_position` is equivalent to `cache_position[-1]` but without breaking dynamo
+        # #         offset = last_cache_position - effective_seq_len
+        # #         # Should only be used when beyond the sliding window (i.e. offset > 0)
+        # #         offset = max(0, offset)
+        # #         attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]
 
-        # TODO: vbaddi: V2, Attention mask for sliding window computations
-        past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
+        # # TODO: vbaddi: V2, Attention mask for sliding window computations
+        # past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
+        # if self.is_sliding:
+        #     position_ids = position_ids % self.sliding_window
+        #     attention_mask = _create_causal_mask(position_ids=position_ids, target_length=past_seen_tokens)
+        #     effective_seq_len = max(position_ids.shape[1], self.sliding_window)
+
+        #     min_dtype = -10000.0
+        #     sliding_window_mask = custom_tril(torch.ones_like(attention_mask, dtype=torch.bool))
+        #     attention_mask = torch.where(sliding_window_mask, min_dtype, attention_mask)
+        #     offset = last_cache_position - effective_seq_len
+        #     offset = max(0, offset)
+        #     attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]
+
+        # else:
+        #     # position_ids = position_ids % self.sliding_window
+        #     attention_mask = _create_causal_mask(
+        #         position_ids=position_ids, target_length=past_key_value.key_cache[5].shape[-2]
+        #     )
+
         if self.is_sliding:
-            position_ids = position_ids % self.sliding_window
-            attention_mask = _create_causal_mask(position_ids=position_ids, target_length=past_seen_tokens)
-            effective_seq_len = max(position_ids.shape[1], self.sliding_window)
-
-            min_dtype = -10000.0
-            sliding_window_mask = custom_tril(torch.ones_like(attention_mask, dtype=torch.bool))
-            attention_mask = torch.where(sliding_window_mask, min_dtype, attention_mask)
-            offset = last_cache_position - effective_seq_len
-            offset = max(0, offset)
-            attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]
-
+            attention_mask = attention_mask_local
         else:
-            # position_ids = position_ids % self.sliding_window
-            attention_mask = _create_causal_mask(
-                position_ids=position_ids, target_length=past_key_value.key_cache[5].shape[-2]
-            )
+            attention_mask = attention_mask_global
 
         residual = hidden_states
         # hidden_states = hidden_states.clamp_(-65504, 65504)
@@ -480,7 +466,10 @@ class QEffGemma3TextModel(Gemma3TextModel):
         # Better method to compute the target_length, for now the sliding global window length using past_key_values
         # causal_mask = _create_causal_mask(position_ids=position_ids, target_length=past_seen_tokens)
         # causal_mask = _create_causal_mask(position_ids=position_ids, target_length=past_key_values[5][0].shape[-2])
-        causal_mask = None
+        # causal_mask = None
+
+        causal_mask_global = _create_causal_mask(position_ids=position_ids, target_length=past_key_values[5][0].shape[-2])
+        causal_mask_local = _create_causal_mask(position_ids=position_ids, target_length=self.config.sliding_window, sliding_window=self.config.sliding_window)
 
         # embed positions
         hidden_states = inputs_embeds
@@ -502,7 +491,8 @@ class QEffGemma3TextModel(Gemma3TextModel):
                     hidden_states,
                     position_embeddings_global,
                     position_embeddings_local,
-                    causal_mask,
+                    causal_mask_global,
+                    causal_mask_local,
                     position_ids,
                     past_key_values,
                     output_attentions,
@@ -515,7 +505,8 @@ class QEffGemma3TextModel(Gemma3TextModel):
                     hidden_states,
                     position_embeddings_global=position_embeddings_global,
                     position_embeddings_local=position_embeddings_local,
-                    attention_mask=causal_mask,
+                    attention_mask_global=causal_mask_global,
+                    attention_mask_local=causal_mask_local,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
                     batch_index=batch_index,
