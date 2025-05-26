@@ -48,7 +48,7 @@ from QEfficient.transformers.quantizers.quant_transforms import (
     FP8DeQuantLinearToLinearTransform,
     GPTQToMatmulNbitsTransform,
 )
-from QEfficient.utils import constants, get_padding_shape_from_config
+from QEfficient.utils import constants, get_padding_shape_from_config, get_sliding_window_shapes
 from QEfficient.utils.cache import to_hashable
 from QEfficient.utils.logging_utils import logger
 
@@ -691,6 +691,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 aic_num_cores=num_cores,
                 custom_io=custom_io_lang,
                 mxint8_kv_cache=mxint8_kv_cache,
+                node_precision_info="/home/vbaddi/.cache/qeff_models/fp32_nodes_rmsnorm.yaml",
                 **compiler_options,
             )
         return self.qpc_path
@@ -799,7 +800,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         vision_session.deactivate()
         lang_session.activate()
 
-        lang_session.set_buffers(vision_outputs)
+        # lang_session.set_buffers(vision_outputs)
+        lang_inputs["vision_embeds"] = vision_outputs["vision_embeds"]
 
         # Run prefill
         for i in range(num_chunks):
@@ -1445,7 +1447,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
         seq_len: int = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
         fbs = constants.ONNX_EXPORT_EXAMPLE_FBS
-        kv_cache_shape = get_padding_shape_from_config(
+        kv_global_shape, kv_sliding_shape = get_sliding_window_shapes(
             self.model.config, fbs if self.continuous_batching else bs, seq_len
         )
         example_inputs = {
@@ -1457,7 +1459,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             "input_ids": {0: "batch_size", 1: "seq_len"},
             "position_ids": {0: "batch_size", 1: "seq_len"},
         }
-        if len(kv_cache_shape) == 3:  # For GPTBigCode arch the pkv is 3d
+        if len(kv_global_shape) == 3:  # For GPTBigCode arch the pkv is 3d
             pkv_dynamic_axes = {
                 0: "full_batch_size" if self.continuous_batching else "batch_size",
                 1: "ctx_len",
@@ -1467,13 +1469,35 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 0: "full_batch_size" if self.continuous_batching else "batch_size",
                 2: "ctx_len",
             }
+            pkv_dynamic_sliding_axes = {
+                0: "full_batch_size" if self.continuous_batching else "batch_size",
+                2: "sliding_window",
+            }
+
         output_names = ["logits"]
 
-        for i in range(self.num_layers):
+        layer_switch = (
+            self.model.config.sliding_window_pattern if hasattr(self.model.config, "sliding_window_pattern") else 2
+        )  # 2 is for BC
+        is_sliding = torch.tensor(
+            [bool((i + 1) % layer_switch) for i in range(self.model.config.num_hidden_layers)], dtype=torch.bool
+        )
+        # global_cache_shape = [1, 4, seq_len, 256]
+        # sliding_cache_shape = [1, 4, sliding_param, 256]
+
+        for i in range(self.model.config.num_hidden_layers):
             for kv in ["key", "value"]:
-                example_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=torch.float32))
-                dynamic_axes[f"past_{kv}.{i}"] = pkv_dynamic_axes
+                cache_shape = kv_global_shape if not is_sliding[i] else kv_sliding_shape
+                apply_dynamic_axes = pkv_dynamic_axes if not is_sliding[i] else pkv_dynamic_sliding_axes
+                example_inputs["past_key_values"][i].append(torch.zeros(cache_shape, dtype=torch.float32))
+                dynamic_axes[f"past_{kv}.{i}"] = apply_dynamic_axes
                 output_names.append(f"past_{kv}.{i}_RetainedState")
+
+        # for i in range(self.num_layers):
+        #     for kv in ["key", "value"]:
+        #         example_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=torch.float32))
+        #         dynamic_axes[f"past_{kv}.{i}"] = pkv_dynamic_axes
+        #         output_names.append(f"past_{kv}.{i}_RetainedState")
 
         if self.continuous_batching:
             example_inputs["batch_index"] = torch.arange(bs).view(bs, 1)
@@ -1503,6 +1527,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             "batch_size": 1 if self.continuous_batching else batch_size,
             "seq_len": prefill_seq_len,
             "ctx_len": ctx_len,
+            "sliding_window": self.model.config.sliding_window,
             "num_logits_to_keep": 1 if self.is_tlm else None,
         }
         if self.continuous_batching:
@@ -1528,6 +1553,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             "batch_size": full_batch_size if self.continuous_batching else batch_size,
             "seq_len": (num_speculative_tokens + 1) if self.is_tlm else 1,
             "ctx_len": ctx_len,
+            "sliding_window": self.model.config.sliding_window,
             "num_logits_to_keep": (num_speculative_tokens + 1) if self.is_tlm else None,
         }
         if self.continuous_batching:
@@ -1644,11 +1670,6 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             mxint8_kv_cache=mxint8_kv_cache,
             **compiler_options,
         )
-
-        if compiler_options.get("io_encrypt", None):
-            logger.warning(
-                "Compilation for IO-Encrypt has been successfully completed. However, Efficient-Transformers do not support IO-Encrypt execution. Please run the execution separately with QPC compiled without io-encrypt."
-            )
 
         return qpc_path
 

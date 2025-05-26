@@ -16,6 +16,7 @@ from QEfficient.utils._utils import (  # noqa: F401
     get_num_layers_vlm,
     get_onnx_dir_name,
     get_padding_shape_from_config,
+    get_sliding_window_shapes,
     get_padding_shape_vlm,
     get_qpc_dir_path,
     hf_download,

@@ -1,0 +1,7 @@
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  2.28it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  4.32it/s]
+Fetching 11 files:   0%|          | 0/11 [00:00<?, ?it/s]Fetching 11 files: 100%|██████████| 11/11 [00:00<00:00, 7819.89it/s]
+Completion: 'ş androgй andंगाबादهاا постара'
+QEff Transformed HF Model Outputs (Torch CPU): 
+
+Prompt: ['Hi']
+Completion: ['ş androgから aléguéguéguéঁ']
