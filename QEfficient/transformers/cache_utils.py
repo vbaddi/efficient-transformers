@@ -442,7 +442,6 @@ class QEffHybridChunkedCache(HybridChunkedCache):
             k_out, v_out = key_states, value_states
 
         else:
-            self.position_ids = cache_kwargs.get("position_ids")
             self.is_sliding_layer = torch.tensor(bool(self.is_sliding[layer_idx]))
 
             # Update both caches with their respective position IDs
