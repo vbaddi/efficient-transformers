@@ -51,6 +51,13 @@ from transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
     GPTBigCodeForCausalLM,
     GPTBigCodeModel,
 )
+from transformers.models.gpt_oss.modeling_gpt_oss import (
+    GptOssAttention,
+    GptOssDecoderLayer,
+    GptOssForCausalLM,
+    GptOssModel,
+    GptOssRMSNorm,
+)
 from transformers.models.gptj.modeling_gptj import GPTJAttention, GPTJBlock, GPTJForCausalLM, GPTJModel
 from transformers.models.granite.modeling_granite import (
     GraniteAttention,
@@ -199,6 +206,12 @@ from QEfficient.transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
     QEffGPTBigCodeForCausalLM,
     QEffGPTBigCodeModel,
 )
+from QEfficient.transformers.models.gpt_oss.modeling_gpt_oss import (
+    QEffGptOssAttention,
+    QEffGptOssDecoderLayer,
+    QEffGptOssForCausalLM,
+    QEffGptOssModel,
+)
 from QEfficient.transformers.models.gptj.modeling_gptj import (
     QEffGPTJAttention,
     QEffGPTJBlock,
@@ -338,6 +351,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         MllamaTextRMSNorm: CustomRMSNormAIC,
         GraniteRMSNorm: CustomRMSNormAIC,
         GraniteMoeRMSNorm: CustomRMSNormAIC,
+        GptOssRMSNorm: CustomRMSNormAIC,
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
     }
 
@@ -399,6 +413,11 @@ class KVCacheTransform(ModuleMappingTransform):
         Gemma3TextModel: QEffGemma3TextModel,
         Gemma3ForCausalLM: QEffGemma3ForCausalLMModel,
         Gemma3ForConditionalGeneration: QEffGemma3ForConditionalGeneration,
+        # GPT_OSS
+        GptOssAttention: QEffGptOssAttention,
+        GptOssDecoderLayer: QEffGptOssDecoderLayer,
+        GptOssModel: QEffGptOssModel,
+        GptOssForCausalLM: QEffGptOssForCausalLM,
         # Granite
         GraniteModel: QEffGraniteModel,
         GraniteForCausalLM: QEffGraniteForCausalLM,
