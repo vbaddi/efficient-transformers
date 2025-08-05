@@ -7,7 +7,7 @@ from QEfficient.utils.constants import Constants
 from QEfficient.utils.run_utils import ApiRunner
 
 torch.manual_seed(42)
-model_id = "/home/vbaddi/transformers/src/transformers/models/gpt_oss/new_weights"
+model_id = "weights"
 config = AutoConfig.from_pretrained(model_id)
 model = GptOssForCausalLM.from_pretrained(
     model_id, torch_dtype=torch.float32, use_cache=True, attn_implementation="eager"
