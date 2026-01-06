@@ -155,12 +155,59 @@ class ApiRunner:
         Return:
             :Dict: Numpy outputs of Onnx model
         """
+        type_map = {
+            "tensor(float)": np.float32,
+            "tensor(float16)": np.float16,
+            "tensor(double)": np.float64,
+            "tensor(int64)": np.int64,
+            "tensor(int32)": np.int32,
+            "tensor(int16)": np.int16,
+            "tensor(int8)": np.int8,
+            "tensor(uint64)": np.uint64,
+            "tensor(uint32)": np.uint32,
+            "tensor(uint16)": np.uint16,
+            "tensor(uint8)": np.uint8,
+            "tensor(bool)": np.bool_,
+        }
         output_names = [x.name for x in session.get_outputs()]
-        session_input_names = [x.name for x in session.get_inputs()]
+        session_inputs_info = session.get_inputs()
+        session_input_names = [x.name for x in session_inputs_info]
+        session_input_types = {x.name: type_map.get(x.type, None) for x in session_inputs_info}
+        session_input_shapes = {x.name: x.shape for x in session_inputs_info}
+        if "position_ids" in inputs and "past_key.0" in inputs:
+            pos_expected = session_input_types.get("position_ids")
+            pk_expected = session_input_types.get("past_key.0")
+            pos_shape = session_input_shapes.get("position_ids")
+            pk_shape = session_input_shapes.get("past_key.0")
+            pos_val = inputs["position_ids"]
+            pk_val = inputs["past_key.0"]
+            if (
+                pos_expected == np.float32
+                and pk_expected == np.int64
+                and pos_shape
+                and pk_shape
+                and len(pos_shape) > len(pk_shape)
+                and getattr(pos_val, "ndim", 0) < getattr(pk_val, "ndim", 0)
+            ):
+                inputs = dict(inputs)
+                inputs["past_key.0"] = pos_val
+                inputs["position_ids"] = pk_val
         session_inputs = {}
         for inp_name in session_input_names:
             if inp_name in inputs.keys():
-                session_inputs[inp_name] = inputs[inp_name]
+                value = inputs[inp_name]
+                expected_dtype = session_input_types.get(inp_name)
+                if expected_dtype is not None and getattr(value, "dtype", None) != expected_dtype:
+                    value = np.asarray(value, dtype=expected_dtype)
+                expected_shape = session_input_shapes.get(inp_name)
+                if expected_shape:
+                    expected_rank = len(expected_shape)
+                    if value.ndim < expected_rank:
+                        value = value.reshape((1,) * (expected_rank - value.ndim) + value.shape)
+                    elif value.ndim > expected_rank:
+                        while value.ndim > expected_rank and value.shape[0] == 1:
+                            value = np.squeeze(value, axis=0)
+                session_inputs[inp_name] = value
         outputs_data = session.run(output_names, session_inputs)
         ort_outputs = dict(zip(output_names, outputs_data))
         return ort_outputs

@@ -174,10 +174,14 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
     qeff_model._onnx_transforms.append(RenameFunctionOutputsTransform)
     qeff_model._onnx_transforms.append(CustomOpTransform)
 
+    use_dynamo = kwargs.get("use_dynamo", False)
     # TODO: Handle this in the modelling class QEFFTransformersBase,remove from here. Refer diffusers implementation
     decoder_layer_classes = get_decoder_layer_classes_for_export(qeff_model.model)
     if decoder_layer_classes:
-        kwargs["export_modules_as_functions"] = decoder_layer_classes
+        if use_dynamo:
+            qeff_model._subfunction_target_classnames = [cls.__name__ for cls in decoder_layer_classes]
+        else:
+            kwargs["export_modules_as_functions"] = decoder_layer_classes
     return args, kwargs
 
 
@@ -203,6 +207,8 @@ def _cleanup_onnx_subfunctions(qeff_model):
     InvalidIndexProvider.SUBFUNC_ENABLED = False
     qeff_model._onnx_transforms.remove(RenameFunctionOutputsTransform)
     qeff_model._onnx_transforms.remove(CustomOpTransform)
+    if hasattr(qeff_model, "_subfunction_target_classnames"):
+        del qeff_model._subfunction_target_classnames
 
 
 def _save_export_metadata(export_dir: Path, filtered_hash_params: Dict):
