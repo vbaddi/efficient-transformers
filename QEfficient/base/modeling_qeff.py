@@ -24,6 +24,8 @@ from QEfficient.base.onnx_transforms import (
 )
 from QEfficient.base.pytorch_transforms import PytorchTransform
 from QEfficient.compile.qnn_compiler import compile as qnn_compile
+from QEfficient.customop.ctx_scatter_gather import CtxGather, CtxScatter
+from QEfficient.customop.rms_norm import CustomRMSNorm
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 from QEfficient.utils import (
     constants,
@@ -35,6 +37,10 @@ from QEfficient.utils import (
     load_json,
 )
 from QEfficient.utils.export_utils import export_wrapper
+from QEfficient.utils.onnx_subfunctions_from_metadata import (
+    extract_functions_from_metadata,
+    fix_misaligned_gpt2_inputs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,7 @@ class QEFFBaseModel(ABC):
         super().__init__()
         self.model = model
         self.hash_params = create_model_params(self, **kwargs)
+        self.prefill_onnx_path: Optional[str] = None
         self.onnx_path: Optional[str] = None
         self.qpc_path: Optional[str] = None
         self.qpc_session: Optional[QAICInferenceSession] = None
@@ -208,6 +215,8 @@ class QEFFBaseModel(ABC):
         export_dir: Optional[str] = None,
         offload_pt_weights: bool = True,
         prefill_only: Optional[bool] = False,
+        use_dynamo: bool = False,
+        dynamic_shapes: Optional[Dict[str, Dict[int, any]]] = None,
         **export_kwargs,
     ) -> str:
         """
@@ -239,7 +248,10 @@ class QEFFBaseModel(ABC):
 
         # Return early if ONNX already exists
         if onnx_path.is_file():
-            self.onnx_path = onnx_path
+            if prefill_only:
+                self.prefill_onnx_path = onnx_path
+            else:
+                self.onnx_path = onnx_path
             return onnx_path
 
         # check if the model is in meta state or weights are offloaded
@@ -275,19 +287,39 @@ class QEFFBaseModel(ABC):
                     input_names.append(param)
 
         try:
+            export_kwargs = dict(export_kwargs)
+            export_kwargs["dynamo"] = use_dynamo
+            if use_dynamo:
+                dynamic_axes = None
+                export_kwargs["report"] = True
+                export_kwargs["custom_translation_table"] = {
+                    torch.ops.qefficient.rms_norm.default: CustomRMSNorm,
+                    torch.ops.qefficient.ctx_gather.default: CtxGather,
+                    torch.ops.qefficient.ctx_scatter.default: CtxScatter,
+                }
             torch.onnx.export(
                 self.model,
-                (example_inputs,),
-                str(tmp_onnx_path),
+                args=(),
+                kwargs=example_inputs,
+                f=str(tmp_onnx_path),
                 input_names=input_names,
                 output_names=output_names,
                 dynamic_axes=dynamic_axes,
+                dynamic_shapes=dynamic_shapes,
                 opset_version=constants.ONNX_EXPORT_OPSET,
                 **export_kwargs,
             )
             logger.info("PyTorch export successful")
             _ = self._offload_model_weights(offload_pt_weights)
             model = onnx.load(tmp_onnx_path, load_external_data=False)
+            if use_dynamo:
+                model = fix_misaligned_gpt2_inputs(model)
+            if use_dynamo and getattr(self, "_subfunction_target_classnames", None):
+                model = extract_functions_from_metadata(
+                    model,
+                    target_module_classnames=self._subfunction_target_classnames,
+                    function_domain="qeff.subfunction",
+                )
 
             # Clear temporary references
             transform_kwargs = {
@@ -318,7 +350,10 @@ class QEFFBaseModel(ABC):
         finally:
             shutil.rmtree(tmp_onnx_dir, ignore_errors=True)
 
-        self.onnx_path = onnx_path
+        if prefill_only:
+            self.prefill_onnx_path = onnx_path
+        else:
+            self.onnx_path = onnx_path
         return onnx_path
 
     def get_onnx_path(
@@ -329,24 +364,29 @@ class QEFFBaseModel(ABC):
         offload_pt_weights: Optional[bool] = True,
         use_onnx_subfunctions: Optional[bool] = False,
         retain_full_kv: Optional[bool] = False,
+        use_dynamo: Optional[bool] = False,
     ):
         kwargs = {
             "offload_pt_weights": offload_pt_weights,
             "use_onnx_subfunctions": use_onnx_subfunctions,
             "retain_full_kv": retain_full_kv,
+            "use_dynamo": use_dynamo,
         }
-
         if prefill_only:
-            kwargs.update(
-                {
-                    "prefill_only": prefill_only,
-                    "prefill_seq_len": specializations[0].get("seq_len"),
-                    "enable_chunking": enable_chunking,
-                }
-            )
-
-        self.export(**kwargs)
-        return self.onnx_path
+            if self.prefill_onnx_path is None:
+                kwargs.update(
+                    {
+                        "prefill_only": prefill_only,
+                        "prefill_seq_len": specializations[0].get("seq_len"),
+                        "enable_chunking": enable_chunking,
+                    }
+                )
+                self.export(**kwargs)
+            return self.prefill_onnx_path
+        else:
+            if self.onnx_path is None:
+                self.export(**kwargs)
+            return self.onnx_path
 
     @dump_qconfig
     def _compile(
@@ -366,6 +406,7 @@ class QEFFBaseModel(ABC):
         offload_pt_weights: Optional[bool] = True,
         enable_chunking: Optional[bool] = False,
         retain_full_kv: Optional[bool] = None,
+        use_dynamo: bool = False,
         **compiler_options,
     ) -> str:
         """
@@ -394,8 +435,6 @@ class QEFFBaseModel(ABC):
         onnx_path = Path(
             onnx_path
             if onnx_path
-            else self.onnx_path
-            if self.onnx_path
             else self.get_onnx_path(
                 prefill_only,
                 enable_chunking,
@@ -403,6 +442,7 @@ class QEFFBaseModel(ABC):
                 offload_pt_weights,
                 use_onnx_subfunctions,
                 retain_full_kv,
+                use_dynamo,
             )
         )
         compile_dir = Path(compile_dir or onnx_path.parent)

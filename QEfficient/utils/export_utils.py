@@ -181,7 +181,10 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
 
     submodule_classes = qeff_model.model.get_submodules_for_export()
     if submodule_classes:
-        kwargs["export_modules_as_functions"] = submodule_classes
+        if kwargs.get("use_dynamo", False):
+            qeff_model._subfunction_target_classnames = [cls.__name__ for cls in submodule_classes]
+        else:
+            kwargs["export_modules_as_functions"] = submodule_classes
     return args, kwargs
 
 
@@ -207,6 +210,8 @@ def _cleanup_onnx_subfunctions(qeff_model):
     InvalidIndexProvider.SUBFUNC_ENABLED = False
     qeff_model._onnx_transforms.remove(RenameFunctionOutputsTransform)
     qeff_model._onnx_transforms.remove(CustomOpTransform)
+    if hasattr(qeff_model, "_subfunction_target_classnames"):
+        del qeff_model._subfunction_target_classnames
 
 
 def _save_export_metadata(export_dir: Path, filtered_hash_params: Dict):
