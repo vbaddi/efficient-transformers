@@ -124,13 +124,19 @@ def _generate_export_hash(qeff_model, args, kwargs, func):
     copy_of_hash_params.update(
         {
             "config": config_val,
+            "use_onnx_subfunctions": getattr(qeff_model, "_use_onnx_subfunctions", False),
+            "onnx_transform_version": 1,
+            "use_dynamo": all_args.get("use_dynamo", False),
         }
     )
+    if getattr(qeff_model, "_use_onnx_subfunctions", False):
+        copy_of_hash_params["onnx_subfunction_version"] = 2
     # Generate hash from relevant parameters
     export_hash, filtered_hash_params = create_export_hash(
         model_params=copy_of_hash_params,
         output_names=all_args.get("output_names"),
         dynamic_axes=all_args.get("dynamic_axes"),
+        dynamic_shapes=all_args.get("dynamic_shapes"),
         export_kwargs=all_args.get("export_kwargs", None),
         onnx_transform_kwargs=all_args.get("onnx_transform_kwargs", None),
     )
@@ -157,6 +163,10 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
         "The subfunction feature is experimental. Please note that using compile "
         "consecutively with and without subfunction may produce inconsistent results."
     )
+    qeff_model._use_onnx_subfunctions = True
+    qeff_model.hash_params["use_onnx_subfunctions"] = True
+    qeff_model.hash_params["onnx_subfunction_version"] = 2
+    use_dynamo = kwargs.get("use_dynamo", False)
 
     # Apply torch patches for subfunction support
     apply_torch_patches()
@@ -174,7 +184,6 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
     qeff_model._onnx_transforms.append(RenameFunctionOutputsTransform)
     qeff_model._onnx_transforms.append(CustomOpTransform)
 
-    use_dynamo = kwargs.get("use_dynamo", False)
     # TODO: Handle this in the modelling class QEFFTransformersBase,remove from here. Refer diffusers implementation
     decoder_layer_classes = get_decoder_layer_classes_for_export(qeff_model.model)
     if decoder_layer_classes:
@@ -209,6 +218,10 @@ def _cleanup_onnx_subfunctions(qeff_model):
     qeff_model._onnx_transforms.remove(CustomOpTransform)
     if hasattr(qeff_model, "_subfunction_target_classnames"):
         del qeff_model._subfunction_target_classnames
+    if hasattr(qeff_model, "_use_onnx_subfunctions"):
+        del qeff_model._use_onnx_subfunctions
+    qeff_model.hash_params.pop("use_onnx_subfunctions", None)
+    qeff_model.hash_params.pop("onnx_subfunction_version", None)
 
 
 def _save_export_metadata(export_dir: Path, filtered_hash_params: Dict):
