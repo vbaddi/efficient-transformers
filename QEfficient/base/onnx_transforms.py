@@ -9,7 +9,7 @@ import logging
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
 import numpy as np
 import onnx
@@ -110,9 +110,15 @@ class CustomOpTransform(BaseOnnxTransform):
             if hasattr(func_class, "symbolic"):
                 torch.onnx.register_custom_op_symbolic(f"::{op_name}", func_class.symbolic, ONNX_EXPORT_OPSET)
 
+        used_op_types = {node.op_type for node in model.graph.node}
+        for function_proto in model.functions:
+            used_op_types.update(node.op_type for node in function_proto.node)
+
         existing = {f.name for f in model.functions}
         for _, onnxscript_func in cls._custom_ops.values():
             proto = onnxscript_func.to_function_proto()
+            if proto.name not in used_op_types:
+                continue
             if proto.name not in existing:
                 model.functions.append(proto)
                 op_applied = True
@@ -130,6 +136,7 @@ class RenameFunctionOutputsTransform(BaseOnnxTransform):
         renamed = False
         model_out_map = {v.name: i for i, v in enumerate(graph.output)}
         layer_idx = 0
+        rename_map = {}
 
         for node in graph.node:
             if any(p in node.name or p in node.op_type for p in decoder_patterns):
@@ -148,9 +155,18 @@ class RenameFunctionOutputsTransform(BaseOnnxTransform):
                             else orig
                         )
                         node.output[i] = new
+                        rename_map[orig] = new
                         if orig in model_out_map:
                             graph.output[model_out_map[orig]].name = new
                 layer_idx += 1
+        if rename_map:
+            for node in graph.node:
+                for i, inp in enumerate(node.input):
+                    if inp in rename_map:
+                        node.input[i] = rename_map[inp]
+            for vi in graph.value_info:
+                if vi.name in rename_map:
+                    vi.name = rename_map[vi.name]
         return renamed
 
 
@@ -196,6 +212,329 @@ class AdapterWeightsToInputsTransform(BaseOnnxTransform):
                 model.graph.initializer.pop(i)
 
         return model, transformed
+
+
+class RewriteUnsupportedOpsTransform(BaseOnnxTransform):
+    """Rewrite unsupported ops like SplitToSequence and CastLike into supported equivalents."""
+
+    _SEQ_PRODUCER_OPS_INT64 = {"Shape", "Size", "NonZero"}
+    _INT_TYPES = (TensorProto.INT64, TensorProto.INT32)
+
+    @classmethod
+    def apply(cls, model: ModelProto) -> bool:
+        type_map, const_map = cls._build_maps(model.graph)
+        const_map.update(cls._infer_function_const_outputs(model))
+
+        changed = cls._rewrite_container(model.graph, type_map, const_map)
+
+        func_const_map = cls._infer_function_const_inputs(model, const_map)
+        for fn in model.functions:
+            changed |= cls._rewrite_container(fn, type_map, {**const_map, **func_const_map.get(fn.name, {})})
+
+        return changed
+
+    @classmethod
+    def _build_maps(cls, graph: onnx.GraphProto) -> Tuple[Dict[str, int], Dict[str, Any]]:
+        """Build type and constant maps from graph."""
+        type_map, const_map = {}, {}
+
+        # Collect from value_info, inputs, outputs, initializers
+        for vi in list(graph.value_info) + list(graph.input) + list(graph.output):
+            if vi.type.HasField("tensor_type") and vi.type.tensor_type.HasField("elem_type"):
+                type_map[vi.name] = vi.type.tensor_type.elem_type
+
+        for init in graph.initializer:
+            type_map[init.name] = init.data_type
+            if init.data_type in cls._INT_TYPES:
+                cls._extract_const_value(numpy_helper.to_array(init), const_map, init.name)
+
+        # Collect from Constant nodes
+        for node in graph.node:
+            if node.op_type == "Constant" and node.output:
+                cls._extract_constant_node(node, const_map)
+
+        return type_map, const_map
+
+    @classmethod
+    def _extract_const_value(cls, arr: Any, const_map: Dict[str, Any], name: str) -> None:
+        """Extract constant value from numpy array."""
+        if arr.ndim == 0:
+            const_map[name] = arr.item()
+        elif arr.ndim == 1:
+            const_map[name] = arr.tolist()
+
+    @classmethod
+    def _extract_constant_node(cls, node: onnx.NodeProto, const_map: Dict[str, Any]) -> None:
+        """Extract constant from Constant node."""
+        value_attr = next((a for a in node.attribute if a.name == "value"), None)
+        if value_attr and value_attr.t.data_type in cls._INT_TYPES:
+            cls._extract_const_value(numpy_helper.to_array(value_attr.t), const_map, node.output[0])
+
+    @classmethod
+    def _rewrite_container(cls, container: Any, type_map: Dict[str, int], const_map: Dict[str, Any]) -> bool:
+        """Rewrite nodes in container (graph or function)."""
+        nodes = list(container.node)
+        if not nodes:
+            return False
+
+        output_to_node = {out: node for node in nodes for out in node.output}
+        replace_map, skip_nodes, new_nodes = {}, set(), []
+        changed = False
+
+        for node in nodes:
+            if id(node) in skip_nodes:
+                continue
+
+            if node.op_type == "SplitToSequence":
+                if cls._try_rewrite_split(node, nodes, output_to_node, const_map, new_nodes, replace_map, skip_nodes):
+                    changed = True
+                    continue
+
+            if node.op_type == "CastLike":
+                new_nodes.append(cls._create_cast_node(node, output_to_node, type_map))
+                changed = True
+                continue
+
+            new_nodes.append(node)
+
+        if replace_map:
+            cls._apply_replacements(container, new_nodes, replace_map, skip_nodes)
+
+        if changed:
+            del container.node[:]
+            container.node.extend([n for n in new_nodes if id(n) not in skip_nodes])
+
+        return changed
+
+    @classmethod
+    def _try_rewrite_split(
+        cls,
+        node: onnx.NodeProto,
+        nodes: List[onnx.NodeProto],
+        output_to_node: Dict[str, onnx.NodeProto],
+        const_map: Dict[str, Any],
+        new_nodes: List[onnx.NodeProto],
+        replace_map: Dict[str, str],
+        skip_nodes: Set[int],
+    ) -> bool:
+        """Try to rewrite SplitToSequence + SequenceAt to Split."""
+        split_out = node.output[0]
+        consumers = [n for n in nodes if split_out in n.input and n.op_type == "SequenceAt"]
+
+        if not consumers or len([n for n in nodes if split_out in n.input]) != len(consumers):
+            new_nodes.append(node)
+            return False
+
+        # Resolve all indices
+        seq_index_map = {}
+        for seq_at in consumers:
+            idx_val = cls._get_const_int(seq_at.input[1], output_to_node, const_map)
+            if idx_val is None:
+                new_nodes.append(node)
+                return False
+            seq_index_map[id(seq_at)] = idx_val
+
+        # Validate contiguous indices
+        indices = list(seq_index_map.values())
+        if set(indices) != set(range(max(indices) + 1)):
+            new_nodes.append(node)
+            return False
+
+        # Create Split node
+        num_outputs = max(indices) + 1
+        split_outputs = [f"{split_out}_part_{i}" for i in range(num_outputs)]
+        split_node = cls._create_split_node(node, split_out, split_outputs, const_map, new_nodes, num_outputs)
+        new_nodes.append(split_node)
+
+        # Map outputs and mark for removal
+        for seq_at in consumers:
+            replace_map[seq_at.output[0]] = split_outputs[seq_index_map[id(seq_at)]]
+            skip_nodes.add(id(seq_at))
+
+        skip_nodes.add(id(node))
+        return True
+
+    @classmethod
+    def _create_split_node(
+        cls,
+        node: onnx.NodeProto,
+        split_out: str,
+        split_outputs: List[str],
+        const_map: Dict[str, Any],
+        new_nodes: List[onnx.NodeProto],
+        num_outputs: int,
+    ) -> onnx.NodeProto:
+        """Create Split node from SplitToSequence."""
+        split_inputs = [node.input[0]]
+        axis = next((a.i for a in node.attribute if a.name == "axis"), 0)
+
+        # Handle split sizes
+        if len(node.input) > 1 and node.input[1]:
+            split_val = const_map.get(node.input[1])
+            split_attr = (
+                split_val
+                if isinstance(split_val, list)
+                else ([split_val] * num_outputs if isinstance(split_val, int) else None)
+            )
+
+            if split_attr:
+                split_const_name = f"{node.name or split_out}_split_sizes"
+                new_nodes.append(
+                    onnx.helper.make_node(
+                        "Constant",
+                        [],
+                        [split_const_name],
+                        name=f"{split_const_name}_const",
+                        value=onnx.helper.make_tensor(
+                            split_const_name, TensorProto.INT64, [len(split_attr)], split_attr
+                        ),
+                    )
+                )
+                split_inputs.append(split_const_name)
+            else:
+                split_inputs.append(node.input[1])
+
+        return onnx.helper.make_node(
+            "Split", split_inputs, split_outputs, name=f"{node.name}_split" if node.name else "", axis=axis
+        )
+
+    @classmethod
+    def _create_cast_node(
+        cls, node: onnx.NodeProto, output_to_node: Dict[str, onnx.NodeProto], type_map: Dict[str, int]
+    ) -> onnx.NodeProto:
+        """Create Cast node from CastLike."""
+        target_type = cls._resolve_type(node.input[1], output_to_node, type_map) or TensorProto.INT64
+        return onnx.helper.make_node("Cast", [node.input[0]], list(node.output), name=node.name, to=target_type)
+
+    @classmethod
+    def _apply_replacements(
+        cls, container: Any, new_nodes: List[onnx.NodeProto], replace_map: Dict[str, str], skip_nodes: Set[int]
+    ) -> None:
+        """Apply name replacements throughout container."""
+        # Update node inputs
+        for node in new_nodes:
+            if id(node) not in skip_nodes:
+                node.input[:] = [replace_map.get(inp, inp) for inp in node.input]
+
+        # Update outputs
+        if hasattr(container, "output"):
+            if container.output and isinstance(container.output[0], str):
+                container.output[:] = [replace_map.get(out, out) for out in container.output]
+            else:
+                for out in container.output:
+                    out.name = replace_map.get(out.name, out.name)
+
+        # Update value_info
+        if hasattr(container, "value_info"):
+            for vi in container.value_info:
+                vi.name = replace_map.get(vi.name, vi.name)
+
+    @classmethod
+    def _get_const_int(
+        cls, name: str, output_to_node: Dict[str, onnx.NodeProto], const_map: Dict[str, Any]
+    ) -> Optional[int]:
+        """Get constant integer value."""
+        if name in const_map:
+            val = const_map[name]
+            return val if isinstance(val, int) else None
+
+        node = output_to_node.get(name)
+        if node and node.op_type == "Constant":
+            value_attr = next((a for a in node.attribute if a.name == "value"), None)
+            if value_attr and not value_attr.t.dims:
+                return numpy_helper.to_array(value_attr.t).item()
+
+        return None
+
+    @classmethod
+    def _resolve_type(
+        cls, name: str, output_to_node: Dict[str, onnx.NodeProto], type_map: Dict[str, int]
+    ) -> Optional[int]:
+        """Resolve data type for a value."""
+        if name in type_map:
+            return type_map[name]
+
+        node = output_to_node.get(name)
+        if not node:
+            return TensorProto.INT64 if any(t in name for t in ("sym_size", "size", "len", "int")) else None
+
+        if node.op_type == "Constant":
+            value_attr = next((a for a in node.attribute if a.name == "value"), None)
+            return value_attr.t.data_type if value_attr else None
+
+        if node.op_type == "Cast":
+            to_attr = next((a for a in node.attribute if a.name == "to"), None)
+            return int(to_attr.i) if to_attr else None
+
+        return TensorProto.INT64 if node.op_type in cls._SEQ_PRODUCER_OPS_INT64 else None
+
+    @classmethod
+    def _infer_function_const_inputs(cls, model: ModelProto, const_map: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """Infer constant function inputs from call sites."""
+        func_const_map = {}
+
+        for fn in model.functions:
+            if not fn.input:
+                continue
+
+            per_input = {}
+            for idx, fn_input in enumerate(fn.input):
+                # Collect values from all call sites
+                values = set()
+                for node in model.graph.node:
+                    if node.op_type != fn.name or idx >= len(node.input):
+                        values.clear()
+                        break
+
+                    graph_input = node.input[idx]
+                    if graph_input not in const_map:
+                        values.clear()
+                        break
+
+                    val = const_map[graph_input]
+                    values.add(tuple(val) if isinstance(val, list) else val)
+
+                # Record if all call sites agree
+                if len(values) == 1:
+                    const_val = next(iter(values))
+                    per_input[fn_input] = list(const_val) if isinstance(const_val, tuple) else const_val
+
+            if per_input:
+                func_const_map[fn.name] = per_input
+
+        return func_const_map
+
+    @classmethod
+    def _infer_function_const_outputs(cls, model: ModelProto) -> Dict[str, Any]:
+        """Infer constant outputs from functions."""
+        # Build function output constants map
+        func_output_consts = {}
+        for fn in model.functions:
+            output_map = {}
+            for out_name in fn.output:
+                prod = next((n for n in fn.node if out_name in n.output and n.op_type == "Constant"), None)
+                if prod:
+                    value_attr = next((a for a in prod.attribute if a.name == "value"), None)
+                    if value_attr and value_attr.t.data_type in cls._INT_TYPES:
+                        cls._extract_const_value(numpy_helper.to_array(value_attr.t), output_map, out_name)
+
+            if output_map:
+                func_output_consts[fn.name] = output_map
+
+        # Propagate to call sites
+        const_outputs = {}
+        fn_map = {f.name: f for f in model.functions}
+
+        for node in model.graph.node:
+            if node.op_type in func_output_consts:
+                fn = fn_map.get(node.op_type)
+                if fn:
+                    output_const_map = func_output_consts[node.op_type]
+                    for idx, out_name in enumerate(node.output):
+                        if idx < len(fn.output) and fn.output[idx] in output_const_map:
+                            const_outputs[out_name] = output_const_map[fn.output[idx]]
+
+        return const_outputs
 
 
 class OnnxTransformPipeline(BaseOnnxTransform):
