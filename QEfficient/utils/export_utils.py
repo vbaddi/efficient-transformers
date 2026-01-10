@@ -123,14 +123,19 @@ def _generate_export_hash(qeff_model, args, kwargs, func):
     copy_of_hash_params.update(
         {
             "config": config_val,
+            "use_onnx_subfunctions": getattr(qeff_model, "_use_onnx_subfunctions", False),
+            "onnx_transform_version": 1,
+            "use_dynamo": all_args.get("use_dynamo", False),
         }
     )
+    if getattr(qeff_model, "_use_onnx_subfunctions", False):
+        copy_of_hash_params["onnx_subfunction_version"] = 2
     # Generate hash from relevant parameters
     export_hash, filtered_hash_params = create_export_hash(
         model_params=copy_of_hash_params,
         output_names=all_args.get("output_names"),
         dynamic_axes=all_args.get("dynamic_axes"),
-        blocking_kwargs=all_args.get("blocking_kwargs", None),
+        dynamic_shapes=all_args.get("dynamic_shapes"),
         export_kwargs=all_args.get("export_kwargs", None),
         onnx_transform_kwargs=all_args.get("onnx_transform_kwargs", None),
     )
@@ -157,7 +162,9 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
         "The subfunction feature is experimental. Please note that using compile "
         "consecutively with and without subfunction may produce inconsistent results."
     )
-
+    qeff_model._use_onnx_subfunctions = True
+    qeff_model.hash_params["use_onnx_subfunctions"] = True
+    qeff_model.hash_params["onnx_subfunction_version"] = 2
     # Apply torch patches for subfunction support
     apply_torch_patches()
     InvalidIndexProvider.SUBFUNC_ENABLED = True
@@ -213,6 +220,10 @@ def _cleanup_onnx_subfunctions(qeff_model):
     qeff_model._onnx_transforms.remove(CustomOpTransform)
     if hasattr(qeff_model, "_subfunction_target_classnames"):
         del qeff_model._subfunction_target_classnames
+    if hasattr(qeff_model, "_use_onnx_subfunctions"):
+        del qeff_model._use_onnx_subfunctions
+    qeff_model.hash_params.pop("use_onnx_subfunctions", None)
+    qeff_model.hash_params.pop("onnx_subfunction_version", None)
 
 
 def _save_export_metadata(export_dir: Path, filtered_hash_params: Dict):
