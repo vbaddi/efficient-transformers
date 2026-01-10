@@ -38,6 +38,7 @@ from QEfficient.diffusers.pipelines.pipeline_utils import (
     set_module_device_ids,
 )
 from QEfficient.generation.cloud_infer import QAICInferenceSession
+from QEfficient.utils import constants
 from QEfficient.utils.logging_utils import logger
 
 
@@ -223,6 +224,27 @@ class QEffFluxPipeline:
             ... )
             >>> print(f"Models exported to: {export_path}")
         """
+        if self.custom_config is None:
+            config_manager(
+                self, config_source=self.get_default_config_path(), use_onnx_subfunctions=use_onnx_subfunctions
+            )
+
+        transformer_config = self.custom_config["modules"]["transformer"]
+        transformer_specializations = transformer_config["specializations"].copy()
+        transformer_specializations.update(
+            {
+                "batch_size": constants.FLUX_ONNX_EXPORT_EXAMPLE_BATCH_SIZE,
+                "seq_len": constants.FLUX_ONNX_EXPORT_SEQ_LENGTH,
+                "cl": constants.FLUX_ONNX_EXPORT_COMPRESSED_LATENT_DIM,
+            }
+        )
+        self.transformer.set_blocking_config(
+            pipeline_config=self.custom_config,
+            module_name="transformer",
+            specializations=transformer_specializations,
+            compile_config=transformer_config["compilation"],
+        )
+
         for module_name, module_obj in tqdm(self.modules.items(), desc="Exporting modules", unit="module"):
             # Get ONNX export configuration for this module
             example_inputs, dynamic_axes, output_names = module_obj.get_onnx_params()
@@ -292,18 +314,6 @@ class QEffFluxPipeline:
             ...     width=512
             ... )
         """
-        # Ensure all modules are exported to ONNX before compilation
-        if any(
-            path is None
-            for path in [
-                self.text_encoder.onnx_path,
-                self.text_encoder_2.onnx_path,
-                self.transformer.onnx_path,
-                self.vae_decode.onnx_path,
-            ]
-        ):
-            self.export(use_onnx_subfunctions=use_onnx_subfunctions)
-
         # Load compilation configuration
         config_manager(self, config_source=compile_config, use_onnx_subfunctions=use_onnx_subfunctions)
 
@@ -320,6 +330,28 @@ class QEffFluxPipeline:
                 "latent_width": latent_width,
             },
         }
+        transformer_config = self.custom_config["modules"]["transformer"]
+        transformer_specializations = transformer_config["specializations"].copy()
+        transformer_specializations.update(specialization_updates["transformer"])
+        transformer_compile_config = transformer_config["compilation"]
+        self.transformer.set_blocking_config(
+            pipeline_config=self.custom_config,
+            module_name="transformer",
+            specializations=transformer_specializations,
+            compile_config=transformer_compile_config,
+        )
+
+        # Ensure all modules are exported to ONNX before compilation
+        if any(
+            path is None
+            for path in [
+                self.text_encoder.onnx_path,
+                self.text_encoder_2.onnx_path,
+                self.transformer.onnx_path,
+                self.vae_decode.onnx_path,
+            ]
+        ):
+            self.export(use_onnx_subfunctions=use_onnx_subfunctions)
 
         # Use generic utility functions for compilation
         if parallel:

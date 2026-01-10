@@ -5,7 +5,7 @@
 #
 # ----------------------------------------------------------------------------
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -469,6 +469,33 @@ class QEffFluxTransformerModel(QEFFBaseModel):
 
         return example_inputs, dynamic_axes, output_names
 
+    def set_blocking_config(
+        self,
+        pipeline_config: Dict,
+        module_name: str = "transformer",
+        blocking_mode: Optional[str] = None,
+        specializations: Optional[Dict] = None,
+        compile_config: Optional[Dict] = None,
+    ) -> Dict:
+        from QEfficient.diffusers.models.blocking_configurator import build_transformer_blocking_config
+        from QEfficient.diffusers.models.transformers.transformer_flux import QEffFluxAttention
+
+        blocking_config = build_transformer_blocking_config(
+            model_config=self.model.config,
+            pipeline_config=pipeline_config,
+            module_name=module_name,
+            blocking_mode=blocking_mode,
+            specializations=specializations,
+            compile_config=compile_config,
+        )
+        self.model._blocking_config = blocking_config
+        for module in self.model.modules():
+            if isinstance(module, QEffFluxAttention):
+                module._blocking_config = blocking_config
+        if compile_config is not None:
+            compile_config.update(blocking_config.get("compile_flags", {}))
+        return blocking_config
+
     def export(
         self,
         inputs: Dict,
@@ -624,6 +651,33 @@ class QEffWanUnifiedTransformer(QEFFBaseModel):
         }
 
         return example_inputs, dynamic_axes, output_names
+
+    def set_blocking_config(
+        self,
+        pipeline_config: Dict,
+        module_name: str = "transformer",
+        blocking_mode: Optional[str] = None,
+        specializations: Optional[Dict] = None,
+        compile_config: Optional[Dict] = None,
+    ) -> Dict:
+        from QEfficient.diffusers.models.blocking_configurator import build_transformer_blocking_config
+        from QEfficient.diffusers.models.transformers.transformer_wan import QEffWanAttention
+
+        blocking_config = build_transformer_blocking_config(
+            model_config=self.model.config,
+            pipeline_config=pipeline_config,
+            module_name=module_name,
+            blocking_mode=blocking_mode,
+            specializations=specializations,
+            compile_config=compile_config,
+        )
+        self.model._blocking_config = blocking_config
+        for module in self.model.modules():
+            if isinstance(module, QEffWanAttention):
+                module._blocking_config = blocking_config
+        if compile_config is not None:
+            compile_config.update(blocking_config.get("compile_flags", {}))
+        return blocking_config
 
     def export(
         self,

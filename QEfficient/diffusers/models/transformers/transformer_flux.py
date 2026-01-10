@@ -89,8 +89,10 @@ class QEffFluxAttnProcessor(FluxAttnProcessor):
             query = qeff_apply_rotary_emb(query, image_rotary_emb)
             key = qeff_apply_rotary_emb(key, image_rotary_emb)
 
-        # Get blocking configuration
-        blocking_mode, head_block_size, num_kv_blocks, num_q_blocks = get_attention_blocking_config()
+        blocking_config = getattr(attn, "_blocking_config", None)
+        blocking_mode, head_block_size, num_kv_blocks, num_q_blocks = get_attention_blocking_config(
+            blocking_config=blocking_config
+        )
         # Apply blocking using pipeline_utils
         hidden_states = compute_blocked_attention(
             query.transpose(1, 2),

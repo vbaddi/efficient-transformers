@@ -6,15 +6,19 @@
 # ----------------------------------------------------------------------------
 
 import math
-import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 
 
-def get_attention_blocking_config():
+def get_attention_blocking_config(
+    blocking_config: Optional[Dict[str, Any]] = None,
+    model_config: Optional[Any] = None,
+    pipeline_config: Optional[Dict[str, Any]] = None,
+    module_name: str = "transformer",
+):
     """
-    Get attention blocking configuration from environment variables.
+    Get attention blocking configuration from provided configs.
 
     Returns:
         tuple: (blocking_mode, head_block_size, num_kv_blocks, num_q_blocks)
@@ -23,17 +27,28 @@ def get_attention_blocking_config():
             - num_kv_blocks (int or None): Number of key-value blocks
             - num_q_blocks (int or None): Number of query blocks
     """
-    mode = os.environ.get("ATTENTION_BLOCKING_MODE", "default").lower()
-    head_block_size = int(os.environ.get("head_block_size", 0)) or None
-    num_kv_blocks = int(os.environ.get("num_kv_blocks", 0)) or None
-    num_q_blocks = int(os.environ.get("num_q_blocks", 0)) or None
+    if blocking_config is None and model_config is not None and pipeline_config is not None:
+        from QEfficient.diffusers.models.blocking_configurator import build_transformer_blocking_config
 
-    # Validate blocking mode
-    valid_modes = ["kv", "qkv", "q", "default"]
-    if mode not in valid_modes:
-        raise ValueError(f"Invalid ATTENTION_BLOCKING_MODE: {mode}. Must be one of {valid_modes}")
+        blocking_config = build_transformer_blocking_config(
+            model_config=model_config,
+            pipeline_config=pipeline_config,
+            module_name=module_name,
+        )
 
-    return mode, head_block_size, num_kv_blocks, num_q_blocks
+    if blocking_config is not None:
+        attention_cfg = blocking_config["attention"]
+        return (
+            blocking_config.get("effective_blocking_mode", blocking_config["blocking_mode"]),
+            attention_cfg["head_block_size"],
+            attention_cfg["num_kv_blocks"],
+            attention_cfg["num_q_blocks"],
+        )
+
+    raise ValueError(
+        "Blocking config is required. Provide blocking_config or model_config + pipeline_config "
+        "to compute attention blocking settings."
+    )
 
 
 def apply_head_blocking(

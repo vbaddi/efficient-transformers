@@ -225,6 +225,29 @@ class QEffWanPipeline:
             ...     use_onnx_subfunctions=True
             ... )
         """
+        if self.custom_config is None:
+            config_manager(
+                self, config_source=self.get_default_config_path(), use_onnx_subfunctions=use_onnx_subfunctions
+            )
+
+        transformer_config = self.custom_config["modules"]["transformer"]
+        transformer_specializations = []
+        for spec in transformer_config["specializations"]:
+            merged = spec.copy()
+            merged.update(
+                {
+                    "batch_size": constants.WAN_ONNX_EXPORT_BATCH_SIZE,
+                    "sequence_length": constants.WAN_ONNX_EXPORT_SEQ_LEN,
+                    "cl": constants.WAN_ONNX_EXPORT_CL_180P,
+                }
+            )
+            transformer_specializations.append(merged)
+        self.transformer.set_blocking_config(
+            pipeline_config=self.custom_config,
+            module_name="transformer",
+            specializations=transformer_specializations,
+            compile_config=transformer_config["compilation"],
+        )
 
         # Export each module with video-specific parameters
         for module_name, module_obj in tqdm(self.modules.items(), desc="Exporting modules", unit="module"):
@@ -253,7 +276,7 @@ class QEffWanPipeline:
         Returns:
             str: Path to the default WAN configuration JSON file.
         """
-        return os.path.join(os.path.dirname(__file__), "wan_config.json")
+        return "QEfficient/diffusers/pipelines/configs/wan_config.json"
 
     def compile(
         self,
@@ -303,16 +326,6 @@ class QEffWanPipeline:
             ...     num_frames=81
             ... )
         """
-        # Ensure all modules are exported to ONNX before compilation
-        if any(
-            path is None
-            for path in [
-                self.transformer.onnx_path,
-                self.vae_decoder.onnx_path,
-            ]
-        ):
-            self.export(use_onnx_subfunctions=use_onnx_subfunctions)
-
         # Load compilation configuration
         config_manager(self, config_source=compile_config, use_onnx_subfunctions=use_onnx_subfunctions)
 
@@ -350,6 +363,29 @@ class QEffWanPipeline:
                 "latent_width": latent_width,
             },
         }
+        transformer_config = self.custom_config["modules"]["transformer"]
+        transformer_specializations = []
+        for spec, updates in zip(transformer_config["specializations"], specialization_updates["transformer"]):
+            merged = spec.copy()
+            merged.update(updates)
+            transformer_specializations.append(merged)
+        transformer_compile_config = transformer_config["compilation"]
+        self.transformer.set_blocking_config(
+            pipeline_config=self.custom_config,
+            module_name="transformer",
+            specializations=transformer_specializations,
+            compile_config=transformer_compile_config,
+        )
+
+        # Ensure all modules are exported to ONNX before compilation
+        if any(
+            path is None
+            for path in [
+                self.transformer.onnx_path,
+                self.vae_decoder.onnx_path,
+            ]
+        ):
+            self.export(use_onnx_subfunctions=use_onnx_subfunctions)
 
         # Use generic utility functions for compilation
         logger.warning('For VAE compilation use QAIC_COMPILER_OPTS_UNSUPPORTED="-aic-hmx-conv3d" ')
