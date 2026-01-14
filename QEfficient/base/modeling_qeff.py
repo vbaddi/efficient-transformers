@@ -40,6 +40,7 @@ from QEfficient.utils.export_utils import export_wrapper
 from QEfficient.utils.onnx_subfunctions_from_metadata import (
     extract_functions_from_metadata,
     fix_misaligned_gpt2_inputs,
+    restore_symbolic_batch_dim,
 )
 
 logger = logging.getLogger(__name__)
@@ -360,6 +361,12 @@ class QEFFBaseModel(ABC):
             onnx_transforms = OnnxTransformPipeline(transforms=self._onnx_transforms)
             model, transformed = onnx_transforms.apply(model, **transform_kwargs)
 
+            if use_dynamo:
+                model = restore_symbolic_batch_dim(
+                    model,
+                    batch_dim_name="full_batch_size" if self.continuous_batching else "batch_size",
+                )
+
             # Add metadata to the model
             model.metadata_props.append(
                 onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(self._transform_names()))
@@ -504,27 +511,8 @@ class QEFFBaseModel(ABC):
             + [f"-m={onnx_path}"]
         )
 
-        # MDP partition config: prioritize dump over load
-        mdp_dump_json_path = compiler_options.pop("mdp_dump_partition_config", None)
-        mdp_ts_json_path = compiler_options.pop("mdp_load_partition_config", None)
-        mdp_ts_json = None
-        user_provided_load_config = False
-
-        if mdp_dump_json_path:
-            if mdp_ts_json_path:
-                logger.warning(
-                    "Loading and Dumping partition is not supported at the same time. Prioritizing dump config over load config!"
-                )
-            command.append(f"-mdp-dump-partition-config={mdp_dump_json_path}")
-        elif mdp_ts_json_path:
+        if mdp_ts_json_path := compiler_options.pop("mdp_load_partition_config", None):
             command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
-            mdp_ts_json = load_json(str(mdp_ts_json_path))
-            user_provided_load_config = True
-        elif mdp_ts_num_devices > 1:
-            # Generate mdp config only if neither dump nor load is provided and num_devices > 1
-            mdp_ts_json = generate_mdp_partition_config(
-                mdp_ts_num_devices, compiler_options.get("aic_num_cores", constants.DEFAULT_AIC_NUM_CORES)
-            )
 
         for key, value in compiler_options.items():
             option = "-" + key.replace("_", "-")
@@ -533,6 +521,16 @@ class QEFFBaseModel(ABC):
                     command.append(option)
                 continue
             command.append(f"{option}={value}")
+
+        # Create a dummy mdp_ts_json if mdp-load-partition-config not provided and num_devices > 1
+        if mdp_ts_json_path is not None:
+            mdp_ts_json = load_json(str(mdp_ts_json_path))
+        elif mdp_ts_num_devices > 1:
+            mdp_ts_json = generate_mdp_partition_config(
+                mdp_ts_num_devices, compiler_options.get("aic_num_cores", constants.DEFAULT_AIC_NUM_CORES)
+            )
+        else:
+            mdp_ts_json = None
 
         if use_onnx_subfunctions:
             logger.info("Using ONNX subfunctions for compilation.")
@@ -560,8 +558,8 @@ class QEFFBaseModel(ABC):
             # Probably compilation failure last time, delete directory to start over
             shutil.rmtree(qpc_path)
 
-        # Write the generated MDP partition config file (not if user provided it)
-        if mdp_ts_json is not None and not user_provided_load_config:
+        # write the MDP partition config file if not provided
+        if mdp_ts_json is not None:
             mdp_ts_json_path = compile_dir / f"mdp_ts_{mdp_ts_num_devices}.json"
             create_json(str(mdp_ts_json_path), mdp_ts_json)
             command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")

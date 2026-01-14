@@ -325,6 +325,12 @@ class QEFFAutoModel(QEFFTransformersBase):
                         dim_registry[dim_name] = Dim(dim_name, min=1, max=64)
                     elif "seq_len" in dim_name:
                         dim_registry[dim_name] = Dim(dim_name, min=1, max=513)
+                    elif "sliding_window" in dim_name:
+                        dim_registry[dim_name] = Dim(
+                            dim_name,
+                            min=2,
+                            max=getattr(self.model.config, "sliding_window", 4096),
+                        )
                     else:
                         dim_registry[dim_name] = Dim(dim_name, min=1, max=4096)
                 input_dynamic_shapes[axis_idx] = dim_registry[dim_name]
@@ -2662,6 +2668,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         dynamic_shapes = {}
 
         max_seq_len = getattr(self.model.config, "max_position_embeddings", 1024)
+        batch_min = 1 if getattr(self.model.config, "model_type", None) == "gpt_oss" else 2
         # Handle regular model inputs (not past_key_values)
         # These match the QEffLlamaForCausalLM forward signature:
         # input_ids, attention_mask, position_ids, past_key_values, batch_index, etc.
@@ -2672,11 +2679,17 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                     # Create or reuse Dim object for this dimension name
                     if dim_name not in dim_registry:
                         if dim_name == "batch_size":
-                            dim_registry[dim_name] = Dim("batch_size", min=2, max=64)
+                            dim_registry[dim_name] = Dim("batch_size", min=batch_min, max=64)
                         elif "seq_len" in dim_name:
                             dim_registry[dim_name] = Dim("seq_len", min=2, max=max_seq_len)
                         elif "ctx_len" in dim_name:
                             dim_registry[dim_name] = Dim("ctx_len", min=2, max=max_seq_len)
+                        elif "sliding_window" in dim_name:
+                            dim_registry[dim_name] = Dim(
+                                "sliding_window",
+                                min=2,
+                                max=getattr(self.model.config, "sliding_window", max_seq_len),
+                            )
                         else:
                             dim_registry[dim_name] = Dim.DYNAMIC
 
@@ -2695,11 +2708,17 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 for axis_idx, dim_name in axes_map.items():
                     if dim_name not in dim_registry:
                         if dim_name == "batch_size":
-                            dim_registry[dim_name] = Dim("batch_size", min=2, max=64)
+                            dim_registry[dim_name] = Dim("batch_size", min=batch_min, max=64)
                         elif "seq_len" in dim_name:
                             dim_registry[dim_name] = Dim("seq_len", min=2, max=max_seq_len)
                         elif "ctx_len" in dim_name:
                             dim_registry[dim_name] = Dim("ctx_len", min=2, max=max_seq_len)
+                        elif "sliding_window" in dim_name:
+                            dim_registry[dim_name] = Dim(
+                                "sliding_window",
+                                min=2,
+                                max=getattr(self.model.config, "sliding_window", max_seq_len),
+                            )
                         else:
                             dim_registry[dim_name] = Dim.DYNAMIC
                     layer_dynamic_shapes[axis_idx] = dim_registry[dim_name]
@@ -2711,11 +2730,17 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 for axis_idx, dim_name in axes_map.items():
                     if dim_name not in dim_registry:
                         if dim_name == "batch_size":
-                            dim_registry[dim_name] = Dim("batch_size", min=2, max=64)
+                            dim_registry[dim_name] = Dim("batch_size", min=batch_min, max=64)
                         elif "seq_len" in dim_name:
                             dim_registry[dim_name] = Dim("seq_len", min=2, max=max_seq_len)
                         elif "ctx_len" in dim_name:
                             dim_registry[dim_name] = Dim("ctx_len", min=2, max=max_seq_len)
+                        elif "sliding_window" in dim_name:
+                            dim_registry[dim_name] = Dim(
+                                "sliding_window",
+                                min=2,
+                                max=getattr(self.model.config, "sliding_window", max_seq_len),
+                            )
                         else:
                             dim_registry[dim_name] = Dim.DYNAMIC
                     layer_dynamic_shapes[axis_idx] = dim_registry[dim_name]
@@ -2777,9 +2802,12 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         seq_len: int = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
         fbs: int = constants.ONNX_EXPORT_EXAMPLE_FBS
         if use_dynamo:
-            bs = max(2, bs)
             seq_len = max(2, seq_len)
             fbs = max(2, fbs)
+            if getattr(self.model.config, "model_type", None) == "gpt_oss" and not self.continuous_batching:
+                bs = 1
+            else:
+                bs = max(2, bs)
         kv_cache_shape = get_padding_shape_from_config(
             self.model.config, fbs if self.continuous_batching else bs, seq_len
         )
