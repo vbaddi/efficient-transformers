@@ -190,6 +190,14 @@ class ApiRunner:
                     added_initializers[node.output[0]] = onnxruntime.OrtValue.ortvalue_from_numpy(
                         np.array(0, np_tensor.dtype)
                     )
+        for tensor in m.graph.initializer:
+            if tensor.data_type == onnx.TensorProto.UNDEFINED:
+                continue
+            if tensor.data_location == onnx.TensorProto.EXTERNAL or tensor.external_data:
+                continue
+            np_tensor = onnx.numpy_helper.to_array(tensor)
+            if len(np_tensor.shape) == 0 and np_tensor.item() == 2147483647:
+                added_initializers[tensor.name] = onnxruntime.OrtValue.ortvalue_from_numpy(np.array(0, np_tensor.dtype))
 
         session_options = onnxruntime.SessionOptions()
         for name, value in added_initializers.items():
