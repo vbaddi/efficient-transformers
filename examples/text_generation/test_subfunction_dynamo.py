@@ -11,11 +11,11 @@ from transformers import AutoConfig, AutoTokenizer
 from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
 from QEfficient.utils.run_utils import ApiRunner
 
-model_name = "gpt2"
+model_name = "openai/gpt-oss-20b"
 # model_name = "meta-llama/Llama-3.2-1B"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 config = AutoConfig.from_pretrained(model_name)
-# config.num_hidden_layers = 4
+config.num_hidden_layers = 4
 print(config)
 runner = ApiRunner(
     batch_size=1,
@@ -27,7 +27,7 @@ runner = ApiRunner(
 )
 
 # PyTorch (KV) output
-qeff_model = QEFFAutoModelForCausalLM.from_pretrained(model_name)
+qeff_model = QEFFAutoModelForCausalLM.from_pretrained(model_name, num_hidden_layers=4)
 pt_tokens = runner.run_kv_model_on_pytorch(qeff_model.model)
 print(pt_tokens)
 
