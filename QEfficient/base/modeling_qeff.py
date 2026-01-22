@@ -12,8 +12,9 @@ import shutil
 import subprocess
 import warnings
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import onnx
 import torch
@@ -198,6 +199,773 @@ class QEFFBaseModel(ABC):
             :str: Path of the compiled ``qpc`` package.
         """
 
+    # ────────────────────────────────────────────────
+    # Helper functions for hierarchy naming
+    # ────────────────────────────────────────────────
+
+    # def common_prefix(self, strings: List[str]) -> str:
+    #     """Find common prefix of a list of strings."""
+    #     if not strings:
+    #         return ''
+    #     min_s = min(strings)
+    #     max_s = max(strings)
+    #     if not min_s:
+    #         return ''
+    #     for i in range(len(min_s)):
+    #         if min_s[i] != max_s[i]:
+    #             return min_s[:i]
+    #     return min_s
+
+    # def path_to_hierarchical(self, dot_path: str) -> str:
+    #     """
+    #     Convert PyTorch module path to hierarchical format.
+
+    #     Examples:
+    #         'layers.0.attn.q_proj' → 'layers.0/attn/q_proj'
+    #         'model.layers.1.mlp' → 'model/layers.1/mlp'
+
+    #     Keeps numeric indices attached to their parent (layers.0, not layers/0)
+    #     """
+    #     parts = dot_path.split('.')
+    #     hier_parts = []
+
+    #     for p in parts:
+    #         # If this part is a digit and we have a previous part, attach it
+    #         if p.isdigit() and hier_parts:
+    #             hier_parts[-1] += '.' + p
+    #         else:
+    #             hier_parts.append(p)
+
+    #     return '/'.join(hier_parts)
+
+    # def process_onnx_with_hierarchy(
+    #     self,
+    #     onnx_model,
+    #     function_module_types: Set[type],
+    #     model: torch.nn.Module
+    # ) -> None:
+    #     """
+    #     Post-process ONNX model to inject hierarchical node names.
+    #     Fixed to prevent incorrect module propagation.
+    #     """
+    #     print("\n  Post-processing ONNX with hierarchy...")
+
+    #     # Find all module instances
+    #     module_instances = [
+    #         name for name, mod in model.named_modules()
+    #         if type(mod) in function_module_types and name
+    #     ]
+
+    #     print(f"    Found {len(module_instances)} module instances:")
+    #     for inst in module_instances:
+    #         print(f"      - {inst}")
+
+    #     if not onnx_model.functions:
+    #         print("    ⚠️  No functions found in ONNX model!")
+    #         return onnx_model
+
+    #     print(f"\n    Original functions: {[f.name for f in onnx_model.functions]}")
+
+    #     # Build weight-to-module mapping
+    #     print(f"\n    Building weight-to-module mapping...")
+    #     weight_to_module = {}
+
+    #     for init in onnx_model.graph.initializer:
+    #         weight_name = init.name
+
+    #         for instance in module_instances:
+    #             if weight_name.startswith(instance + "."):
+    #                 relative_key = weight_name[len(instance) + 1:]
+
+    #                 if '.' in relative_key:
+    #                     relative_module = relative_key.rsplit('.', 1)[0]
+    #                     weight_to_module[weight_name] = (instance, relative_module)
+    #                     break
+
+    #     print(f"    Mapped {len(weight_to_module)} weights")
+
+    #     # Show what modules we have
+    #     unique_modules = set()
+    #     for instance, rel_module in weight_to_module.values():
+    #         unique_modules.add(rel_module)
+    #     print(f"    Unique submodules found: {sorted(unique_modules)}")
+
+    #     # Analyze calls
+    #     call_nodes_in_order = []
+    #     for node in onnx_model.graph.node:
+    #         if node.op_type in [f.name for f in onnx_model.functions]:
+    #             call_nodes_in_order.append(node)
+
+    #     call_to_instance = {}
+    #     for idx, call_node in enumerate(call_nodes_in_order):
+    #         if idx < len(module_instances):
+    #             call_to_instance[call_node.name] = module_instances[idx]
+
+    #     func_to_calls = {}
+    #     for call_node in call_nodes_in_order:
+    #         func_name = call_node.op_type
+    #         if func_name not in func_to_calls:
+    #             func_to_calls[func_name] = []
+    #         func_to_calls[func_name].append(call_node)
+
+    #     # Process each function
+    #     for func in onnx_model.functions:
+    #         print(f"\n    ═══════════════════════════════════════════")
+    #         print(f"    Processing: {func.name}")
+    #         print(f"    ═══════════════════════════════════════════")
+
+    #         calls_for_this_func = func_to_calls.get(func.name, [])
+
+    #         if not calls_for_this_func:
+    #             print(f"      Skipping - no calls")
+    #             continue
+
+    #         representative_call = calls_for_this_func[0]
+    #         representative_instance = call_to_instance.get(representative_call.name)
+
+    #         if not representative_instance:
+    #             print(f"      Skipping - no instance")
+    #             continue
+
+    #         print(f"      Instance: {representative_instance}")
+
+    #         # Build weight mapping for this instance
+    #         instance_weight_to_module = {}
+    #         for weight_name, (instance, rel_module) in weight_to_module.items():
+    #             if instance == representative_instance:
+    #                 instance_weight_to_module[weight_name] = rel_module
+
+    #         print(f"      Weights: {len(instance_weight_to_module)}")
+
+    #         # Track tensors - but DON'T propagate across module boundaries
+    #         tensor_to_module = {}
+    #         tensor_is_constant = {}
+    #         last_weight_module = None  # Track the last module that used weights
+
+    #         for inp in func.input:
+    #             tensor_to_module[inp] = ''
+
+    #         for node in func.node:
+    #             if node.op_type == 'Constant':
+    #                 for out in node.output:
+    #                     tensor_is_constant[out] = True
+
+    #         # Process nodes
+    #         for node_idx, node in enumerate(func.node):
+    #             # Check if node uses weights
+    #             weight_modules = set()
+    #             for inp in node.input:
+    #                 if inp in instance_weight_to_module:
+    #                     weight_modules.add(instance_weight_to_module[inp])
+
+    #             # Check data flow
+    #             data_modules = set()
+    #             for inp in node.input:
+    #                 if inp in tensor_to_module and not tensor_is_constant.get(inp, False):
+    #                     if tensor_to_module[inp]:  # Only add non-empty
+    #                         data_modules.add(tensor_to_module[inp])
+
+    #             # Determine module with better logic
+    #             if weight_modules:
+    #                 # Node uses weights - this is authoritative
+    #                 node_module = self.common_prefix(list(weight_modules)).rstrip('.')
+    #                 last_weight_module = node_module
+    #             elif data_modules:
+    #                 # Node doesn't use weights - inherit from inputs
+    #                 # But only if all inputs agree on the module
+    #                 if len(data_modules) == 1:
+    #                     node_module = list(data_modules)[0]
+    #                 else:
+    #                     # Multiple different modules - use common prefix
+    #                     node_module = self.common_prefix(list(data_modules)).rstrip('.')
+    #             else:
+    #                 # No information - use last known weight module if recent
+    #                 # This helps operations like Softmax that follow attention MatMuls
+    #                 if last_weight_module and node_idx > 0:
+    #                     # Check if previous node was in the same module
+    #                     prev_node = func.node[node_idx - 1]
+    #                     if prev_node.name and last_weight_module in prev_node.name:
+    #                         node_module = last_weight_module
+    #                     else:
+    #                         node_module = ''
+    #                 else:
+    #                     node_module = ''
+
+    #             # Build path
+    #             full_path = representative_instance
+    #             if node_module:
+    #                 full_path += '.' + node_module
+
+    #             hier_path = self.path_to_hierarchical(full_path)
+    #             new_node_name = f"/{hier_path}/{node.op_type}"
+
+    #             # DEBUG for Softmax
+    #             if node.op_type == 'Softmax':
+    #                 print(f"\n      🔍 SOFTMAX (node {node_idx}):")
+    #                 print(f"         Inputs: {list(node.input)}")
+    #                 print(f"         Weight modules: {weight_modules}")
+    #                 print(f"         Data modules: {data_modules}")
+    #                 print(f"         Last weight module: {last_weight_module}")
+    #                 print(f"         Determined: '{node_module}'")
+    #                 print(f"         New name: {new_node_name}")
+
+    #                 # Check previous few nodes
+    #                 print(f"         Previous 3 nodes:")
+    #                 for i in range(max(0, node_idx - 3), node_idx):
+    #                     prev = func.node[i]
+    #                     print(f"           {i}: {prev.op_type} -> {prev.name}")
+
+    #             # Update name
+    #             node.name = new_node_name
+
+    #             # Propagate - but only if we have a definitive module
+    #             if weight_modules:
+    #                 # Definitive - propagate
+    #                 for out in node.output:
+    #                     tensor_to_module[out] = node_module
+    #             elif node_module:
+    #                 # Inherited - propagate but mark as less certain
+    #                 for out in node.output:
+    #                     tensor_to_module[out] = node_module
+    #             else:
+    #                 # No module - don't propagate
+    #                 for out in node.output:
+    #                     tensor_to_module[out] = ''
+
+    #             if node_idx < 3:
+    #                 print(f"        {new_node_name}")
+
+    #         print(f"      ✓ Done")
+
+    #     return onnx_model
+
+    # def process_onnx_with_hierarchy(
+    #     self,
+    #     onnx_model,
+    #     function_module_types: Set[type],
+    #     model: torch.nn.Module
+    # ) -> None:
+    #     """
+    #     Post-process ONNX model to inject hierarchical node names.
+    #     Uses operation patterns to identify attention vs MLP vs LayerNorm.
+    #     """
+    #     print("\n  Post-processing ONNX with hierarchy...")
+
+    #     # Find all module instances
+    #     module_instances = [
+    #         name for name, mod in model.named_modules()
+    #         if type(mod) in function_module_types and name
+    #     ]
+
+    #     print(f"    Found {len(module_instances)} module instances:")
+    #     for inst in module_instances:
+    #         print(f"      - {inst}")
+
+    #     if not onnx_model.functions:
+    #         print("    ⚠️  No functions found in ONNX model!")
+    #         return onnx_model
+
+    #     print(f"\n    Original functions: {[f.name for f in onnx_model.functions]}")
+
+    #     # Build weight-to-module mapping
+    #     weight_to_module = {}
+    #     for init in onnx_model.graph.initializer:
+    #         weight_name = init.name
+    #         for instance in module_instances:
+    #             if weight_name.startswith(instance + "."):
+    #                 relative_key = weight_name[len(instance) + 1:]
+    #                 if '.' in relative_key:
+    #                     relative_module = relative_key.rsplit('.', 1)[0]
+    #                     weight_to_module[weight_name] = (instance, relative_module)
+    #                     break
+
+    #     print(f"    Mapped {len(weight_to_module)} weights")
+
+    #     # Analyze calls
+    #     call_nodes_in_order = []
+    #     for node in onnx_model.graph.node:
+    #         if node.op_type in [f.name for f in onnx_model.functions]:
+    #             call_nodes_in_order.append(node)
+
+    #     call_to_instance = {}
+    #     for idx, call_node in enumerate(call_nodes_in_order):
+    #         if idx < len(module_instances):
+    #             call_to_instance[call_node.name] = module_instances[idx]
+
+    #     func_to_calls = {}
+    #     for call_node in call_nodes_in_order:
+    #         func_name = call_node.op_type
+    #         if func_name not in func_to_calls:
+    #             func_to_calls[func_name] = []
+    #         func_to_calls[func_name].append(call_node)
+
+    #     # Process each function
+    #     for func in onnx_model.functions:
+    #         print(f"\n    Processing: {func.name}")
+
+    #         calls_for_this_func = func_to_calls.get(func.name, [])
+    #         if not calls_for_this_func:
+    #             continue
+
+    #         representative_call = calls_for_this_func[0]
+    #         representative_instance = call_to_instance.get(representative_call.name)
+    #         if not representative_instance:
+    #             continue
+
+    #         print(f"      Instance: {representative_instance}")
+
+    #         # Build weight mapping
+    #         instance_weight_to_module = {}
+    #         for weight_name, (instance, rel_module) in weight_to_module.items():
+    #             if instance == representative_instance:
+    #                 instance_weight_to_module[weight_name] = rel_module
+
+    #         # Identify attention region by finding Softmax
+    #         softmax_indices = [i for i, n in enumerate(func.node) if n.op_type == 'Softmax']
+    #         print(f"      Found Softmax at indices: {softmax_indices}")
+
+    #         # Define regions based on patterns
+    #         # Typical transformer layer structure:
+    #         # 1. input_layernorm (0 to ~10)
+    #         # 2. self_attn (around softmax, ~10 to ~150)
+    #         # 3. residual add
+    #         # 4. post_attention_layernorm
+    #         # 5. mlp
+    #         # 6. final residual add
+
+    #         attention_region = set()
+    #         if softmax_indices:
+    #             # Attention region: 50 nodes before softmax to 50 nodes after
+    #             for softmax_idx in softmax_indices:
+    #                 for i in range(max(0, softmax_idx - 50), min(len(func.node), softmax_idx + 50)):
+    #                     attention_region.add(i)
+
+    #         print(f"      Attention region: {len(attention_region)} nodes")
+
+    #         # Track tensors
+    #         tensor_to_module = {}
+    #         tensor_is_constant = {}
+
+    #         for inp in func.input:
+    #             tensor_to_module[inp] = ''
+
+    #         for node in func.node:
+    #             if node.op_type == 'Constant':
+    #                 for out in node.output:
+    #                     tensor_is_constant[out] = True
+
+    #         # Process nodes
+    #         for node_idx, node in enumerate(func.node):
+    #             # Check if node uses weights
+    #             weight_modules = set()
+    #             for inp in node.input:
+    #                 if inp in instance_weight_to_module:
+    #                     weight_modules.add(instance_weight_to_module[inp])
+
+    #             # Determine module
+    #             if weight_modules:
+    #                 # Has weights - use weight module
+    #                 node_module = self.common_prefix(list(weight_modules)).rstrip('.')
+    #             elif node_idx in attention_region:
+    #                 # In attention region but no weights - it's self_attn
+    #                 node_module = 'self_attn'
+    #             else:
+    #                 # Check data flow
+    #                 data_modules = set()
+    #                 for inp in node.input:
+    #                     if inp in tensor_to_module and not tensor_is_constant.get(inp, False):
+    #                         if tensor_to_module[inp]:
+    #                             data_modules.add(tensor_to_module[inp])
+
+    #                 if data_modules:
+    #                     node_module = self.common_prefix(list(data_modules)).rstrip('.')
+    #                 else:
+    #                     # Check if it's likely MLP (after attention, has GELU nearby)
+    #                     # Look for GELU in nearby nodes
+    #                     has_gelu_nearby = any(
+    #                         func.node[i].op_type in ['Gelu', 'Relu', 'Silu']
+    #                         for i in range(max(0, node_idx - 10), min(len(func.node), node_idx + 10))
+    #                     )
+    #                     if has_gelu_nearby and node_idx > max(softmax_indices) if softmax_indices else False:
+    #                         node_module = 'mlp'
+    #                     else:
+    #                         node_module = ''
+
+    #             # Build path
+    #             full_path = representative_instance
+    #             if node_module:
+    #                 full_path += '.' + node_module
+
+    #             hier_path = self.path_to_hierarchical(full_path)
+    #             new_node_name = f"/{hier_path}/{node.op_type}"
+
+    #             # DEBUG for key operations
+    #             if node.op_type in ['Softmax', 'Gelu', 'Silu']:
+    #                 print(f"      {node.op_type} at {node_idx}: {new_node_name}")
+
+    #             # Update name
+    #             node.name = new_node_name
+
+    #             # Propagate
+    #             for out in node.output:
+    #                 tensor_to_module[out] = node_module
+
+    #             if node_idx < 3:
+    #                 print(f"        {new_node_name}")
+
+    #         print(f"      ✓ Done")
+
+    #     return onnx_model
+
+    # Add these methods to your QEFFBaseModel class
+
+    def common_prefix(self, strings: List[str]) -> str:
+        """
+        Find the longest common prefix among a list of strings.
+
+        Args:
+            strings: List of strings to compare
+
+        Returns:
+            Common prefix string, empty if no common prefix exists
+        """
+        if not strings:
+            return ""
+
+        min_s = min(strings)
+        max_s = max(strings)
+
+        if not min_s:
+            return ""
+
+        for i in range(len(min_s)):
+            if min_s[i] != max_s[i]:
+                return min_s[:i]
+
+        return min_s
+
+    def path_to_hierarchical(self, dot_path: str) -> str:
+        """
+        Convert PyTorch dot notation to hierarchical path format.
+        Keeps numeric indices attached to their parent module.
+
+        Args:
+            dot_path: Module path in dot notation
+
+        Returns:
+            Hierarchical path with slashes
+        """
+        parts = dot_path.split(".")
+        hier_parts = []
+
+        for p in parts:
+            if p.isdigit() and hier_parts:
+                hier_parts[-1] += "." + p
+            else:
+                hier_parts.append(p)
+
+        return "/".join(hier_parts)
+
+    def extract_submodule_structure(self, pytorch_model, function_module_types: Set[type]) -> Dict[str, Dict[str, str]]:
+        """
+        Extract the actual submodule structure from PyTorch model.
+
+        Args:
+            pytorch_model: Original PyTorch model
+            function_module_types: Set of module types exported as functions
+
+        Returns:
+            Dictionary mapping instance_path -> {submodule_name: submodule_type}
+
+        Example:
+            {
+                'model.layers.0': {
+                    'self_attn': 'LlamaAttention',
+                    'mlp': 'LlamaMLP',
+                    'input_layernorm': 'LlamaRMSNorm',
+                    'post_attention_layernorm': 'LlamaRMSNorm'
+                },
+                'model.layers.1': {...}
+            }
+        """
+        submodule_structure = {}
+
+        for name, module in pytorch_model.named_modules():
+            if type(module) in function_module_types and name:
+                # This is a function module instance (e.g., model.layers.0)
+                submodules = {}
+
+                for child_name, child_module in module.named_children():
+                    submodules[child_name] = type(child_module).__name__
+
+                submodule_structure[name] = submodules
+
+        return submodule_structure
+
+    def categorize_submodules(self, submodules: Dict[str, str]) -> Dict[str, str]:
+        """
+        Categorize submodules into functional types (attention, mlp, norm, etc.).
+
+        Args:
+            submodules: Dictionary of {submodule_name: submodule_type}
+
+        Returns:
+            Dictionary mapping category -> actual_submodule_name
+
+        Example:
+            Input: {'self_attn': 'LlamaAttention', 'mlp': 'LlamaMLP'}
+            Output: {'attention': 'self_attn', 'mlp': 'mlp'}
+        """
+        categories = {}
+
+        # Attention patterns
+        attention_patterns = [
+            "attn",
+            "attention",
+            "self_attn",
+            "self_attention",
+            "cross_attn",
+            "cross_attention",
+            "mha",
+            "multihead",
+        ]
+
+        # MLP/FFN patterns
+        mlp_patterns = ["mlp", "ffn", "feed_forward", "feedforward", "ff", "dense", "intermediate"]
+
+        # Normalization patterns
+        norm_patterns = ["norm", "layernorm", "layer_norm", "rmsnorm", "rms_norm", "ln", "normalization"]
+
+        for submodule_name, submodule_type in submodules.items():
+            name_lower = submodule_name.lower()
+            type_lower = submodule_type.lower()
+            combined = name_lower + " " + type_lower
+
+            # Check attention
+            if any(pattern in combined for pattern in attention_patterns):
+                if "attention" not in categories:  # Use first match
+                    categories["attention"] = submodule_name
+
+            # Check MLP
+            elif any(pattern in combined for pattern in mlp_patterns):
+                if "mlp" not in categories:
+                    categories["mlp"] = submodule_name
+
+            # Check normalization (can have multiple)
+            elif any(pattern in combined for pattern in norm_patterns):
+                # Distinguish pre/post norms
+                if "input" in name_lower or "pre" in name_lower or name_lower.endswith("1"):
+                    categories["norm_pre_attn"] = submodule_name
+                elif "post" in name_lower or name_lower.endswith("2"):
+                    categories["norm_post_attn"] = submodule_name
+                else:
+                    # Generic norm
+                    if "norm" not in categories:
+                        categories["norm"] = submodule_name
+
+        return categories
+
+    def identify_attention_regions(self, nodes: List, window_size: int = 50) -> Set[int]:
+        """
+        Identify node indices that belong to attention mechanisms.
+        Uses Softmax as anchor point.
+        """
+        attention_region = set()
+        softmax_indices = [i for i, node in enumerate(nodes) if node.op_type == "Softmax"]
+
+        for softmax_idx in softmax_indices:
+            start = max(0, softmax_idx - window_size)
+            end = min(len(nodes), softmax_idx + window_size)
+            attention_region.update(range(start, end))
+
+        return attention_region
+
+    def identify_mlp_regions(self, nodes: List, attention_region: Set[int], window_size: int = 30) -> Set[int]:
+        """
+        Identify node indices that belong to MLP/FFN layers.
+        Uses activation functions as indicators.
+        """
+        mlp_region = set()
+        activation_ops = {"Gelu", "Relu", "Silu", "Tanh", "Swish"}
+
+        activation_indices = [
+            i for i, node in enumerate(nodes) if node.op_type in activation_ops and i not in attention_region
+        ]
+
+        for act_idx in activation_indices:
+            start = max(0, act_idx - window_size)
+            end = min(len(nodes), act_idx + window_size)
+            mlp_region.update(range(start, end))
+
+        return mlp_region
+
+    def infer_node_module_with_structure(
+        self,
+        node,
+        node_idx: int,
+        instance_weight_to_module: Dict[str, str],
+        tensor_to_module: Dict[str, str],
+        tensor_is_constant: Dict[str, bool],
+        attention_region: Set[int],
+        mlp_region: Set[int],
+        submodule_categories: Dict[str, str],
+    ) -> str:
+        """
+        Infer which submodule a node belongs to using actual PyTorch structure.
+
+        Args:
+            node: ONNX node to analyze
+            node_idx: Index of node in function
+            instance_weight_to_module: Weight to module mapping
+            tensor_to_module: Tensor ownership tracking
+            tensor_is_constant: Constant tensor flags
+            attention_region: Set of attention node indices
+            mlp_region: Set of MLP node indices
+            submodule_categories: Mapping of category -> actual submodule name
+
+        Returns:
+            Actual submodule name from PyTorch model
+        """
+        # Strategy 1: Direct weight usage (most reliable)
+        weight_modules = {instance_weight_to_module[inp] for inp in node.input if inp in instance_weight_to_module}
+
+        if weight_modules:
+            return self.common_prefix(list(weight_modules)).rstrip(".")
+
+        # Strategy 2: Pattern-based with actual names
+        if node_idx in attention_region:
+            # Use actual attention submodule name
+            return submodule_categories.get("attention", "self_attn")
+
+        if node_idx in mlp_region:
+            # Use actual MLP submodule name
+            return submodule_categories.get("mlp", "mlp")
+
+        # Strategy 3: Inherit from data flow
+        data_modules = {
+            tensor_to_module[inp]
+            for inp in node.input
+            if inp in tensor_to_module and not tensor_is_constant.get(inp, False) and tensor_to_module[inp]
+        }
+
+        if data_modules:
+            return self.common_prefix(list(data_modules)).rstrip(".")
+
+        return ""
+
+    def process_onnx_with_hierarchy(self, onnx_model, function_module_types: Set[type], pytorch_model):
+        """
+        Post-process ONNX model to inject hierarchical node names using actual PyTorch structure.
+
+        This hybrid approach:
+        1. Extracts actual submodule names from PyTorch model
+        2. Uses pattern detection to identify functional regions
+        3. Maps regions to actual submodule names
+
+        Args:
+            onnx_model: Loaded ONNX model (onnx.ModelProto)
+            function_module_types: Set of PyTorch module types exported as functions
+            pytorch_model: Original PyTorch model for reference
+
+        Returns:
+            Modified ONNX model with hierarchical node names using actual PyTorch names
+        """
+        # Extract actual submodule structure from PyTorch
+        submodule_structure = self.extract_submodule_structure(pytorch_model, function_module_types)
+
+        if not submodule_structure:
+            return onnx_model
+
+        if not onnx_model.functions:
+            return onnx_model
+
+        # Build weight-to-module mapping
+        weight_to_module = {}
+        for init in onnx_model.graph.initializer:
+            weight_name = init.name
+            for instance in submodule_structure.keys():
+                if weight_name.startswith(instance + "."):
+                    relative_key = weight_name[len(instance) + 1 :]
+                    if "." in relative_key:
+                        relative_module = relative_key.rsplit(".", 1)[0]
+                        weight_to_module[weight_name] = (instance, relative_module)
+                        break
+
+        # Map function calls to module instances
+        call_nodes_in_order = [
+            node for node in onnx_model.graph.node if node.op_type in [f.name for f in onnx_model.functions]
+        ]
+
+        module_instances = list(submodule_structure.keys())
+        call_to_instance = {
+            call_node.name: module_instances[idx]
+            for idx, call_node in enumerate(call_nodes_in_order)
+            if idx < len(module_instances)
+        }
+
+        # Group calls by function name
+        func_to_calls = defaultdict(list)
+        for call_node in call_nodes_in_order:
+            func_to_calls[call_node.op_type].append(call_node)
+
+        # Process each function
+        for func in onnx_model.functions:
+            calls_for_this_func = func_to_calls.get(func.name, [])
+            if not calls_for_this_func:
+                continue
+
+            representative_call = calls_for_this_func[0]
+            representative_instance = call_to_instance.get(representative_call.name)
+            if not representative_instance:
+                continue
+
+            # Get actual submodule structure for this instance
+            instance_submodules = submodule_structure.get(representative_instance, {})
+            submodule_categories = self.categorize_submodules(instance_submodules)
+
+            # Build weight mapping for this instance
+            instance_weight_to_module = {
+                weight_name: rel_module
+                for weight_name, (instance, rel_module) in weight_to_module.items()
+                if instance == representative_instance
+            }
+
+            # Identify functional regions
+            attention_region = self.identify_attention_regions(func.node)
+            mlp_region = self.identify_mlp_regions(func.node, attention_region)
+
+            # Initialize tensor tracking
+            tensor_to_module = {inp: "" for inp in func.input}
+            tensor_is_constant = {out: True for node in func.node if node.op_type == "Constant" for out in node.output}
+
+            # Process each node
+            for node_idx, node in enumerate(func.node):
+                # Infer module using actual PyTorch structure
+                node_module = self.infer_node_module_with_structure(
+                    node,
+                    node_idx,
+                    instance_weight_to_module,
+                    tensor_to_module,
+                    tensor_is_constant,
+                    attention_region,
+                    mlp_region,
+                    submodule_categories,
+                )
+
+                # Build full hierarchical path
+                full_path = representative_instance
+                if node_module:
+                    full_path += "." + node_module
+
+                hier_path = self.path_to_hierarchical(full_path)
+                node.name = f"/{hier_path}/{node.op_type}"
+
+                # Propagate module info
+                for out in node.output:
+                    tensor_to_module[out] = node_module
+
+        return onnx_model
+
     @export_wrapper
     def _export(
         self,
@@ -288,6 +1056,11 @@ class QEFFBaseModel(ABC):
             logger.info("PyTorch export successful")
             _ = self._offload_model_weights(offload_pt_weights)
             model = onnx.load(tmp_onnx_path, load_external_data=False)
+            # model = self.process_onnx_with_hierarchy(model, export_kwargs["export_modules_as_functions"], self.model)
+            if "export_modules_as_functions" in export_kwargs and export_kwargs["export_modules_as_functions"]:
+                model = self.process_onnx_with_hierarchy(
+                    model, export_kwargs["export_modules_as_functions"], self.model
+                )
 
             # Clear temporary references
             transform_kwargs = {
