@@ -12,7 +12,11 @@ import warnings
 from pathlib import Path
 from typing import Dict
 
-from QEfficient.base.onnx_transforms import CustomOpTransform, RenameFunctionOutputsTransform
+from QEfficient.base.onnx_transforms import (
+    CustomOpTransform,
+    HierarchyPreservationTransform,
+    RenameFunctionOutputsTransform,
+)
 from QEfficient.transformers.cache_utils import InvalidIndexProvider
 from QEfficient.transformers.models.pytorch_transforms import get_decoder_layer_classes_for_export
 from QEfficient.utils.cache import QEFF_HOME
@@ -171,6 +175,7 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
         args[1] = [re.sub("_RetainedState", "_InternalRetainedState", name) for name in args[1]]
         args = tuple(args)
     # Add subfunction-specific ONNX transforms
+    qeff_model._onnx_transforms.append(HierarchyPreservationTransform)
     qeff_model._onnx_transforms.append(RenameFunctionOutputsTransform)
     qeff_model._onnx_transforms.append(CustomOpTransform)
 
@@ -201,6 +206,7 @@ def _cleanup_onnx_subfunctions(qeff_model):
     # Undo torch patches
     undo_torch_patches()
     InvalidIndexProvider.SUBFUNC_ENABLED = False
+    qeff_model._onnx_transforms.remove(HierarchyPreservationTransform)
     qeff_model._onnx_transforms.remove(RenameFunctionOutputsTransform)
     qeff_model._onnx_transforms.remove(CustomOpTransform)
 
