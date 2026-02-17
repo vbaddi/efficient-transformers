@@ -45,20 +45,25 @@ class QEFFBaseModel(ABC):
     Provides certain utility methods to be used by child classes.
 
     Class variables:
-    :_pytorch_transforms: Pytorch transformations to be applied after initialization.
+    :_pytorch_transforms: Pytorch transformations to be applied before ONNX export.
     :_onnx_transforms: ONNX transformations to be applied after ONNX export.
     """
 
     _pytorch_transforms: List[PytorchTransform]
     _onnx_transforms = [BaseOnnxTransform]
 
-    @classmethod
-    def _transform_names(cls) -> List[str]:
-        return [x.__name__ for x in cls._pytorch_transforms + cls._onnx_transforms]
+    def _transform_names(self) -> List[str]:
+        return [
+            getattr(x, "transform_name", getattr(x, "__name__", x.__class__.__name__))
+            for x in self._pytorch_transforms_to_apply + self._onnx_transforms
+        ]
 
     def __init__(self, model: torch.nn.Module, **kwargs) -> None:
         super().__init__()
         self.model = model
+        # Defer PyTorch transforms to export stage.
+        self._pytorch_transforms_to_apply = list(self._pytorch_transforms)
+        self._pytorch_transforms_applied = False
         self.hash_params = create_model_params(self, **kwargs)
         self.onnx_path: Optional[str] = None
         self.qpc_path: Optional[str] = None
@@ -70,9 +75,12 @@ class QEFFBaseModel(ABC):
         # Flag for checking if weights are offloaded
         self._is_weights_offloaded: bool = False
 
-        # Apply the transformations
+    def _apply_pytorch_transforms(self) -> None:
+        if self._pytorch_transforms_applied:
+            return
+
         any_transformed = False
-        for transform in self._pytorch_transforms:
+        for transform in self._pytorch_transforms_to_apply:
             self.model, transformed = transform.apply(self.model)
             any_transformed = any_transformed or transformed
 
@@ -80,6 +88,7 @@ class QEFFBaseModel(ABC):
             warnings.warn(f"No transforms applied to model: {self.model_name}. It may be an unsupported model!")
         else:
             logger.info(f"Pytorch transforms applied to model: {self.model_name}")
+        self._pytorch_transforms_applied = True
 
     def _offload_model_weights(self, offload_pt_weights: bool) -> bool:
         """Clear PyTorch model weights to reduce memory usage after ONNX export."""

@@ -40,6 +40,10 @@ def export_wrapper(func):
     """
 
     def wrapper(self, *args, **kwargs):
+        # Ensure deferred PyTorch transforms are applied before hashing/export.
+        if hasattr(self, "_apply_pytorch_transforms"):
+            self._apply_pytorch_transforms()
+
         # 1. Setup ONNX subfunctions if requested
         if use_onnx_subfunctions := kwargs.pop("use_onnx_subfunctions", False):
             args, kwargs = _setup_onnx_subfunctions(self, args, kwargs)

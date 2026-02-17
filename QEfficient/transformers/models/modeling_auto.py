@@ -75,6 +75,40 @@ from QEfficient.utils.logging_utils import logger
 from QEfficient.utils.sampler_utils import get_sampling_inputs_and_outputs
 
 
+class _SpDTransformWrapper:
+    transform_name = "SpDTransform"
+
+    def __init__(self, qaic_config: Optional[dict], **kwargs) -> None:
+        self.qaic_config = qaic_config
+        self.kwargs = kwargs
+
+    def apply(self, model: nn.Module):
+        return SpDTransform.apply(model, self.qaic_config, **dict(self.kwargs))
+
+
+class _SamplerTransformWrapper:
+    transform_name = "SamplerTransform"
+
+    def __init__(self, qaic_config: Optional[dict], **kwargs) -> None:
+        self.qaic_config = qaic_config
+        self.kwargs = kwargs
+
+    def apply(self, model: nn.Module):
+        return SamplerTransform.apply(model, self.qaic_config, **dict(self.kwargs))
+
+
+class _BlockedKVAttentionTransformWrapper:
+    transform_name = "BlockedKVAttentionTransform"
+
+    def __init__(self, qaic_config: Optional[dict]) -> None:
+        self.qaic_config = qaic_config
+
+    def apply(self, model: nn.Module):
+        if self.qaic_config is not None and self.qaic_config.get("num_kv_blocks", None) is not None:
+            return BlockedKVAttentionTransform.apply(model, num_kv_blocks=self.qaic_config.get("num_kv_blocks"))
+        return model, False
+
+
 class QEFFTransformersBase(QEFFBaseModel):
     """
     Base class for QEfficient wrappers around HuggingFace transformer models.
@@ -989,9 +1023,8 @@ class QEffCausalLMForTextImageToTextModel(QEFFBaseModel):
         self.model = model.get_qeff_language_decoder()
         self.model.qaic_config = qaic_config
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
-
-        if self.model.qaic_config is not None and self.model.qaic_config.get("num_kv_blocks", None) is not None:
-            BlockedKVAttentionTransform.apply(self.model, num_kv_blocks=self.model.qaic_config.get("num_kv_blocks"))
+        self._pytorch_transforms_to_apply.append(_BlockedKVAttentionTransformWrapper(qaic_config=qaic_config))
+        self.hash_params["applied_transform_names"] = self._transform_names()
 
     def export(self, inputs, output_names, dynamic_axes, export_dir=None, offload_pt_weights=True, **kwargs):
         """
@@ -1144,11 +1177,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             self.ccl_enabled = qaic_config.get("ccl_enabled", False)
         self.comp_ctx_lengths_prefill, self.comp_ctx_lengths_decode = None, None
         self.input_shapes, self.output_names = None, None
-        # ---Sampling---
-        # Note: SamplerTransform should be applied after all other transforms
-        # are done. The role of the sampler is to just add nodes at the output of the
-        # previous transform function.
-        self.lang_model.model, _ = SamplerTransform.apply(self.lang_model.model, qaic_config, **kwargs)
+        self.lang_model._pytorch_transforms_to_apply.append(_SamplerTransformWrapper(qaic_config=qaic_config, **kwargs))
+        self.lang_model.hash_params["applied_transform_names"] = self.lang_model._transform_names()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, qaic_config: Optional[dict] = None, **kwargs):
@@ -1881,9 +1911,8 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
         if qaic_config:
             self.ccl_enabled = qaic_config.get("ccl_enabled", False)
         self.comp_ctx_lengths_prefill, self.comp_ctx_lengths_decode = None, None
-
-        if self.model.qaic_config is not None and self.model.qaic_config.get("num_kv_blocks", None) is not None:
-            BlockedKVAttentionTransform.apply(self.model, num_kv_blocks=self.model.qaic_config.get("num_kv_blocks"))
+        self._pytorch_transforms_to_apply.append(_BlockedKVAttentionTransformWrapper(qaic_config=qaic_config))
+        self.hash_params["applied_transform_names"] = self._transform_names()
 
     @classmethod
     def from_pretrained(
@@ -2640,28 +2669,24 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         self.num_layers = model.config.num_hidden_layers
         self.continuous_batching = continuous_batching
         self.model.qaic_config = qaic_config
-        self.model, transformed = SpDTransform.apply(self.model, qaic_config, **kwargs)
-        self.is_tlm = transformed
-
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
         self.ccl_enabled = False
         if qaic_config:
             self.ccl_enabled = qaic_config.get("ccl_enabled", False)
         self.comp_ctx_lengths_prefill, self.comp_ctx_lengths_decode = None, None
         self.hash_params["max_seq_len_cached"] = max_seq_len_cached
-
-        # ---Sampling---
-        # Note: SamplerTransform should be applied after all other transforms
-        # are done. The role of the sampler is to just add nodes at the output of the
-        # previous transform function.
-        self.model, transformed = SamplerTransform.apply(self.model, qaic_config, **kwargs)
-        # TODO : Update in qaic_config isn't updated in the hash due to SpDTransforms. Need to move
-        # SpDTransforms to PytorchTransforms.
-        if self.is_tlm:
+        self.is_tlm = qaic_config is not None and qaic_config.get("speculative_model_type") is not None
+        if self.is_tlm and self.model.qaic_config is not None:
             self.model.qaic_config["return_pdfs"] = True
 
-        if self.model.qaic_config is not None and self.model.qaic_config.get("num_kv_blocks", None) is not None:
-            BlockedKVAttentionTransform.apply(self.model, num_kv_blocks=self.model.qaic_config.get("num_kv_blocks"))
+        self._pytorch_transforms_to_apply.extend(
+            [
+                _SpDTransformWrapper(qaic_config=qaic_config, **kwargs),
+                _SamplerTransformWrapper(qaic_config=qaic_config, **kwargs),
+                _BlockedKVAttentionTransformWrapper(qaic_config=qaic_config),
+            ]
+        )
+        self.hash_params["applied_transform_names"] = self._transform_names()
 
     def __repr__(self) -> str:
         return self.__class__.__name__ + "\n" + self.model.__repr__()
@@ -2841,6 +2866,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         str
             Path to the generated ONNX graph file.
         """
+        self._apply_pytorch_transforms()
+
         bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
         seq_len: int = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
         fbs: int = constants.ONNX_EXPORT_EXAMPLE_FBS
