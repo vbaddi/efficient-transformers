@@ -175,9 +175,15 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLTextModel,
     Qwen2_5_VLVisionAttention,
 )
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2RMSNorm as Qwen2_5RMSNorm,
-)
+
+try:
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+        Qwen2RMSNorm as Qwen2_5RMSNorm,
+    )
+except ImportError:
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+        Qwen2_5_VLRMSNorm as Qwen2_5RMSNorm,
+    )
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
     Qwen3DecoderLayer,
@@ -194,6 +200,18 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeRotaryEmbedding,
     Qwen3MoeSparseMoeBlock,
 )
+
+try:
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5Attention,
+        Qwen3_5DecoderLayer,
+        Qwen3_5ForCausalLM,
+        Qwen3_5TextModel,
+    )
+
+    _QWEN3_5_AVAILABLE = True
+except ImportError:
+    _QWEN3_5_AVAILABLE = False
 from transformers.models.starcoder2.modeling_starcoder2 import (
     Starcoder2Attention,
     Starcoder2DecoderLayer,
@@ -432,6 +450,14 @@ from QEfficient.transformers.models.qwen3_moe.modeling_qwen3_moe import (
     QEffQwen3MoeRotaryEmbedding,
     QEffQwen3MoeSparseMoeBlock,
 )
+
+if _QWEN3_5_AVAILABLE:
+    from QEfficient.transformers.models.qwen3_5.modeling_qwen3_5 import (
+        QEffQwen3_5Attention,
+        QEffQwen3_5DecoderLayer,
+        QEffQwen3_5ForCausalLM,
+        QEffQwen3_5TextModel,
+    )
 from QEfficient.transformers.models.starcoder2.modeling_starcoder2 import (
     QEffStarcoder2Attention,
     QEFFStarcoder2DecoderLayer,
@@ -653,6 +679,16 @@ class KVCacheTransform(ModuleMappingTransform):
         WhisperForConditionalGeneration: QEffWhisperForConditionalGeneration,
     }
 
+    if _QWEN3_5_AVAILABLE:
+        _module_mapping.update(
+            {
+                Qwen3_5Attention: QEffQwen3_5Attention,
+                Qwen3_5DecoderLayer: QEffQwen3_5DecoderLayer,
+                Qwen3_5TextModel: QEffQwen3_5TextModel,
+                Qwen3_5ForCausalLM: QEffQwen3_5ForCausalLM,
+            }
+        )
+
     @classmethod
     def apply(cls, model: nn.Module) -> Tuple[nn.Module, bool]:
         model, transformed = super().apply(model)
@@ -714,6 +750,9 @@ class SpDTransform:
         QEffQwen2ForCausalLM,
         QEffQwen3ForCausalLM,
     }
+
+    if _QWEN3_5_AVAILABLE:
+        _module_mapping.add(QEffQwen3_5ForCausalLM)
 
     @classmethod
     def apply(cls, model: nn.Module, qaic_config: Optional[dict] = None, **kwargs) -> Tuple[nn.Module, bool]:

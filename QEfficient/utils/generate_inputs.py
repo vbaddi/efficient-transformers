@@ -51,6 +51,21 @@ class InputHandler:
             config=config, batch_size=full_batch_size if full_batch_size else batch_size, seq_len=ctx_len
         )
 
+    def _is_qwen3_5_linear_layer(self, layer_idx):
+        return hasattr(self.config, "layer_types") and self.config.layer_types[layer_idx] == "linear_attention"
+
+    def _get_qwen3_5_linear_state_shapes(self, batch_size):
+        conv_dim = self.config.linear_key_head_dim * self.config.linear_num_key_heads * 2
+        conv_dim += self.config.linear_value_head_dim * self.config.linear_num_value_heads
+        conv_shape = (batch_size, conv_dim, self.config.linear_conv_kernel_dim)
+        recurrent_shape = (
+            batch_size,
+            self.config.linear_num_value_heads,
+            self.config.linear_key_head_dim,
+            self.config.linear_value_head_dim,
+        )
+        return conv_shape, recurrent_shape
+
     def prepare_pytorch_inputs(self):
         """
         Function responsible for creating Prefill stage tensor inputs for PyTorch model.
@@ -93,16 +108,23 @@ class InputHandler:
 
         past_key_values = []
         for i in range(self.n_layer):
-            if (
-                all(hasattr(self.config, attr) for attr in ["sliding_window", "layer_types"])
-                and self.config.layer_types[i] == "sliding_attention"
-            ):
-                pad_shape = self.padding_shape[:2] + [self.config.sliding_window] + [self.padding_shape[-1]]
+            if self._is_qwen3_5_linear_layer(i):
+                conv_shape, recurrent_shape = self._get_qwen3_5_linear_state_shapes(usable_bs)
+                pkv = (
+                    torch.zeros(conv_shape, dtype=torch.float32),
+                    torch.zeros(recurrent_shape, dtype=torch.float32),
+                )
             else:
-                pad_shape = self.padding_shape
-            past_key = torch.zeros((pad_shape), dtype=torch.float32)
-            past_value = torch.zeros((pad_shape), dtype=torch.float32)
-            pkv = (past_key, past_value)
+                if (
+                    all(hasattr(self.config, attr) for attr in ["sliding_window", "layer_types"])
+                    and self.config.layer_types[i] == "sliding_attention"
+                ):
+                    pad_shape = self.padding_shape[:2] + [self.config.sliding_window] + [self.padding_shape[-1]]
+                else:
+                    pad_shape = self.padding_shape
+                past_key = torch.zeros((pad_shape), dtype=torch.float32)
+                past_value = torch.zeros((pad_shape), dtype=torch.float32)
+                pkv = (past_key, past_value)
             past_key_values.append(pkv)
         inputs["past_key_values"] = tuple(past_key_values)
 
@@ -167,13 +189,19 @@ class InputHandler:
             axis=1,
         ).astype(np.int64)
 
-        if hasattr(self.config, "model_type") and self.config.model_type in DYNAMIC_SEQ_LEN_SUPPORTED_MODEL_ARCH:
-            for i in range(self.n_layer):
+        ort_batch_size = self.full_batch_size if self.full_batch_size else batch_size
+        for i in range(self.n_layer):
+            if self._is_qwen3_5_linear_layer(i):
+                conv_shape, recurrent_shape = self._get_qwen3_5_linear_state_shapes(ort_batch_size)
+                inputs["conv_state." + str(i)] = np.zeros(conv_shape, dtype=np.float32)
+                inputs["recurrent_state." + str(i)] = np.zeros(recurrent_shape, dtype=np.float32)
+                continue
+
+            if hasattr(self.config, "model_type") and self.config.model_type in DYNAMIC_SEQ_LEN_SUPPORTED_MODEL_ARCH:
                 cache_shape = self.global_shape if not self.is_chunked_attention[i] else self.sliding_shape
                 inputs["past_key." + str(i)] = np.zeros((cache_shape), dtype=np.float32)
                 inputs["past_value." + str(i)] = np.zeros((cache_shape), dtype=np.float32)
-        else:
-            for i in range(self.n_layer):
+            else:
                 if (
                     all(hasattr(self.config, attr) for attr in ["sliding_window", "layer_types"])
                     and self.config.layer_types[i] == "sliding_attention"
@@ -202,9 +230,12 @@ class InputHandler:
         updated_inputs = {}
         updated_inputs["input_ids"] = ort_outputs["logits"].argmax(-1)
         updated_inputs["position_ids"] = np.max(inputs["position_ids"], axis=1, keepdims=True) + 1
-        for i in range(self.n_layer):
-            updated_inputs["past_key." + str(i)] = ort_outputs["past_key_values"][i * 2]
-            updated_inputs["past_value." + str(i)] = ort_outputs["past_key_values"][i * 2 + 1]
+        if "retained_states" in ort_outputs:
+            updated_inputs.update(ort_outputs["retained_states"])
+        else:
+            for i in range(self.n_layer):
+                updated_inputs["past_key." + str(i)] = ort_outputs["past_key_values"][i * 2]
+                updated_inputs["past_value." + str(i)] = ort_outputs["past_key_values"][i * 2 + 1]
         if self.full_batch_size:
             updated_inputs["batch_index"] = inputs["batch_index"]
         return updated_inputs
@@ -221,14 +252,20 @@ class InputHandler:
         """
 
         present_key_values = []
+        retained_states = {}
+        for name, value in ort_outputs.items():
+            if name.endswith("_RetainedState"):
+                retained_states[name[: -len("_RetainedState")]] = value
+
         for i in range(self.n_layer):
-            if "past_key." + str(i) + "_RetainedState" in ort_outputs:
-                present_key_values.append(ort_outputs["past_key." + str(i) + "_RetainedState"])
-            if "past_value." + str(i) + "_RetainedState" in ort_outputs:
-                present_key_values.append(ort_outputs["past_value." + str(i) + "_RetainedState"])
+            if "past_key." + str(i) in retained_states:
+                present_key_values.append(retained_states["past_key." + str(i)])
+            if "past_value." + str(i) in retained_states:
+                present_key_values.append(retained_states["past_value." + str(i)])
 
         outputs = {}
         outputs["past_key_values"] = present_key_values
+        outputs["retained_states"] = retained_states
         outputs["logits"] = ort_outputs["logits"]
 
         return outputs

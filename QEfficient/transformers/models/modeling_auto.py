@@ -2987,8 +2987,23 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         else:
             output_names.append("logits")
 
+        past_key_values_input_names = None
+
         # TODO Update the get_padding_shape_from_config method to handle the case when the model config has attention_chunk_size or sliding_window and it should return a list of shapes for each layer
-        if (
+        if hasattr(self.model, "get_onnx_retained_state_specs"):
+            retained_state_specs = self.model.get_onnx_retained_state_specs(
+                batch_size=fbs if self.continuous_batching else bs,
+                seq_len=seq_len,
+                kv_cache_shape=kv_cache_shape,
+                continuous_batching=self.continuous_batching,
+                retain_full_kv=kwargs.get("retain_full_kv", False)
+                or (prefill_only and kwargs.get("enable_chunking", False)),
+            )
+            example_inputs["past_key_values"] = retained_state_specs["past_key_values"]
+            past_key_values_input_names = retained_state_specs["input_names"]
+            dynamic_axes.update(retained_state_specs["dynamic_axes"])
+            output_names.extend(retained_state_specs["output_names"])
+        elif (
             hasattr(self.model.config, "model_type")
             and self.model.config.model_type in DYNAMIC_SEQ_LEN_SUPPORTED_MODEL_ARCH
         ):
@@ -3046,6 +3061,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             example_inputs,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
+            past_key_values_input_names=past_key_values_input_names,
             export_dir=export_dir,
             use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
             offload_pt_weights=kwargs.get("offload_pt_weights", True),
@@ -3402,12 +3418,18 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             specializations = kw_spec
         # --- Compilation ---
         kv_cache_dtype = "mxint8" if mxint8_kv_cache else "float16"
-        custom_io = {}
+        if hasattr(self.model, "get_retained_state_names"):
+            custom_io = {}
+            for base_name in self.model.get_retained_state_names():
+                custom_io[base_name] = kv_cache_dtype
+                custom_io[f"{base_name}_RetainedState"] = kv_cache_dtype
+        else:
+            custom_io = {}
 
-        for suffix in ["", "_RetainedState"]:
-            for i in range(self.num_layers):
-                for kv in ["key", "value"]:
-                    custom_io[f"past_{kv}.{i}{suffix}"] = kv_cache_dtype
+            for suffix in ["", "_RetainedState"]:
+                for i in range(self.num_layers):
+                    for kv in ["key", "value"]:
+                        custom_io[f"past_{kv}.{i}{suffix}"] = kv_cache_dtype
         qpc_path = self._compile(
             onnx_path=onnx_path,
             compile_dir=compile_dir,

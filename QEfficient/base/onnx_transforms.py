@@ -140,13 +140,13 @@ class RenameFunctionOutputsTransform(BaseOnnxTransform):
                     if "_InternalRetainedState" in out_name:
                         renamed = True
                         orig = node.output[i]
-                        new = (
-                            f"past_key.{layer_idx}_RetainedState"
-                            if "key" in out_name
-                            else f"past_value.{layer_idx}_RetainedState"
-                            if "value" in out_name
-                            else orig
-                        )
+                        state_name = out_name.replace("_InternalRetainedState", "")
+                        if state_name == "key":
+                            new = f"past_key.{layer_idx}_RetainedState"
+                        elif state_name == "value":
+                            new = f"past_value.{layer_idx}_RetainedState"
+                        else:
+                            new = f"{state_name}.{layer_idx}_RetainedState"
                         node.output[i] = new
                         if orig in model_out_map:
                             graph.output[model_out_map[orig]].name = new

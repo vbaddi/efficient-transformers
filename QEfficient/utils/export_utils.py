@@ -164,15 +164,13 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
     # Transform output names for subfunction compatibility
     if "output_names" in kwargs:
         kwargs["output_names"] = [
-            re.sub("_RetainedState", "_InternalRetainedState", name)
-            if name.endswith("_RetainedState") and ("key" in name or "value" in name)
-            else name
+            re.sub("_RetainedState", "_InternalRetainedState", name) if name.endswith("_RetainedState") else name
             for name in kwargs["output_names"]
         ]
     else:
         warnings.warn(
             "ONNX subfunctions are enabled, but no retained-state output names were found to rewrite. "
-            "Ensure `output_names` includes key/value retained states if subfunction compatibility is required."
+            "Ensure `output_names` includes retained-state outputs if subfunction compatibility is required."
         )
 
     # Add subfunction-specific ONNX transforms

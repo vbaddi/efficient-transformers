@@ -224,18 +224,26 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
     def _setup_vision_buffer_skipping(self):
         """Skip KV cache and retained state buffers for vision session"""
         # Pre-compute skip buffers
+        vision_retained_state_inputs = {
+            name[: -len("_RetainedState")]
+            for name in self._vision_session.output_names
+            if name.endswith("_RetainedState")
+        }
         self._vision_skip_buffers = [
             x
             for x in self._vision_session.input_names + self._vision_session.output_names
-            if x.startswith("past_") or x.endswith("_RetainedState")
+            if x.startswith("past_") or x.endswith("_RetainedState") or x in vision_retained_state_inputs
         ]
         self._vision_session.skip_buffers(self._vision_skip_buffers)
 
         # Pre-compute language skip buffers
+        lang_retained_state_inputs = {
+            name[: -len("_RetainedState")] for name in self._session.output_names if name.endswith("_RetainedState")
+        }
         self._lang_skip_buffers = [
             x
             for x in self._session.input_names + self._session.output_names
-            if x.startswith("past_") or x.endswith("_RetainedState")
+            if x.startswith("past_") or x.endswith("_RetainedState") or x in lang_retained_state_inputs
         ]
 
     def run_prefill_for_all_inputs(self, prompt_queue, generation_len):

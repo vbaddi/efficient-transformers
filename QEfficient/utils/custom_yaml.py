@@ -63,12 +63,18 @@ class CausalLMIOGenerator(CustomIOGenerator):
         Returns:
             dict: Mapping of IO names to precision types.
         """
-        custom_io = {}
-        num_layers = getattr(self.model, "num_layers", 12)
-        for suffix in ["", "_RetainedState"]:
-            for i in range(num_layers):
-                for kv in ["key", "value"]:
-                    custom_io[f"past_{kv}.{i}{suffix}"] = self.kv_cache_dtype
+        if hasattr(self.model.model, "get_retained_state_names"):
+            custom_io = {}
+            for base_name in self.model.model.get_retained_state_names():
+                custom_io[base_name] = self.kv_cache_dtype
+                custom_io[f"{base_name}_RetainedState"] = self.kv_cache_dtype
+        else:
+            custom_io = {}
+            num_layers = getattr(self.model, "num_layers", 12)
+            for suffix in ["", "_RetainedState"]:
+                for i in range(num_layers):
+                    for kv in ["key", "value"]:
+                        custom_io[f"past_{kv}.{i}{suffix}"] = self.kv_cache_dtype
         self.dump(custom_io, self.dtype_suffix)
         return custom_io
 

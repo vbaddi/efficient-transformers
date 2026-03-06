@@ -496,8 +496,15 @@ class QEffTextGenerationBase:
         self.tokenizer = tokenizer
         self._set_tokenizer_params()  # set tokenizer params
         # Skip inputs/outputs
+        retained_state_inputs = {
+            name[: -len("_RetainedState")] for name in self._session.output_names if name.endswith("_RetainedState")
+        }
         self._session.skip_buffers(
-            [x for x in self._session.input_names + self._session.output_names if x.startswith("past_")]
+            [
+                x
+                for x in self._session.input_names + self._session.output_names
+                if x.startswith("past_") or x.endswith("_RetainedState") or x in retained_state_inputs
+            ]
         )
 
     def _set_tokenizer_params(self):

@@ -10,7 +10,16 @@ from collections.abc import Iterable
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from transformers.cache_utils import DynamicCache, DynamicLayer, EncoderDecoderCache, HybridCache, HybridChunkedCache
+from transformers.cache_utils import DynamicCache, DynamicLayer, EncoderDecoderCache
+
+try:
+    from transformers.cache_utils import HybridCache, HybridChunkedCache
+except ImportError:
+    # Newer transformers builds may not expose these cache helpers. Fall back to
+    # DynamicCache so QEfficient can still import in environments where the
+    # hybrid-cache-specific models are not exercised.
+    HybridCache = DynamicCache
+    HybridChunkedCache = DynamicCache
 
 from QEfficient.customop import (
     CtxGatherFunc,

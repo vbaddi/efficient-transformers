@@ -29,14 +29,23 @@ from QEfficient.base import (
     QEFFCommonLoader,
 )
 from QEfficient.compile.compile_helper import compile
-from QEfficient.diffusers.pipelines.flux.pipeline_flux import QEffFluxPipeline
-from QEfficient.diffusers.pipelines.wan.pipeline_wan import QEffWanPipeline
 from QEfficient.exporter.export_hf_to_cloud_ai_100 import qualcomm_efficient_converter
 from QEfficient.generation.text_generation_inference import cloud_ai_100_exec_kv
-from QEfficient.peft import QEffAutoPeftModelForCausalLM
 from QEfficient.transformers.transform import transform
 from QEfficient.utils import custom_format_warning
 from QEfficient.utils.logging_utils import logger
+
+try:
+    from QEfficient.peft import QEffAutoPeftModelForCausalLM
+except Exception:  # pragma: no cover - optional dependency path
+    QEffAutoPeftModelForCausalLM = None
+
+try:
+    from QEfficient.diffusers.pipelines.flux.pipeline_flux import QEffFluxPipeline
+    from QEfficient.diffusers.pipelines.wan.pipeline_wan import QEffWanPipeline
+except Exception:  # pragma: no cover - optional dependency path
+    QEffFluxPipeline = None
+    QEffWanPipeline = None
 
 # custom warning for the better logging experience
 warnings.formatwarning = custom_format_warning
@@ -57,9 +66,14 @@ __all__ = [
     "QEFFAutoModelForSequenceClassification",
     "QEFFAutoModelForSpeechSeq2Seq",
     "QEFFCommonLoader",
-    "QEffFluxPipeline",
-    "QEffWanPipeline",
 ]
+
+if QEffAutoPeftModelForCausalLM is not None:
+    __all__.append("QEffAutoPeftModelForCausalLM")
+if QEffFluxPipeline is not None:
+    __all__.append("QEffFluxPipeline")
+if QEffWanPipeline is not None:
+    __all__.append("QEffWanPipeline")
 
 
 # Conditionally import QAIC-related modules if the SDK is installed
