@@ -502,12 +502,6 @@ class QEFFBaseModel(ABC):
             onnx_transforms = OnnxTransformPipeline(transforms=self._onnx_transforms)
             model, transformed = onnx_transforms.apply(model, **transform_kwargs)
 
-            # if use_dynamo:
-            #     model = restore_symbolic_batch_dim(
-            #         model,
-            #         batch_dim_name="full_batch_size" if self.continuous_batching else "batch_size",
-            #     )
-
             # Add metadata to the model
             model.metadata_props.append(
                 onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(self._transform_names()))
