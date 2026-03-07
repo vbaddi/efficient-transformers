@@ -31,6 +31,11 @@ class CustomRMSNormFunc(torch.autograd.Function):
         return weight * hidden_states
 
     @staticmethod
+    def backward(ctx, grad_output):
+        # Not needed for inference/export
+        raise NotImplementedError("backward not supported for export")
+
+    @staticmethod
     def setup_context(ctx, inputs, outputs):
         pass
 

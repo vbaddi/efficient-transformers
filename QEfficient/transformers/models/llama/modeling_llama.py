@@ -193,7 +193,7 @@ class QEffLlamaAttention(LlamaAttention):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output, **kwargs)
 
-        return attn_output, attn_weights
+        return attn_output, attn_weights, key_states, value_states
 
 
 class QEffLlamaDecoderLayer(LlamaDecoderLayer):
@@ -203,6 +203,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
     - add new args batch idx for the CB models
     """
 
+    @torch.compiler.nested_compile_region
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -222,7 +223,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states, _, new_key, new_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -243,7 +244,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, new_key, new_value
 
 
 class QEffLlamaModel(LlamaModel):
@@ -306,7 +307,7 @@ class QEffLlamaModel(LlamaModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            hidden_states = decoder_layer(
+            hidden_states, _, _ = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
