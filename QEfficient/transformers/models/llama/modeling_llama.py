@@ -226,11 +226,19 @@ class QEffLlamaAttention(LlamaAttention):
         key_states = self.k_proj(hidden_states, **kwargs).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states, **kwargs).view(hidden_shape).transpose(1, 2)
 
-        kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position)
+        # import ipdb; ipdb.set_trace()
+        # kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position)
+        # kv_seq_len = 32
+        kv_seq_len = past_key_value.key_cache[0].shape[-2] if past_key_value is not None else key_states.shape[2]
         past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+        cache_kwargs = {
+            "batch_index": batch_index,
+            "position_ids": position_ids,
+            "past_seen_tokens": past_seen_tokens,
+        }
         if past_key_value is not None:
             if num_kv_blocks is not None:
                 cache_kwargs = {
@@ -267,7 +275,7 @@ class QEffLlamaAttention(LlamaAttention):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output, **kwargs)
 
-        return attn_output, attn_weights
+        return attn_output, attn_weights, key_states, value_states
 
 
 class QEffLlamaDecoderLayer(LlamaDecoderLayer):
@@ -277,6 +285,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
     - add new args batch idx for the CB models
     """
 
+    @torch.compiler.nested_compile_region
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -294,7 +303,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states, _, new_key, new_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -313,7 +322,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, new_key, new_value
 
 
 class QEffLlamaModel(LlamaModel):
@@ -371,7 +380,7 @@ class QEffLlamaModel(LlamaModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            hidden_states = decoder_layer(
+            hidden_states, _, _ = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
