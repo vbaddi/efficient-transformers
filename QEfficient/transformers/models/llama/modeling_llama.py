@@ -86,6 +86,10 @@ def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    if position_ids is None:
+        seq_len = q.shape[-2]
+        position_ids = torch.arange(seq_len, device=q.device).view(1, seq_len).expand(q.shape[0], -1)
+
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
 
@@ -110,9 +114,8 @@ def eager_attention_forward(
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
-        attn_weights = torch.where(
-            attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32), attn_weights
-        )
+        masked_fill = torch.full_like(attn_weights, MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32)
+        attn_weights = torch.where(attention_mask, masked_fill, attn_weights)
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_output = torch.matmul(attn_weights, value_states)
@@ -226,19 +229,14 @@ class QEffLlamaAttention(LlamaAttention):
         key_states = self.k_proj(hidden_states, **kwargs).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states, **kwargs).view(hidden_shape).transpose(1, 2)
 
-        # import ipdb; ipdb.set_trace()
-        # kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position)
-        # kv_seq_len = 32
-        kv_seq_len = past_key_value.key_cache[0].shape[-2] if past_key_value is not None else key_states.shape[2]
-        past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
+        # Keep rotary cache length static inside nested compile regions to avoid
+        # Python cache-object calls (e.g., get_seq_length) that break invoke_subgraph capture.
+        kv_seq_len = self.rotary_emb.max_seq_len_cached
+        past_seen_tokens = position_ids.max() + 1 if position_ids is not None else 0
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        cache_kwargs = {
-            "batch_index": batch_index,
-            "position_ids": position_ids,
-            "past_seen_tokens": past_seen_tokens,
-        }
+        cache_kwargs = {}
         if past_key_value is not None:
             if num_kv_blocks is not None:
                 cache_kwargs = {
@@ -275,7 +273,7 @@ class QEffLlamaAttention(LlamaAttention):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output, **kwargs)
 
-        return attn_output, attn_weights, key_states, value_states
+        return attn_output, attn_weights
 
 
 class QEffLlamaDecoderLayer(LlamaDecoderLayer):
@@ -299,11 +297,8 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        hidden_states, _, new_key, new_value = self.self_attn(
+        hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -316,13 +311,12 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         )
         hidden_states = residual + hidden_states
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states, new_key, new_value
+        return hidden_states
 
 
 class QEffLlamaModel(LlamaModel):
@@ -360,8 +354,8 @@ class QEffLlamaModel(LlamaModel):
             return_legacy_cache = True
             past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
 
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -380,7 +374,7 @@ class QEffLlamaModel(LlamaModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            hidden_states, _, _ = decoder_layer(
+            hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,

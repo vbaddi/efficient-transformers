@@ -12,7 +12,12 @@ import warnings
 from pathlib import Path
 from typing import Dict
 
-from QEfficient.base.onnx_transforms import CustomOpTransform, RenameFunctionOutputsTransform
+from QEfficient.base.onnx_transforms import (
+    CustomOpTransform,
+    PreserveNestedCacheRetainedStateTransform,
+    RenameFunctionOutputsTransform,
+    RewriteRMSNormToCustomOpTransform,
+)
 from QEfficient.transformers.cache_utils import InvalidIndexProvider
 from QEfficient.transformers.models.pytorch_transforms import get_decoder_layer_classes_for_export
 from QEfficient.utils.cache import QEFF_HOME
@@ -41,8 +46,15 @@ def export_wrapper(func):
     """
 
     def wrapper(self, *args, **kwargs):
-        # 1. Setup ONNX subfunctions if requested
-        if use_onnx_subfunctions := kwargs.pop("use_onnx_subfunctions", False):
+        use_dynamo = kwargs.get("use_dynamo", False)
+        requested_subfunctions = kwargs.pop("use_onnx_subfunctions", False)
+        use_onnx_subfunctions = requested_subfunctions or use_dynamo
+
+        if use_dynamo and not requested_subfunctions:
+            logger.info("Enabling ONNX subfunctions because use_dynamo=True.")
+
+        # 1. Setup ONNX subfunctions if requested/required
+        if use_onnx_subfunctions:
             args, kwargs = _setup_onnx_subfunctions(self, args, kwargs)
 
         # 2. Prepare export directory
@@ -171,17 +183,22 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
     # Apply torch patches for subfunction support
     apply_torch_patches()
     InvalidIndexProvider.SUBFUNC_ENABLED = True
-    # Transform output names for subfunction compatibility
-    if "output_names" in kwargs:
-        kwargs["output_names"] = [
-            re.sub("_RetainedState", "_InternalRetainedState", name) for name in kwargs["output_names"]
-        ]
-    else:
-        args = list(args)
-        args[1] = [re.sub("_RetainedState", "_InternalRetainedState", name) for name in args[1]]
-        args = tuple(args)
+    # For legacy export-modules-as-functions path we keep internal retained-state
+    # names and restore them later via RenameFunctionOutputsTransform. For dynamo's
+    # native invoke_subgraph/repeated_subgraph path, keep original output names.
+    if not use_dynamo:
+        if "output_names" in kwargs:
+            kwargs["output_names"] = [
+                re.sub("_RetainedState", "_InternalRetainedState", name) for name in kwargs["output_names"]
+            ]
+        else:
+            args = list(args)
+            args[1] = [re.sub("_RetainedState", "_InternalRetainedState", name) for name in args[1]]
+            args = tuple(args)
     # Add subfunction-specific ONNX transforms
     qeff_model._onnx_transforms.append(RenameFunctionOutputsTransform)
+    qeff_model._onnx_transforms.append(PreserveNestedCacheRetainedStateTransform)
+    qeff_model._onnx_transforms.append(RewriteRMSNormToCustomOpTransform)
     qeff_model._onnx_transforms.append(CustomOpTransform)
 
     # TODO: Handle this in the modelling class QEFFTransformersBase,remove from here. Refer diffusers implementation
@@ -215,6 +232,8 @@ def _cleanup_onnx_subfunctions(qeff_model):
     undo_torch_patches()
     InvalidIndexProvider.SUBFUNC_ENABLED = False
     qeff_model._onnx_transforms.remove(RenameFunctionOutputsTransform)
+    qeff_model._onnx_transforms.remove(PreserveNestedCacheRetainedStateTransform)
+    qeff_model._onnx_transforms.remove(RewriteRMSNormToCustomOpTransform)
     qeff_model._onnx_transforms.remove(CustomOpTransform)
     if hasattr(qeff_model, "_subfunction_target_classnames"):
         del qeff_model._subfunction_target_classnames

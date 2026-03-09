@@ -8,8 +8,10 @@
 import gc
 import inspect
 import logging
+import os
 import shutil
 import subprocess
+import sys
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -17,11 +19,13 @@ from typing import Dict, List, Optional, OrderedDict
 
 import onnx
 import torch
-from onnx import TensorProto, helper
+from torch.onnx._internal.exporter import _core as onnx_export_core
+from torch.onnx._internal.exporter import _registration as onnx_export_registration
 
 from QEfficient.base.onnx_transforms import (
     BaseOnnxTransform,
     OnnxTransformPipeline,
+    RestoreNamedDynamicAxesTransform,
 )
 from QEfficient.base.pytorch_transforms import PytorchTransform
 from QEfficient.compile.qnn_compiler import compile as qnn_compile
@@ -40,6 +44,18 @@ from QEfficient.utils import (
 from QEfficient.utils.export_utils import export_wrapper
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_onnxscript_framework_api_compat() -> None:
+    # torch nightlies can request newer framework API stubs than the installed
+    # onnxscript wheel ships. Reuse the newest available stub for registration.
+    try:
+        import onnxscript._framework_apis.torch_2_9 as torch_2_9
+    except ImportError:
+        return
+
+    sys.modules.setdefault("onnxscript._framework_apis.torch_2_10", torch_2_9)
+    sys.modules.setdefault("onnxscript._framework_apis.torch_2_11", torch_2_9)
 
 
 class QEFFBaseModel(ABC):
@@ -308,20 +324,77 @@ class QEFFBaseModel(ABC):
 
         try:
             export_kwargs = {} if export_kwargs is None else export_kwargs
-            export_kwargs["dynamo"] = use_dynamo
 
             if use_dynamo:
                 dynamic_axes = None
-                export_kwargs["report"] = True
-                # export_kwargs["optimize"] = False
-                export_kwargs["custom_translation_table"] = {
-                    torch.ops.qefficient.rms_norm.default: CustomRMSNorm,
-                    torch.ops.qefficient.ctx_gather.default: CtxGather,
-                    torch.ops.qefficient.ctx_scatter.default: CtxScatter,
-                }
+                # Keep HOP invoke_subgraph calls as ONNX function calls (repeated subgraphs).
+                # torch.onnx.export currently inlines these during version conversion/optimize.
+                # Using exporter core directly with opset_version=None preserves subgraph calls.
+                export_kwargs = dict(export_kwargs)
+                export_kwargs.setdefault("report", True)
+                export_kwargs.setdefault("optimize", False)
 
-            # import ipdb; ipdb.set_trace()
-            with torch.no_grad():
+                custom_translation_table = export_kwargs.pop("custom_translation_table", None) or {}
+                custom_translation_table.update(
+                    {
+                        torch.ops.qefficient.rms_norm.default: CustomRMSNorm,
+                        torch.ops.qefficient.ctx_gather.default: CtxGather,
+                        torch.ops.qefficient.ctx_scatter.default: CtxScatter,
+                    }
+                )
+
+                _ensure_onnxscript_framework_api_compat()
+                registry = onnx_export_registration.ONNXRegistry().from_torchlib(
+                    opset_version=constants.ONNX_EXPORT_OPSET
+                )
+                for torch_op, onnx_op in custom_translation_table.items():
+                    registry.register_op(torch_op, onnx_op, is_complex=False)
+
+                prev_invoke_fallback = os.environ.get("TORCH_INVOKE_ALLOW_CREATE_FALLBACK")
+                prev_force_reuse = os.environ.get("TORCH_INVOKE_FORCE_REUSE_SUBGRAPH")
+                os.environ["TORCH_INVOKE_ALLOW_CREATE_FALLBACK"] = "1"
+                if getattr(self, "_use_onnx_subfunctions", False):
+                    os.environ["TORCH_INVOKE_FORCE_REUSE_SUBGRAPH"] = "1"
+                try:
+                    onnx_program = onnx_export_core.export(
+                        self.model,
+                        args=(),
+                        kwargs=example_inputs,
+                        registry=registry,
+                        dynamic_shapes=dynamic_shapes,
+                        input_names=input_names,
+                        output_names=output_names,
+                        report=export_kwargs.pop("report", False),
+                        verify=export_kwargs.pop("verify", False),
+                        profile=export_kwargs.pop("profile", False),
+                        dump_exported_program=export_kwargs.pop("dump_exported_program", False),
+                        artifacts_dir=export_kwargs.pop("artifacts_dir", "."),
+                        verbose=export_kwargs.pop("verbose", None),
+                        optimize=export_kwargs.pop("optimize", False),
+                        opset_version=None,
+                    )
+                finally:
+                    if prev_invoke_fallback is None:
+                        os.environ.pop("TORCH_INVOKE_ALLOW_CREATE_FALLBACK", None)
+                    else:
+                        os.environ["TORCH_INVOKE_ALLOW_CREATE_FALLBACK"] = prev_invoke_fallback
+                    if prev_force_reuse is None:
+                        os.environ.pop("TORCH_INVOKE_FORCE_REUSE_SUBGRAPH", None)
+                    else:
+                        os.environ["TORCH_INVOKE_FORCE_REUSE_SUBGRAPH"] = prev_force_reuse
+                if export_kwargs:
+                    logger.warning(
+                        "Ignoring unsupported dynamo exporter kwargs in native repeated-subgraph path: %s",
+                        sorted(export_kwargs.keys()),
+                    )
+                onnx_program.save(
+                    str(tmp_onnx_path),
+                    include_initializers=True,
+                    keep_initializers_as_inputs=False,
+                    external_data=True,
+                )
+            else:
+                export_kwargs["dynamo"] = False
                 torch.onnx.export(
                     self.model,
                     args=(),
@@ -331,176 +404,32 @@ class QEFFBaseModel(ABC):
                     output_names=output_names,
                     dynamic_axes=dynamic_axes,
                     dynamic_shapes=dynamic_shapes,
-                    optimize=False,
                     opset_version=constants.ONNX_EXPORT_OPSET,
                     **export_kwargs,
                 )
-            # op.save(str(tmp_onnx_path))
 
             # model_proto = model.model_proto
             logger.info("PyTorch export successful")
             _ = self._offload_model_weights(offload_pt_weights)
             model = onnx.load(tmp_onnx_path, load_external_data=False)
 
-            graph = model.graph
-
-            # ── DEBUG: print before any changes ───────────────────────────────────────
-            print("\n=== Graph inputs ===")
-            for vi in graph.input:
-                print(f"  {vi.name}")
-            print("\n=== Graph outputs ===")
-            for vi in graph.output:
-                print(f"  {vi.name}")
-
-            # ── Step 1: Build rename map for INPUTS: strip _RetainedState suffix ───────
-            # past_key.0_RetainedState → past_key.0
-            input_rename_map = {}
-            for vi in graph.input:
-                if vi.name.endswith("_RetainedState"):
-                    new_name = vi.name.replace("_RetainedState", "")
-                    input_rename_map[vi.name] = new_name
-                    print(f"Input rename: {vi.name} → {new_name}")
-
-            # Apply rename to graph.input value_infos
-            for vi in graph.input:
-                if vi.name in input_rename_map:
-                    vi.name = input_rename_map[vi.name]
-
-            # Propagate input renames to all nodes that consume them
-            for node in graph.node:
-                for i, inp in enumerate(node.input):
-                    if inp in input_rename_map:
-                        node.input[i] = input_rename_map[inp]
-
-            # Also propagate inside ONNX functions
-            for func in model.functions:
-                for node in func.node:
-                    for i, inp in enumerate(node.input):
-                        if inp in input_rename_map:
-                            node.input[i] = input_rename_map[inp]
-
-            # ── Step 2: Collect subgraph nodes ────────────────────────────────────────
-            subgraph_nodes = [node for node in graph.node if node.op_type.startswith("repeated_subgraph")]
-            print(f"\nFound {len(subgraph_nodes)} subgraph nodes")
-            for node in subgraph_nodes:
-                print(f"  outputs: {list(node.output)}")
-
-            # ── Step 3: Wire subgraph k/v outputs → RetainedState output names ────────
-            num_layers = len(subgraph_nodes)
-            kv_pairs = [(f"past_key.{i}_RetainedState", f"past_value.{i}_RetainedState") for i in range(num_layers)]
-
-            output_rename_map = {}
-            for layer_idx, node in enumerate(subgraph_nodes):
-                if len(node.output) < 3:
-                    print(f"WARNING: node {layer_idx} has only {len(node.output)} outputs")
-                    continue
-                old_key = node.output[1]
-                old_val = node.output[2]
-                new_key, new_val = kv_pairs[layer_idx]
-
-                output_rename_map[old_key] = new_key
-                output_rename_map[old_val] = new_val
-
-                node.output[1] = new_key
-                node.output[2] = new_val
-                print(f"Layer {layer_idx}: {old_key} → {new_key}")
-                print(f"Layer {layer_idx}: {old_val} → {new_val}")
-
-            # Propagate output renames to consumers
-            for node in graph.node:
-                for i, inp in enumerate(node.input):
-                    if inp in output_rename_map:
-                        node.input[i] = output_rename_map[inp]
-
-            # ── Step 4: Remove dangling nodes producing RetainedState names ───────────
-            retained_out_names = set()
-            for k, v in kv_pairs:
-                retained_out_names.add(k)
-                retained_out_names.add(v)
-
-            nodes_to_remove = []
-            for node in graph.node:
-                if node.op_type.startswith("repeated_subgraph"):
-                    continue
-                if node.output and all(o in retained_out_names for o in node.output if o):
-                    print(f"Removing dangling node: op={node.op_type}, outputs={list(node.output)}")
-                    nodes_to_remove.append(node)
-            for node in nodes_to_remove:
-                graph.node.remove(node)
-
-            # ── Step 5: Fix graph outputs ─────────────────────────────────────────────
-            # Remove any existing RetainedState outputs (may be stale/wrong)
-            outputs_to_remove = [o for o in graph.output if "RetainedState" in o.name]
-            for o in outputs_to_remove:
-                graph.output.remove(o)
-
-            # Re-add with shape copied from (now renamed) graph inputs
-            input_shape_map = {vi.name: vi for vi in graph.input}
-
-            for key_name, val_name in kv_pairs:
-                # Input is now named without _RetainedState e.g. past_key.0
-                key_input_name = key_name.replace("_RetainedState", "")
-                val_input_name = val_name.replace("_RetainedState", "")
-
-                for out_name, in_name in [(key_name, key_input_name), (val_name, val_input_name)]:
-                    src_vi = input_shape_map.get(in_name)
-                    if src_vi is not None:
-                        shape = [d.dim_param if d.dim_param else d.dim_value for d in src_vi.type.tensor_type.shape.dim]
-                        elem_type = src_vi.type.tensor_type.elem_type
-                    else:
-                        shape = None
-                        elem_type = TensorProto.FLOAT
-                    graph.output.append(helper.make_tensor_value_info(out_name, elem_type, shape))
-
-            # ── Step 6: Clean up value_info duplicates ────────────────────────────────
-            seen = set()
-            vis_to_remove = []
-            for vi in graph.value_info:
-                if vi.name in seen or vi.name in retained_out_names:
-                    vis_to_remove.append(vi)
-                else:
-                    seen.add(vi.name)
-            for vi in vis_to_remove:
-                graph.value_info.remove(vi)
-
-            # ── Step 7: Verify ────────────────────────────────────────────────────────
-            all_produced = {vi.name for vi in graph.input}
-            for node in graph.node:
-                all_produced.update(o for o in node.output if o)
-
-            print("\nVerification:")
-            for key_name, val_name in kv_pairs:
-                print(f"  {key_name}: {'✓' if key_name in all_produced else '✗ MISSING'}")
-                print(f"  {val_name}: {'✓' if val_name in all_produced else '✗ MISSING'}")
-
-            print("\n=== Final graph inputs ===")
-            for vi in graph.input:
-                print(f"  {vi.name}")
-            print("=== Final graph outputs ===")
-            for vi in graph.output:
-                print(f"  {vi.name}")
-
-            if use_dynamo:
-                old_name = None
-                for func in model.functions:
-                    if func.name.startswith("repeated_subgraph0"):
-                        old_name = func.name
-                        func.name = "QEffLlamaDecoderLayer"
-
-                for node in model.graph.node:
-                    if node.op_type == old_name:
-                        node.op_type = "QEffLlamaDecoderLayer"
-
             # Clear temporary references
             transform_kwargs = {
                 "onnx_base_dir": str(tmp_onnx_dir),
                 "model_name": self.model_name,
+                "dynamic_axes": dynamic_axes,
             }
             if onnx_transform_kwargs is not None:
                 transform_kwargs.update(onnx_transform_kwargs)
 
-            onnx_transforms = OnnxTransformPipeline(transforms=self._onnx_transforms)
+            onnx_transform_classes = list(self._onnx_transforms)
+            if dynamic_axes is not None:
+                onnx_transform_classes.append(RestoreNamedDynamicAxesTransform)
+
+            onnx_transforms = OnnxTransformPipeline(transforms=onnx_transform_classes)
             model, transformed = onnx_transforms.apply(model, **transform_kwargs)
+            restored_dynamic_axes = RestoreNamedDynamicAxesTransform.apply(model, dynamic_axes=dynamic_axes)
+            transformed = transformed or restored_dynamic_axes
 
             # Add metadata to the model
             model.metadata_props.append(
