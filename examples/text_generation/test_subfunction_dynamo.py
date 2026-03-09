@@ -15,7 +15,7 @@ from QEfficient.utils.run_utils import ApiRunner
 model_name = "meta-llama/Llama-3.2-1B"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 config = AutoConfig.from_pretrained(model_name)
-config.num_hidden_layers = 4
+# config.num_hidden_layers = 4
 print(config)
 runner = ApiRunner(
     batch_size=1,
@@ -27,7 +27,7 @@ runner = ApiRunner(
 )
 
 # PyTorch (KV) output
-hf_model = AutoModelForCausalLM.from_pretrained(model_name, num_hidden_layers=4)
+hf_model = AutoModelForCausalLM.from_pretrained(model_name)
 hf_tokens = runner.run_hf_model_on_pytorch(hf_model)
 print(hf_tokens)
 
