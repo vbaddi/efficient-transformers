@@ -25,7 +25,6 @@ from torch.onnx._internal.exporter import _registration as onnx_export_registrat
 from QEfficient.base.onnx_transforms import (
     BaseOnnxTransform,
     OnnxTransformPipeline,
-    RestoreNamedDynamicAxesTransform,
 )
 from QEfficient.base.pytorch_transforms import PytorchTransform
 from QEfficient.compile.qnn_compiler import compile as qnn_compile
@@ -351,10 +350,7 @@ class QEFFBaseModel(ABC):
                     registry.register_op(torch_op, onnx_op, is_complex=False)
 
                 prev_invoke_fallback = os.environ.get("TORCH_INVOKE_ALLOW_CREATE_FALLBACK")
-                prev_force_reuse = os.environ.get("TORCH_INVOKE_FORCE_REUSE_SUBGRAPH")
                 os.environ["TORCH_INVOKE_ALLOW_CREATE_FALLBACK"] = "1"
-                if getattr(self, "_use_onnx_subfunctions", False):
-                    os.environ["TORCH_INVOKE_FORCE_REUSE_SUBGRAPH"] = "1"
                 try:
                     onnx_program = onnx_export_core.export(
                         self.model,
@@ -378,10 +374,6 @@ class QEFFBaseModel(ABC):
                         os.environ.pop("TORCH_INVOKE_ALLOW_CREATE_FALLBACK", None)
                     else:
                         os.environ["TORCH_INVOKE_ALLOW_CREATE_FALLBACK"] = prev_invoke_fallback
-                    if prev_force_reuse is None:
-                        os.environ.pop("TORCH_INVOKE_FORCE_REUSE_SUBGRAPH", None)
-                    else:
-                        os.environ["TORCH_INVOKE_FORCE_REUSE_SUBGRAPH"] = prev_force_reuse
                 if export_kwargs:
                     logger.warning(
                         "Ignoring unsupported dynamo exporter kwargs in native repeated-subgraph path: %s",
@@ -422,14 +414,8 @@ class QEFFBaseModel(ABC):
             if onnx_transform_kwargs is not None:
                 transform_kwargs.update(onnx_transform_kwargs)
 
-            onnx_transform_classes = list(self._onnx_transforms)
-            if dynamic_axes is not None:
-                onnx_transform_classes.append(RestoreNamedDynamicAxesTransform)
-
-            onnx_transforms = OnnxTransformPipeline(transforms=onnx_transform_classes)
+            onnx_transforms = OnnxTransformPipeline(transforms=self._onnx_transforms)
             model, transformed = onnx_transforms.apply(model, **transform_kwargs)
-            restored_dynamic_axes = RestoreNamedDynamicAxesTransform.apply(model, dynamic_axes=dynamic_axes)
-            transformed = transformed or restored_dynamic_axes
 
             # Add metadata to the model
             model.metadata_props.append(

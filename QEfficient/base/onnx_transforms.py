@@ -278,180 +278,6 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
         return changed
 
 
-class RestoreNamedDynamicAxesTransform(BaseOnnxTransform):
-    """Restore user-facing symbolic dim names after native dynamo export."""
-
-    @classmethod
-    def apply(cls, model: ModelProto, *, dynamic_axes: Optional[Dict[str, Dict[int, str]]] = None, **kwargs) -> bool:
-        dynamic_axes = dynamic_axes or cls._infer_dynamic_axes(model)
-        if not dynamic_axes:
-            return False
-
-        rename_map: Dict[str, str] = {}
-        for value in model.graph.input:
-            axis_map = dynamic_axes.get(value.name)
-            if not axis_map:
-                continue
-            dims = value.type.tensor_type.shape.dim
-            for axis, desired_name in axis_map.items():
-                if axis >= len(dims):
-                    continue
-                dim = dims[axis]
-                if not dim.dim_param or dim.dim_param == desired_name:
-                    continue
-                existing_name = dim.dim_param
-                mapped_name = rename_map.setdefault(existing_name, desired_name)
-                if mapped_name != desired_name:
-                    logger.warning(
-                        "Conflicting symbolic dim rename for %s: keeping %s, skipping %s",
-                        existing_name,
-                        mapped_name,
-                        desired_name,
-                    )
-
-        if not rename_map:
-            return False
-
-        changed = False
-        for value in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
-            if not value.type.HasField("tensor_type"):
-                continue
-            for dim in value.type.tensor_type.shape.dim:
-                if dim.dim_param in rename_map:
-                    dim.dim_param = rename_map[dim.dim_param]
-                    changed = True
-
-        return changed
-
-    @staticmethod
-    def _infer_dynamic_axes(model: ModelProto) -> Dict[str, Dict[int, str]]:
-        dynamic_axes: Dict[str, Dict[int, str]] = {}
-        for value in model.graph.input:
-            if value.name in {"input_ids", "position_ids", "attention_mask"}:
-                dynamic_axes[value.name] = {0: "batch_size", 1: "seq_len"}
-            elif value.name.startswith("past_key.") or value.name.startswith("past_value."):
-                dynamic_axes[value.name] = {0: "batch_size", 2: "ctx_len"}
-            elif value.name == "batch_index":
-                dynamic_axes[value.name] = {0: "batch_size"}
-        return dynamic_axes
-
-
-class RewriteRMSNormToCustomOpTransform(BaseOnnxTransform):
-    """Fold decomposed RMSNorm patterns into CustomRMSNorm ops/functions."""
-
-    @classmethod
-    def apply(cls, model: ModelProto, **kwargs) -> bool:
-        changed = cls._rewrite_container(model.graph)
-        for fn in model.functions:
-            changed |= cls._rewrite_container(fn)
-        return changed
-
-    @classmethod
-    def _rewrite_container(cls, container) -> bool:
-        producer = {output: node for node in container.node for output in node.output}
-        const_map = cls._build_const_map(container)
-        changed = False
-
-        for node in container.node:
-            match = cls._match_rms_norm(node, producer, const_map)
-            if match is None:
-                continue
-
-            hidden_input, weight_input, epsilon = match
-            rewritten = onnx.helper.make_node(
-                "CustomRMSNorm",
-                [hidden_input, weight_input],
-                list(node.output),
-                name=f"{node.name}_custom_rms_norm",
-                domain="com.qti.aisw.onnx",
-                epsilon=float(epsilon),
-            )
-            node.CopyFrom(rewritten)
-            changed = True
-
-        return changed
-
-    @staticmethod
-    def _build_const_map(container) -> Dict[str, Any]:
-        const_map = {}
-        for init in getattr(container, "initializer", []):
-            try:
-                arr = numpy_helper.to_array(init)
-            except Exception:
-                continue
-            if np.isscalar(arr) or arr.shape == ():
-                const_map[init.name] = float(arr)
-
-        for node in container.node:
-            if node.op_type != "Constant" or not node.output:
-                continue
-            for attr in node.attribute:
-                if attr.type == onnx.AttributeProto.TENSOR:
-                    arr = numpy_helper.to_array(attr.t)
-                    if np.isscalar(arr) or arr.shape == ():
-                        const_map[node.output[0]] = float(arr)
-                    break
-        return const_map
-
-    @classmethod
-    def _match_rms_norm(cls, node, producer, const_map):
-        if node.op_type != "Mul" or len(node.input) != 2:
-            return None
-
-        inner_mul = None
-        weight_input = None
-        for i, inp_name in enumerate(node.input):
-            candidate = producer.get(inp_name)
-            if candidate is not None and candidate.op_type == "Mul":
-                inner_mul = candidate
-                weight_input = node.input[1 - i]
-                break
-        if inner_mul is None or len(inner_mul.input) != 2:
-            return None
-
-        hidden_input = None
-        reciprocal = None
-        for inp_name in inner_mul.input:
-            candidate = producer.get(inp_name)
-            if candidate is not None and candidate.op_type == "Reciprocal":
-                reciprocal = candidate
-            else:
-                hidden_input = inp_name
-        if hidden_input is None or reciprocal is None or len(reciprocal.input) != 1:
-            return None
-
-        sqrt = producer.get(reciprocal.input[0])
-        if sqrt is None or sqrt.op_type != "Sqrt" or len(sqrt.input) != 1:
-            return None
-        add = producer.get(sqrt.input[0])
-        if add is None or add.op_type != "Add" or len(add.input) != 2:
-            return None
-
-        mean = None
-        epsilon = None
-        for inp_name in add.input:
-            candidate = producer.get(inp_name)
-            if candidate is not None and candidate.op_type == "ReduceMean":
-                mean = candidate
-            elif inp_name in const_map:
-                epsilon = const_map[inp_name]
-        if mean is None or epsilon is None or len(mean.input) != 2:
-            return None
-
-        pow_node = producer.get(mean.input[0])
-        if pow_node is None or pow_node.op_type != "Pow" or len(pow_node.input) != 2:
-            return None
-        if hidden_input not in pow_node.input:
-            return None
-
-        exponent_name = pow_node.input[0] if pow_node.input[1] == hidden_input else pow_node.input[1]
-        exponent = const_map.get(exponent_name)
-        if exponent is None or abs(exponent - 2.0) > 1e-6:
-            return None
-
-        return hidden_input, weight_input, epsilon
-
-
 class AdapterWeightsToInputsTransform(BaseOnnxTransform):
     @classmethod
     def apply(cls, model: onnx.ModelProto, *, adapter_name: str, **kwargs) -> Tuple[onnx.ModelProto, bool]:
@@ -883,9 +709,6 @@ class OnnxTransformPipeline(BaseOnnxTransform):
                     logger.error(f"Failed to set external data: {e}")
 
         # Non-looping transforms
-        if RewriteRMSNormToCustomOpTransform in requested:
-            applied[RewriteRMSNormToCustomOpTransform] = RewriteRMSNormToCustomOpTransform.apply(model, **kwargs)
-
         if CustomOpTransform in requested:
             applied[CustomOpTransform] = CustomOpTransform.apply(model)
 
@@ -894,9 +717,6 @@ class OnnxTransformPipeline(BaseOnnxTransform):
 
         if PreserveNestedCacheRetainedStateTransform in requested:
             applied[PreserveNestedCacheRetainedStateTransform] = PreserveNestedCacheRetainedStateTransform.apply(model)
-
-        if RestoreNamedDynamicAxesTransform in requested:
-            applied[RestoreNamedDynamicAxesTransform] = RestoreNamedDynamicAxesTransform.apply(model, **kwargs)
 
         if AdapterWeightsToInputsTransform in requested:
             applied[AdapterWeightsToInputsTransform] = AdapterWeightsToInputsTransform.apply(model, **kwargs)
