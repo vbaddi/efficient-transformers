@@ -16,7 +16,6 @@ from QEfficient.base.onnx_transforms import (
     CustomOpTransform,
     PreserveNestedCacheRetainedStateTransform,
     RenameFunctionOutputsTransform,
-    RewriteRMSNormToCustomOpTransform,
 )
 from QEfficient.transformers.cache_utils import InvalidIndexProvider
 from QEfficient.transformers.models.pytorch_transforms import get_decoder_layer_classes_for_export
@@ -196,10 +195,11 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
             args[1] = [re.sub("_RetainedState", "_InternalRetainedState", name) for name in args[1]]
             args = tuple(args)
     # Add subfunction-specific ONNX transforms
-    qeff_model._onnx_transforms.append(RenameFunctionOutputsTransform)
-    qeff_model._onnx_transforms.append(PreserveNestedCacheRetainedStateTransform)
-    qeff_model._onnx_transforms.append(RewriteRMSNormToCustomOpTransform)
-    qeff_model._onnx_transforms.append(CustomOpTransform)
+    if use_dynamo:
+        qeff_model._onnx_transforms.append(PreserveNestedCacheRetainedStateTransform)
+    else:
+        qeff_model._onnx_transforms.append(RenameFunctionOutputsTransform)
+        qeff_model._onnx_transforms.append(CustomOpTransform)
 
     # TODO: Handle this in the modelling class QEFFTransformersBase,remove from here. Refer diffusers implementation
     decoder_layer_classes = get_decoder_layer_classes_for_export(qeff_model.model)
@@ -231,10 +231,12 @@ def _cleanup_onnx_subfunctions(qeff_model):
     # Undo torch patches
     undo_torch_patches()
     InvalidIndexProvider.SUBFUNC_ENABLED = False
-    qeff_model._onnx_transforms.remove(RenameFunctionOutputsTransform)
-    qeff_model._onnx_transforms.remove(PreserveNestedCacheRetainedStateTransform)
-    qeff_model._onnx_transforms.remove(RewriteRMSNormToCustomOpTransform)
-    qeff_model._onnx_transforms.remove(CustomOpTransform)
+    if PreserveNestedCacheRetainedStateTransform in qeff_model._onnx_transforms:
+        qeff_model._onnx_transforms.remove(PreserveNestedCacheRetainedStateTransform)
+    if RenameFunctionOutputsTransform in qeff_model._onnx_transforms:
+        qeff_model._onnx_transforms.remove(RenameFunctionOutputsTransform)
+    if CustomOpTransform in qeff_model._onnx_transforms:
+        qeff_model._onnx_transforms.remove(CustomOpTransform)
     if hasattr(qeff_model, "_subfunction_target_classnames"):
         del qeff_model._subfunction_target_classnames
     if hasattr(qeff_model, "_use_onnx_subfunctions"):
