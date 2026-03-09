@@ -31,13 +31,24 @@ class CustomRMSNormFunc(torch.autograd.Function):
         return weight * hidden_states
 
     @staticmethod
-    def backward(ctx, grad_output):
-        # Not needed for inference/export
-        raise NotImplementedError("backward not supported for export")
+    def setup_context(ctx, inputs, outputs):
+        hidden_states, weight, epsilon = inputs
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        inv_rms = torch.rsqrt(variance + epsilon)
+        normed_hidden_states = hidden_states * inv_rms
+        ctx.save_for_backward(hidden_states, weight, inv_rms, normed_hidden_states)
 
     @staticmethod
-    def setup_context(ctx, inputs, outputs):
-        pass
+    def backward(ctx, grad_output: torch.Tensor):
+        hidden_states, weight, inv_rms, normed_hidden_states = ctx.saved_tensors
+        grad_hidden_states = grad_output * weight
+        dot = (grad_hidden_states * hidden_states).sum(dim=-1, keepdim=True)
+        hidden_dim = hidden_states.shape[-1]
+        grad_hidden_states = grad_hidden_states * inv_rms - hidden_states * (inv_rms**3) * dot / hidden_dim
+
+        reduce_dims = tuple(range(grad_output.ndim - 1))
+        grad_weight = (grad_output * normed_hidden_states).sum(dim=reduce_dims)
+        return grad_hidden_states, grad_weight, None
 
     @staticmethod
     def symbolic(g: torch.Graph, hidden_states: torch.Value, weight: torch.Value, epsilon: torch.Value) -> torch.Value:

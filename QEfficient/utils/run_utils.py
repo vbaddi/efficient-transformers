@@ -164,6 +164,11 @@ class ApiRunner:
         for inp_name in session_input_names:
             if inp_name in inputs.keys():
                 session_inputs[inp_name] = inputs[inp_name]
+                continue
+            if inp_name.endswith("_RetainedState"):
+                base_name = inp_name.replace("_RetainedState", "")
+                if base_name in inputs:
+                    session_inputs[inp_name] = inputs[base_name]
         outputs_data = session.run(output_names, session_inputs)
         ort_outputs = dict(zip(output_names, outputs_data))
         return ort_outputs
@@ -179,33 +184,39 @@ class ApiRunner:
             :numpy.ndarray: Generated output tokens
         """
 
-        # Replace invalid index value for INT32 max to 0 using add_initializer
-        m = onnx.load(model_path, load_external_data=False)
-        # NOTE: OrtValue objects should be kept around until the session is run, hence this dict is required
-        added_initializers = {}
-        for node in m.graph.node:
-            if node.op_type == "Constant":
-                tensor = node.attribute[0].t
+        try:
+            session = onnxruntime.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        except Exception:
+            # Fallback for models that still require replacing invalid INT32 max
+            # sentinel values before ORT session creation.
+            m = onnx.load(model_path, load_external_data=False)
+            # NOTE: OrtValue objects should be kept around until the session is run, hence this dict is required
+            added_initializers = {}
+            for node in m.graph.node:
+                if node.op_type == "Constant":
+                    tensor = node.attribute[0].t
+                    if tensor.data_type == onnx.TensorProto.UNDEFINED:
+                        continue
+                    np_tensor = onnx.numpy_helper.to_array(tensor, os.path.dirname(model_path))
+                    if len(np_tensor.shape) == 0 and np_tensor.item() == 2147483647:
+                        added_initializers[node.output[0]] = onnxruntime.OrtValue.ortvalue_from_numpy(
+                            np.array(0, np_tensor.dtype)
+                        )
+            for tensor in m.graph.initializer:
                 if tensor.data_type == onnx.TensorProto.UNDEFINED:
                     continue
-                np_tensor = onnx.numpy_helper.to_array(tensor, os.path.dirname(model_path))
+                if tensor.data_location == onnx.TensorProto.EXTERNAL or tensor.external_data:
+                    continue
+                np_tensor = onnx.numpy_helper.to_array(tensor)
                 if len(np_tensor.shape) == 0 and np_tensor.item() == 2147483647:
-                    added_initializers[node.output[0]] = onnxruntime.OrtValue.ortvalue_from_numpy(
+                    added_initializers[tensor.name] = onnxruntime.OrtValue.ortvalue_from_numpy(
                         np.array(0, np_tensor.dtype)
                     )
-        for tensor in m.graph.initializer:
-            if tensor.data_type == onnx.TensorProto.UNDEFINED:
-                continue
-            if tensor.data_location == onnx.TensorProto.EXTERNAL or tensor.external_data:
-                continue
-            np_tensor = onnx.numpy_helper.to_array(tensor)
-            if len(np_tensor.shape) == 0 and np_tensor.item() == 2147483647:
-                added_initializers[tensor.name] = onnxruntime.OrtValue.ortvalue_from_numpy(np.array(0, np_tensor.dtype))
 
-        session_options = onnxruntime.SessionOptions()
-        for name, value in added_initializers.items():
-            session_options.add_initializer(name, value)
-        session = onnxruntime.InferenceSession(model_path, session_options)
+            session_options = onnxruntime.SessionOptions()
+            for name, value in added_initializers.items():
+                session_options.add_initializer(name, value)
+            session = onnxruntime.InferenceSession(model_path, session_options, providers=["CPUExecutionProvider"])
 
         generated_ids = []
         inputs = self.input_handler.prepare_ort_inputs()

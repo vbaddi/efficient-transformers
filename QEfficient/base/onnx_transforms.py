@@ -7,6 +7,7 @@
 
 import logging
 import os
+import re
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple, Type
@@ -122,7 +123,23 @@ class CustomOpTransform(BaseOnnxTransform):
             if proto.name not in existing:
                 model.functions.append(proto)
                 op_applied = True
+                cls._ensure_opset_imports(model, proto.domain, 1)
+        cls._propagate_function_opset_imports(model)
         return op_applied
+
+    @staticmethod
+    def _ensure_opset_imports(container, domain: str, version: int) -> None:
+        if any(opset.domain == domain for opset in container.opset_import):
+            return
+        container.opset_import.append(onnx.helper.make_opsetid(domain, version))
+
+    @classmethod
+    def _propagate_function_opset_imports(cls, model: ModelProto) -> None:
+        for fn in model.functions:
+            for node in fn.node:
+                if node.domain:
+                    cls._ensure_opset_imports(fn, node.domain, 1)
+                    cls._ensure_opset_imports(model, node.domain, 1)
 
 
 class RenameFunctionOutputsTransform(BaseOnnxTransform):
@@ -168,6 +185,271 @@ class RenameFunctionOutputsTransform(BaseOnnxTransform):
                 if vi.name in rename_map:
                     vi.name = rename_map[vi.name]
         return renamed
+
+
+class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
+    """Expose nested decoder cache side effects as explicit ONNX values."""
+
+    _KV_INPUT_RE = re.compile(r"^past_(key|value)\.(\d+)(?:_RetainedState)?$")
+
+    @classmethod
+    def apply(cls, model: ModelProto) -> bool:
+        graph = model.graph
+        produced_names = {name for node in graph.node for name in node.output}
+        dangling_retained_outputs = {
+            out.name for out in graph.output if out.name.endswith("_RetainedState") and out.name not in produced_names
+        }
+        if not dangling_retained_outputs:
+            return False
+
+        fn_by_name = {fn.name: fn for fn in model.functions}
+        changed = False
+
+        for node in graph.node:
+            fn = fn_by_name.get(node.op_type)
+            if fn is None:
+                continue
+
+            scatter_outputs = [
+                fn_node.output[0] for fn_node in fn.node if fn_node.op_type == "CtxScatter" and fn_node.output
+            ]
+            if len(scatter_outputs) != 2:
+                continue
+
+            layer_idx = None
+            kv_inputs = {}
+            for inp_name in node.input:
+                match = cls._KV_INPUT_RE.match(inp_name)
+                if match is None:
+                    continue
+                kind, idx = match.groups()
+                layer_idx = idx if layer_idx is None else layer_idx
+                if layer_idx != idx:
+                    kv_inputs = {}
+                    break
+                kv_inputs[kind] = inp_name
+
+            if layer_idx is None or set(kv_inputs) != {"key", "value"}:
+                continue
+
+            for scatter_output in scatter_outputs:
+                if scatter_output not in fn.output:
+                    fn.output.append(scatter_output)
+                    changed = True
+
+            for kind in ("key", "value"):
+                retained_input = kv_inputs[kind]
+                plain_input = f"past_{kind}.{layer_idx}"
+                if retained_input.endswith("_RetainedState"):
+                    changed |= cls._rename_graph_input(graph, retained_input, plain_input)
+                    for i, name in enumerate(node.input):
+                        if name == retained_input:
+                            node.input[i] = plain_input
+
+            desired_outputs = [
+                f"past_key.{layer_idx}_RetainedState",
+                f"past_value.{layer_idx}_RetainedState",
+            ]
+            if node.output[-2:] != desired_outputs:
+                if len(node.output) == 1:
+                    node.output.extend(desired_outputs)
+                else:
+                    node.output[-2:] = desired_outputs
+                changed = True
+
+        return changed
+
+    @staticmethod
+    def _rename_graph_input(graph: onnx.GraphProto, old_name: str, new_name: str) -> bool:
+        changed = False
+        for value in graph.input:
+            if value.name == old_name:
+                value.name = new_name
+                changed = True
+        for value in graph.value_info:
+            if value.name == old_name:
+                value.name = new_name
+                changed = True
+        for node in graph.node:
+            for i, name in enumerate(node.input):
+                if name == old_name:
+                    node.input[i] = new_name
+                    changed = True
+        return changed
+
+
+class RestoreNamedDynamicAxesTransform(BaseOnnxTransform):
+    """Restore user-facing symbolic dim names after native dynamo export."""
+
+    @classmethod
+    def apply(cls, model: ModelProto, *, dynamic_axes: Optional[Dict[str, Dict[int, str]]] = None, **kwargs) -> bool:
+        dynamic_axes = dynamic_axes or cls._infer_dynamic_axes(model)
+        if not dynamic_axes:
+            return False
+
+        rename_map: Dict[str, str] = {}
+        for value in model.graph.input:
+            axis_map = dynamic_axes.get(value.name)
+            if not axis_map:
+                continue
+            dims = value.type.tensor_type.shape.dim
+            for axis, desired_name in axis_map.items():
+                if axis >= len(dims):
+                    continue
+                dim = dims[axis]
+                if not dim.dim_param or dim.dim_param == desired_name:
+                    continue
+                existing_name = dim.dim_param
+                mapped_name = rename_map.setdefault(existing_name, desired_name)
+                if mapped_name != desired_name:
+                    logger.warning(
+                        "Conflicting symbolic dim rename for %s: keeping %s, skipping %s",
+                        existing_name,
+                        mapped_name,
+                        desired_name,
+                    )
+
+        if not rename_map:
+            return False
+
+        changed = False
+        for value in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
+            if not value.type.HasField("tensor_type"):
+                continue
+            for dim in value.type.tensor_type.shape.dim:
+                if dim.dim_param in rename_map:
+                    dim.dim_param = rename_map[dim.dim_param]
+                    changed = True
+
+        return changed
+
+    @staticmethod
+    def _infer_dynamic_axes(model: ModelProto) -> Dict[str, Dict[int, str]]:
+        dynamic_axes: Dict[str, Dict[int, str]] = {}
+        for value in model.graph.input:
+            if value.name in {"input_ids", "position_ids", "attention_mask"}:
+                dynamic_axes[value.name] = {0: "batch_size", 1: "seq_len"}
+            elif value.name.startswith("past_key.") or value.name.startswith("past_value."):
+                dynamic_axes[value.name] = {0: "batch_size", 2: "ctx_len"}
+            elif value.name == "batch_index":
+                dynamic_axes[value.name] = {0: "batch_size"}
+        return dynamic_axes
+
+
+class RewriteRMSNormToCustomOpTransform(BaseOnnxTransform):
+    """Fold decomposed RMSNorm patterns into CustomRMSNorm ops/functions."""
+
+    @classmethod
+    def apply(cls, model: ModelProto, **kwargs) -> bool:
+        changed = cls._rewrite_container(model.graph)
+        for fn in model.functions:
+            changed |= cls._rewrite_container(fn)
+        return changed
+
+    @classmethod
+    def _rewrite_container(cls, container) -> bool:
+        producer = {output: node for node in container.node for output in node.output}
+        const_map = cls._build_const_map(container)
+        changed = False
+
+        for node in container.node:
+            match = cls._match_rms_norm(node, producer, const_map)
+            if match is None:
+                continue
+
+            hidden_input, weight_input, epsilon = match
+            rewritten = onnx.helper.make_node(
+                "CustomRMSNorm",
+                [hidden_input, weight_input],
+                list(node.output),
+                name=f"{node.name}_custom_rms_norm",
+                domain="com.qti.aisw.onnx",
+                epsilon=float(epsilon),
+            )
+            node.CopyFrom(rewritten)
+            changed = True
+
+        return changed
+
+    @staticmethod
+    def _build_const_map(container) -> Dict[str, Any]:
+        const_map = {}
+        for init in getattr(container, "initializer", []):
+            try:
+                arr = numpy_helper.to_array(init)
+            except Exception:
+                continue
+            if np.isscalar(arr) or arr.shape == ():
+                const_map[init.name] = float(arr)
+
+        for node in container.node:
+            if node.op_type != "Constant" or not node.output:
+                continue
+            for attr in node.attribute:
+                if attr.type == onnx.AttributeProto.TENSOR:
+                    arr = numpy_helper.to_array(attr.t)
+                    if np.isscalar(arr) or arr.shape == ():
+                        const_map[node.output[0]] = float(arr)
+                    break
+        return const_map
+
+    @classmethod
+    def _match_rms_norm(cls, node, producer, const_map):
+        if node.op_type != "Mul" or len(node.input) != 2:
+            return None
+
+        inner_mul = None
+        weight_input = None
+        for i, inp_name in enumerate(node.input):
+            candidate = producer.get(inp_name)
+            if candidate is not None and candidate.op_type == "Mul":
+                inner_mul = candidate
+                weight_input = node.input[1 - i]
+                break
+        if inner_mul is None or len(inner_mul.input) != 2:
+            return None
+
+        hidden_input = None
+        reciprocal = None
+        for inp_name in inner_mul.input:
+            candidate = producer.get(inp_name)
+            if candidate is not None and candidate.op_type == "Reciprocal":
+                reciprocal = candidate
+            else:
+                hidden_input = inp_name
+        if hidden_input is None or reciprocal is None or len(reciprocal.input) != 1:
+            return None
+
+        sqrt = producer.get(reciprocal.input[0])
+        if sqrt is None or sqrt.op_type != "Sqrt" or len(sqrt.input) != 1:
+            return None
+        add = producer.get(sqrt.input[0])
+        if add is None or add.op_type != "Add" or len(add.input) != 2:
+            return None
+
+        mean = None
+        epsilon = None
+        for inp_name in add.input:
+            candidate = producer.get(inp_name)
+            if candidate is not None and candidate.op_type == "ReduceMean":
+                mean = candidate
+            elif inp_name in const_map:
+                epsilon = const_map[inp_name]
+        if mean is None or epsilon is None or len(mean.input) != 2:
+            return None
+
+        pow_node = producer.get(mean.input[0])
+        if pow_node is None or pow_node.op_type != "Pow" or len(pow_node.input) != 2:
+            return None
+        if hidden_input not in pow_node.input:
+            return None
+
+        exponent_name = pow_node.input[0] if pow_node.input[1] == hidden_input else pow_node.input[1]
+        exponent = const_map.get(exponent_name)
+        if exponent is None or abs(exponent - 2.0) > 1e-6:
+            return None
+
+        return hidden_input, weight_input, epsilon
 
 
 class AdapterWeightsToInputsTransform(BaseOnnxTransform):
@@ -601,11 +883,20 @@ class OnnxTransformPipeline(BaseOnnxTransform):
                     logger.error(f"Failed to set external data: {e}")
 
         # Non-looping transforms
+        if RewriteRMSNormToCustomOpTransform in requested:
+            applied[RewriteRMSNormToCustomOpTransform] = RewriteRMSNormToCustomOpTransform.apply(model, **kwargs)
+
         if CustomOpTransform in requested:
             applied[CustomOpTransform] = CustomOpTransform.apply(model)
 
         if RenameFunctionOutputsTransform in requested:
             applied[RenameFunctionOutputsTransform] = RenameFunctionOutputsTransform.apply(model)
+
+        if PreserveNestedCacheRetainedStateTransform in requested:
+            applied[PreserveNestedCacheRetainedStateTransform] = PreserveNestedCacheRetainedStateTransform.apply(model)
+
+        if RestoreNamedDynamicAxesTransform in requested:
+            applied[RestoreNamedDynamicAxesTransform] = RestoreNamedDynamicAxesTransform.apply(model, **kwargs)
 
         if AdapterWeightsToInputsTransform in requested:
             applied[AdapterWeightsToInputsTransform] = AdapterWeightsToInputsTransform.apply(model, **kwargs)
