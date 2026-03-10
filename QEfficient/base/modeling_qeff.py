@@ -11,7 +11,6 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -19,8 +18,6 @@ from typing import Dict, List, Optional, OrderedDict
 
 import onnx
 import torch
-from torch.onnx._internal.exporter import _core as onnx_export_core
-from torch.onnx._internal.exporter import _registration as onnx_export_registration
 
 from QEfficient.base.onnx_transforms import (
     BaseOnnxTransform,
@@ -43,18 +40,6 @@ from QEfficient.utils import (
 from QEfficient.utils.export_utils import export_wrapper
 
 logger = logging.getLogger(__name__)
-
-
-def _ensure_onnxscript_framework_api_compat() -> None:
-    # torch nightlies can request newer framework API stubs than the installed
-    # onnxscript wheel ships. Reuse the newest available stub for registration.
-    try:
-        import onnxscript._framework_apis.torch_2_9 as torch_2_9
-    except ImportError:
-        return
-
-    sys.modules.setdefault("onnxscript._framework_apis.torch_2_10", torch_2_9)
-    sys.modules.setdefault("onnxscript._framework_apis.torch_2_11", torch_2_9)
 
 
 class QEFFBaseModel(ABC):
@@ -326,65 +311,37 @@ class QEFFBaseModel(ABC):
 
             if use_dynamo:
                 dynamic_axes = None
-                # Keep HOP invoke_subgraph calls as ONNX function calls (repeated subgraphs).
-                # torch.onnx.export currently inlines these during version conversion/optimize.
-                # Using exporter core directly with opset_version=None preserves subgraph calls.
                 export_kwargs = dict(export_kwargs)
                 export_kwargs.setdefault("report", True)
                 export_kwargs.setdefault("optimize", False)
-
-                custom_translation_table = export_kwargs.pop("custom_translation_table", None) or {}
-                custom_translation_table.update(
-                    {
-                        torch.ops.qefficient.rms_norm.default: CustomRMSNorm,
-                        torch.ops.qefficient.ctx_gather.default: CtxGather,
-                        torch.ops.qefficient.ctx_scatter.default: CtxScatter,
-                    }
-                )
-
-                _ensure_onnxscript_framework_api_compat()
-                registry = onnx_export_registration.ONNXRegistry().from_torchlib(
-                    opset_version=constants.ONNX_EXPORT_OPSET
-                )
-                for torch_op, onnx_op in custom_translation_table.items():
-                    registry.register_op(torch_op, onnx_op, is_complex=False)
+                export_kwargs["dynamo"] = True
+                export_kwargs["custom_translation_table"] = {
+                    **(export_kwargs.pop("custom_translation_table", None) or {}),
+                    torch.ops.qefficient.rms_norm.default: CustomRMSNorm,
+                    torch.ops.qefficient.ctx_gather.default: CtxGather,
+                    torch.ops.qefficient.ctx_scatter.default: CtxScatter,
+                }
 
                 prev_invoke_fallback = os.environ.get("TORCH_INVOKE_ALLOW_CREATE_FALLBACK")
                 os.environ["TORCH_INVOKE_ALLOW_CREATE_FALLBACK"] = "1"
                 try:
-                    onnx_program = onnx_export_core.export(
+                    torch.onnx.export(
                         self.model,
                         args=(),
+                        f=str(tmp_onnx_path),
                         kwargs=example_inputs,
-                        registry=registry,
-                        dynamic_shapes=dynamic_shapes,
                         input_names=input_names,
                         output_names=output_names,
-                        report=export_kwargs.pop("report", False),
-                        verify=export_kwargs.pop("verify", False),
-                        profile=export_kwargs.pop("profile", False),
-                        dump_exported_program=export_kwargs.pop("dump_exported_program", False),
-                        artifacts_dir=export_kwargs.pop("artifacts_dir", "."),
-                        verbose=export_kwargs.pop("verbose", None),
-                        optimize=export_kwargs.pop("optimize", False),
-                        opset_version=None,
+                        dynamic_axes=dynamic_axes,
+                        dynamic_shapes=dynamic_shapes,
+                        opset_version=constants.ONNX_EXPORT_OPSET,
+                        **export_kwargs,
                     )
                 finally:
                     if prev_invoke_fallback is None:
                         os.environ.pop("TORCH_INVOKE_ALLOW_CREATE_FALLBACK", None)
                     else:
                         os.environ["TORCH_INVOKE_ALLOW_CREATE_FALLBACK"] = prev_invoke_fallback
-                if export_kwargs:
-                    logger.warning(
-                        "Ignoring unsupported dynamo exporter kwargs in native repeated-subgraph path: %s",
-                        sorted(export_kwargs.keys()),
-                    )
-                onnx_program.save(
-                    str(tmp_onnx_path),
-                    include_initializers=True,
-                    keep_initializers_as_inputs=False,
-                    external_data=True,
-                )
             else:
                 export_kwargs["dynamo"] = False
                 torch.onnx.export(
