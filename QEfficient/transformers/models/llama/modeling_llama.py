@@ -86,10 +86,6 @@ def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    if position_ids is None:
-        seq_len = q.shape[-2]
-        position_ids = torch.arange(seq_len, device=q.device).view(1, seq_len).expand(q.shape[0], -1)
-
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
 
@@ -354,8 +350,8 @@ class QEffLlamaModel(LlamaModel):
             return_legacy_cache = True
             past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
 
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
