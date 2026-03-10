@@ -35,7 +35,7 @@ qeff_model = QEFFAutoModelForCausalLM(hf_model)
 pt_tokens = runner.run_kv_model_on_pytorch(qeff_model.model)
 print(pt_tokens)
 
-onnx_path = qeff_model.export(use_dynamo=True, use_onnx_subfunctions=False)
+onnx_path = qeff_model.export(use_dynamo=True, use_onnx_subfunctions=True)
 ort_inputs = runner.input_handler.prepare_ort_inputs()
 ort_tokens = runner.run_kv_model_on_ort(onnx_path)
 print(ort_tokens)

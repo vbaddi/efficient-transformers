@@ -9,6 +9,7 @@ import copy
 import inspect
 import re
 import warnings
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict
 
@@ -22,7 +23,11 @@ from QEfficient.transformers.models.pytorch_transforms import get_decoder_layer_
 from QEfficient.utils.cache import QEFF_HOME
 from QEfficient.utils.hash_utils import create_export_hash
 from QEfficient.utils.logging_utils import logger
-from QEfficient.utils.torch_patches import apply_torch_patches, undo_torch_patches
+from QEfficient.utils.torch_patches import (
+    apply_torch_patches,
+    temporarily_disable_nested_compile_regions,
+    undo_torch_patches,
+)
 
 
 def export_wrapper(func):
@@ -47,35 +52,39 @@ def export_wrapper(func):
     def wrapper(self, *args, **kwargs):
         use_dynamo = kwargs.get("use_dynamo", False)
         requested_subfunctions = kwargs.pop("use_onnx_subfunctions", False)
-        use_onnx_subfunctions = requested_subfunctions or use_dynamo
+        use_onnx_subfunctions = requested_subfunctions
 
-        if use_dynamo and not requested_subfunctions:
-            logger.info("Enabling ONNX subfunctions because use_dynamo=True.")
+        export_context = nullcontext()
+        subfunction_setup_done = False
+        try:
+            # 1. Setup the requested export mode
+            if use_onnx_subfunctions:
+                args, kwargs = _setup_onnx_subfunctions(self, args, kwargs)
+                subfunction_setup_done = True
+            elif use_dynamo:
+                decoder_layer_classes = get_decoder_layer_classes_for_export(self.model)
+                export_context = temporarily_disable_nested_compile_regions(self.model, decoder_layer_classes)
 
-        # 1. Setup ONNX subfunctions if requested/required
-        if use_onnx_subfunctions:
-            args, kwargs = _setup_onnx_subfunctions(self, args, kwargs)
+            # 2. Prepare export directory
+            export_dir = _prepare_export_directory(self, kwargs)
 
-        # 2. Prepare export directory
-        export_dir = _prepare_export_directory(self, kwargs)
+            # 3. Generate hash and finalize export directory path
+            export_hash, filtered_hash_params = _generate_export_hash(self, args, kwargs, func)
+            export_dir = export_dir.with_name(export_dir.name + "-" + export_hash)
+            kwargs["export_dir"] = export_dir
+            self.export_hash = export_hash
 
-        # 3. Generate hash and finalize export directory path
-        export_hash, filtered_hash_params = _generate_export_hash(self, args, kwargs, func)
-        export_dir = export_dir.with_name(export_dir.name + "-" + export_hash)
-        kwargs["export_dir"] = export_dir
-        self.export_hash = export_hash
+            # 4. Execute the actual export
+            with export_context:
+                onnx_path = func(self, *args, **kwargs)
 
-        # 4. Execute the actual export
-        onnx_path = func(self, *args, **kwargs)
-
-        # 5. Save export metadata
-        _save_export_metadata(export_dir, filtered_hash_params)
-
-        # 6. Always cleanup subfunctions if they were setup
-        if use_onnx_subfunctions:
-            _cleanup_onnx_subfunctions(self)
-
-        return onnx_path
+            # 5. Save export metadata
+            _save_export_metadata(export_dir, filtered_hash_params)
+            return onnx_path
+        finally:
+            # 6. Always cleanup subfunctions if they were setup
+            if subfunction_setup_done:
+                _cleanup_onnx_subfunctions(self)
 
     return wrapper
 
