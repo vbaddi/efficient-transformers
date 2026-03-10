@@ -325,10 +325,10 @@ class QEFFBaseModel(ABC):
                 prev_invoke_fallback = os.environ.get("TORCH_INVOKE_ALLOW_CREATE_FALLBACK")
                 os.environ["TORCH_INVOKE_ALLOW_CREATE_FALLBACK"] = "1"
                 try:
-                    torch.onnx.export(
+                    onnx_program = torch.onnx.export(
                         self.model,
                         args=(),
-                        f=str(tmp_onnx_path),
+                        f=None,
                         kwargs=example_inputs,
                         input_names=input_names,
                         output_names=output_names,
@@ -337,6 +337,22 @@ class QEFFBaseModel(ABC):
                         opset_version=constants.ONNX_EXPORT_OPSET,
                         **export_kwargs,
                     )
+                    if onnx_program is None:
+                        raise RuntimeError("torch.onnx.export returned None for dynamo export")
+                    if onnx_program.exported_program is not None:
+                        weights_to_apply = {}
+                        for name, tensor in onnx_program.exported_program.state_dict.items():
+                            if isinstance(tensor, torch.Tensor):
+                                weights_to_apply[name] = tensor
+                        for name, tensor in onnx_program.exported_program.constants.items():
+                            if isinstance(tensor, torch.Tensor):
+                                weights_to_apply[name] = tensor
+                                suffix = name.rsplit(".", 1)[-1]
+                                if suffix not in weights_to_apply:
+                                    weights_to_apply[suffix] = tensor
+                        if weights_to_apply:
+                            onnx_program.apply_weights(weights_to_apply)
+                    onnx_program.save(str(tmp_onnx_path))
                 finally:
                     if prev_invoke_fallback is None:
                         os.environ.pop("TORCH_INVOKE_ALLOW_CREATE_FALLBACK", None)

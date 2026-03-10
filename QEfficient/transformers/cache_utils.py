@@ -138,7 +138,7 @@ class QEffDynamicLayer(CacheLayerMixin):
             k_out = ctx_gather_interface(k_out, ctx_indices, ctx_len)
             v_out = ctx_gather_interface(v_out, ctx_indices, ctx_len)
 
-        v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+        v_out = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(v_out), v_out)
         return k_out, v_out
 
     def read_only_blockedKV(self, start_index, end_index, cache_kwargs):
@@ -184,7 +184,7 @@ class QEffDynamicLayer(CacheLayerMixin):
             k_out = CtxGatherFuncBlockedKV.apply(k_out, ctx_indices)
             v_out = CtxGatherFuncBlockedKV.apply(v_out, ctx_indices)
 
-        v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+        v_out = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(v_out), v_out)
         return k_out, v_out
 
     def write_only(self, key_states, value_states, cache_kwargs):
@@ -305,7 +305,7 @@ class QEffDynamicLayer(CacheLayerMixin):
                 k_out = ctx_gather_interface(k_out, ctx_indices, ctx_len)
                 v_out = ctx_gather_interface(v_out, ctx_indices, ctx_len)
 
-            v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+            v_out = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(v_out), v_out)
 
         return k_out, v_out
 
@@ -388,7 +388,7 @@ class QEffDynamicLayer(CacheLayerMixin):
                 k_out = ctx_gather_3d_interface(k_out, ctx_indices)
                 v_out = ctx_gather_3d_interface(v_out, ctx_indices)
 
-            v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+            v_out = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(v_out), v_out)
 
         return k_out, v_out
 
@@ -667,7 +667,7 @@ class QEffHybridCache(HybridCache):
             )
             k_out = ctx_gather_interface(k_out, final_indices, ctx_len)
             v_out = ctx_gather_interface(v_out, final_indices, ctx_len)
-            ctx_v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+            ctx_v_out = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(v_out), v_out)
             v_out = torch.where((is_sliding_layer & (position_ids.max() >= (layer_ctx_len - 1))), v_out, ctx_v_out)
         return k_out, v_out
 
@@ -782,7 +782,7 @@ class QEffHybridChunkedCache(HybridChunkedCache):
             )
             k_out = ctx_gather_interface(k_out, final_indices, ctx_len)
             v_out = ctx_gather_interface(v_out, final_indices, ctx_len)
-            ctx_v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+            ctx_v_out = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(v_out), v_out)
             v_out = torch.where((is_sliding_layer & (position_ids.max() >= (layer_ctx_len - 1))), v_out, ctx_v_out)
         return k_out, v_out
 
@@ -1125,7 +1125,7 @@ class QEffHybridCacheForGPTOSS:
                 k_out = ctx_gather_interface(k_out, ctx_indices, ctx_len)
                 v_out = ctx_gather_interface(v_out, ctx_indices, ctx_len)
 
-            v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+            v_out = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(v_out), v_out)
         return k_out, v_out
 
     def full_cache_update_chunked(
@@ -1167,7 +1167,7 @@ class QEffHybridCacheForGPTOSS:
         else:
             k_out = CtxGatherFunc.apply(k_out, ctx_indices, ctx_len)
             v_out = CtxGatherFunc.apply(v_out, ctx_indices, ctx_len)
-        v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+        v_out = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(v_out), v_out)
 
         return k_out, v_out
 
@@ -1213,6 +1213,6 @@ class QEffHybridCacheForGPTOSS:
         else:
             k_out = CtxGatherFunc.apply(k_out, ctx_indices, ctx_len)
             v_out = CtxGatherFunc.apply(v_out, ctx_indices, ctx_len)
-        v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+        v_out = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(v_out), v_out)
 
         return k_out, v_out
