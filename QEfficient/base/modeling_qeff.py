@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, OrderedDict
 
 import onnx
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 from QEfficient.base.onnx_transforms import (
     BaseOnnxTransform,
@@ -38,6 +39,19 @@ from QEfficient.utils import (
     load_json,
 )
 from QEfficient.utils.export_utils import export_wrapper
+
+
+def _prune_unused_fake_initializers(onnx_program) -> None:
+    initializers = onnx_program.model.graph.initializers
+    used_names = {name for node in onnx_program.model.graph for name in node.inputs}
+    used_names.update(output.name for output in onnx_program.model.graph.outputs)
+
+    for name in list(initializers):
+        const_value = getattr(initializers[name], "const_value", None)
+        raw_value = getattr(const_value, "raw", None)
+        if isinstance(raw_value, FakeTensor) and name not in used_names:
+            del initializers[name]
+
 
 logger = logging.getLogger(__name__)
 
@@ -339,19 +353,7 @@ class QEFFBaseModel(ABC):
                     )
                     if onnx_program is None:
                         raise RuntimeError("torch.onnx.export returned None for dynamo export")
-                    if onnx_program.exported_program is not None:
-                        weights_to_apply = {}
-                        for name, tensor in onnx_program.exported_program.state_dict.items():
-                            if isinstance(tensor, torch.Tensor):
-                                weights_to_apply[name] = tensor
-                        for name, tensor in onnx_program.exported_program.constants.items():
-                            if isinstance(tensor, torch.Tensor):
-                                weights_to_apply[name] = tensor
-                                suffix = name.rsplit(".", 1)[-1]
-                                if suffix not in weights_to_apply:
-                                    weights_to_apply[suffix] = tensor
-                        if weights_to_apply:
-                            onnx_program.apply_weights(weights_to_apply)
+                    _prune_unused_fake_initializers(onnx_program)
                     onnx_program.save(str(tmp_onnx_path))
                 finally:
                     if prev_invoke_fallback is None:

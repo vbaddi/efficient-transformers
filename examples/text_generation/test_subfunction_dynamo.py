@@ -12,7 +12,10 @@ from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalL
 from QEfficient.utils.run_utils import ApiRunner
 
 # model_name = "openai/gpt-oss-20b"
-model_name = "meta-llama/Llama-3.2-1B"
+# model_name = "meta-llama/Llama-3.2-1B"
+model_name = "gpt2"
+# model_name = "hf-internal-testing/tiny-random-Olmo2ForCausalLM"
+# model_name = "tiny-random/gpt-oss-bf16"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 config = AutoConfig.from_pretrained(model_name)
 # config.num_hidden_layers = 4
