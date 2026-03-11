@@ -250,11 +250,10 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
                 f"past_key.{layer_idx}_RetainedState",
                 f"past_value.{layer_idx}_RetainedState",
             ]
-            if node.output[-2:] != desired_outputs:
-                if len(node.output) == 1:
-                    node.output.extend(desired_outputs)
-                else:
-                    node.output[-2:] = desired_outputs
+            if node.output[-len(desired_outputs) :] != desired_outputs:
+                missing_outputs = [name for name in desired_outputs if name not in node.output]
+                if missing_outputs:
+                    node.output.extend(missing_outputs)
                 changed = True
 
         return changed

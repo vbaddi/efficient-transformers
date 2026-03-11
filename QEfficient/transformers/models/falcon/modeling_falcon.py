@@ -59,6 +59,16 @@ class QEffFalconRotaryEmbedding(FalconRotaryEmbedding):
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype) * self.attention_scaling,
+            self.sin_cached[:seq_len].to(dtype=x.dtype) * self.attention_scaling,
+        )
+
 
 def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
@@ -98,13 +108,42 @@ class QEffFalconAttention(FalconAttention):
     - add new args position idx for the cache_kwargs for kv retention
     """
 
+    def __qeff_init__(self):
+        self.rotary_emb = QEffFalconRotaryEmbedding(config=self.config)
+
+    def _split_heads_for_nested_region(
+        self, fused_qkv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Avoid list-index based slicing that materializes anonymous constants in nested export."""
+        if self.new_decoder_architecture:
+            batch, seq_len, _ = fused_qkv.shape
+            qkv = fused_qkv.view(batch, seq_len, -1, self.num_heads // self.num_kv_heads + 2, self.head_dim)
+            query = qkv[:, :, :, :-2, :]
+            key = qkv[:, :, :, -2:-1, :]
+            value = qkv[:, :, :, -1:, :]
+            key = torch.broadcast_to(key, query.shape)
+            value = torch.broadcast_to(value, query.shape)
+            return (query.flatten(2, 3), key.flatten(2, 3), value.flatten(2, 3))
+
+        batch_size, seq_length, _ = fused_qkv.shape
+        if not self.multi_query:
+            qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
+            return qkv[:, :, :, 0, :], qkv[:, :, :, 1, :], qkv[:, :, :, 2, :]
+
+        qkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
+        return (
+            qkv[:, :, : self.num_heads, :],
+            qkv[:, :, self.num_heads : self.num_heads + 1, :],
+            qkv[:, :, self.num_heads + 1 :, :],
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         alibi: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_value: Optional[Cache] = None,
         comp_ctx_lengths: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         layer_past: Optional[Cache] = None,
@@ -112,13 +151,11 @@ class QEffFalconAttention(FalconAttention):
         use_cache: bool = False,
         output_attentions: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        cos_cached: Optional[torch.Tensor] = None,
-        sin_cached: Optional[torch.Tensor] = None,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
         num_kv_heads = self.num_heads if self.new_decoder_architecture else self.num_kv_heads
         # 3 x [batch_size, seq_length, num_heads, head_dim]
-        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
+        (query_layer, key_layer, value_layer) = self._split_heads_for_nested_region(fused_qkv)
 
         batch_size, query_length, _, _ = query_layer.shape
 
@@ -126,16 +163,12 @@ class QEffFalconAttention(FalconAttention):
         key_layer = key_layer.transpose(1, 2).reshape(batch_size, num_kv_heads, query_length, self.head_dim)
         value_layer = value_layer.transpose(1, 2).reshape(batch_size, num_kv_heads, query_length, self.head_dim)
 
-        # kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position)
-        query_layer, key_layer = qeff_apply_rotary_pos_emb(query_layer, key_layer, cos_cached, sin_cached, position_ids)
+        kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position)
+        cos, sin = self.rotary_emb(value_layer, seq_len=kv_seq_len)
+        query_layer, key_layer = qeff_apply_rotary_pos_emb(query_layer, key_layer, cos, sin, position_ids)
 
         if layer_past is not None:
-            past_seen_tokens = layer_past.get_seq_length()
-            cache_kwargs = {
-                "batch_index": batch_index,
-                "position_ids": position_ids,
-                "past_seen_tokens": past_seen_tokens,
-            }
+            cache_kwargs = {"batch_index": batch_index, "position_ids": position_ids}
             if comp_ctx_lengths is not None:
                 attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
                 cache_kwargs["CCL"] = attention_mask.shape[-1]
@@ -147,11 +180,9 @@ class QEffFalconAttention(FalconAttention):
         attention_scores = query_layer @ key_layer.transpose(-1, -2)
         attention_scores /= math.sqrt(self.head_dim)
         attention_scores = torch.where(
-            attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=self.config.torch_dtype), attention_scores
+            attention_mask, torch.full_like(attention_scores, MIN_MASKED_ATTENTION_VALUE), attention_scores
         )
-        attention_scores = F.softmax(attention_scores + attention_mask, dim=-1, dtype=torch.float32).to(
-            query_layer.dtype
-        )
+        attention_scores = F.softmax(attention_scores + attention_mask, dim=-1, dtype=hidden_states.dtype)
         # It is unclear why neither dropout nor head_mask is applied here (while it is with alibi).
         attn_output = attention_scores @ value_layer
 
@@ -165,6 +196,7 @@ class QEffFalconAttention(FalconAttention):
 
 
 class QEffFalconDecoderLayer(FalconDecoderLayer):
+    @torch.compiler.nested_compile_region
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -179,8 +211,6 @@ class QEffFalconDecoderLayer(FalconDecoderLayer):
         use_cache: bool = False,
         output_attentions: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        sin_cached=None,
-        cos_cached=None,
         **kwargs,
     ):
         residual = hidden_states
@@ -197,7 +227,7 @@ class QEffFalconDecoderLayer(FalconDecoderLayer):
             layer_past=layer_past,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_value,
+            past_key_value=past_key_value,
             comp_ctx_lengths=comp_ctx_lengths,
             batch_index=batch_index,
             alibi=alibi,
@@ -205,8 +235,6 @@ class QEffFalconDecoderLayer(FalconDecoderLayer):
             use_cache=use_cache,
             output_attentions=output_attentions,
             cache_position=cache_position,
-            sin_cached=sin_cached,
-            cos_cached=cos_cached,
         )
 
         if not self.config.new_decoder_architecture:
@@ -243,11 +271,6 @@ class QEffFalconModel(FalconModel):
     - add new args position idx for the cache_kwargs for kv retention
     - update causal attention mask
     """
-
-    def __qeff_init__(self):
-        self.rotary_emb = QEffFalconRotaryEmbedding(config=self.config)
-        self.sin_cached = torch.nn.Parameter(self.rotary_emb.sin_cached * self.rotary_emb.attention_scaling)
-        self.cos_cached = torch.nn.Parameter(self.rotary_emb.cos_cached * self.rotary_emb.attention_scaling)
 
     def forward(
         self,
@@ -326,8 +349,6 @@ class QEffFalconModel(FalconModel):
                 output_attentions=output_attentions,
                 alibi=alibi,
                 cache_position=cache_position,
-                sin_cached=self.sin_cached,
-                cos_cached=self.cos_cached,
             )
 
             hidden_states = outputs[0]
@@ -408,7 +429,7 @@ class QEffFalconForCausalLM(FalconForCausalLM):
         # Cast to INT32 to avoid issue while running in ONNXRT
         logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
         hidden_states = transformer_outputs[0][torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
-        lm_logits = self.lm_head(hidden_states).float()
+        lm_logits = self.lm_head(hidden_states)
 
         return CausalLMOutputWithCrossAttentions(
             loss=None,
