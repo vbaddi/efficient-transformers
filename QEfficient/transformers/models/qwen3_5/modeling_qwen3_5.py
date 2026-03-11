@@ -173,66 +173,60 @@ class QEffQwen3_5TextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
             dtype=torch.get_default_dtype(),
         )
         self.mrope_section = config.rope_parameters.get("mrope_section", [11, 11, 10])
+        self.register_buffer("mrope_source_index", self._build_mrope_source_index(), persistent=False)
+
+    def _build_mrope_source_index(self) -> torch.Tensor:
+        rotary_half_dim = self.inv_freq.shape[0]
+        source_index = torch.zeros(rotary_half_dim, dtype=torch.long)
+        for idx in range(rotary_half_dim):
+            if idx % 3 == 1 and idx < self.mrope_section[1] * 3:
+                source_index[idx] = 1
+            elif idx % 3 == 2 and idx < self.mrope_section[2] * 3:
+                source_index[idx] = 2
+        return source_index
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.int64).type_as(self.inv_freq)
         freqs = torch.outer(t, self.inv_freq)
-        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
-        self.register_buffer("cos_cached", freqs.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", freqs.sin().to(dtype), persistent=False)
+        self.register_buffer("cos_cached_half", freqs.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached_half", freqs.sin().to(dtype), persistent=False)
 
-    def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype) * self.attention_scaling,
-            self.sin_cached[:seq_len].to(dtype=x.dtype) * self.attention_scaling,
+    def _apply_interleaved_mrope_cache(self, gathered_cache: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        safe_position_ids = torch.where(position_ids < 0, torch.zeros_like(position_ids), position_ids)
+        cache = (
+            gathered_cache.unsqueeze(0)
+            .unsqueeze(1)
+            .expand(position_ids.shape[0], position_ids.shape[1], -1, gathered_cache.shape[-1])
         )
+        gather_index = safe_position_ids.unsqueeze(-1).expand(-1, -1, -1, gathered_cache.shape[-1])
+        stacked_cache = torch.gather(cache, 2, gather_index).permute(1, 2, 3, 0)
+        source_index = self.mrope_source_index.to(device=stacked_cache.device)
+        source_index = source_index.view(1, 1, -1, 1).expand(*stacked_cache.shape[:-1], 1)
+        return torch.gather(stacked_cache, -1, source_index).squeeze(-1)
+
+    def forward(self, x, position_ids):
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        cos_half = self._apply_interleaved_mrope_cache(self.cos_cached_half, position_ids)
+        sin_half = self._apply_interleaved_mrope_cache(self.sin_cached_half, position_ids)
+
+        cos = torch.cat((cos_half, cos_half), dim=-1) * self.attention_scaling
+        sin = torch.cat((sin_half, sin_half), dim=-1) * self.attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
-
-    Explanation:
-        Multimodal 3D rotary position embedding is an extension to 1D rotary position embedding. The input embedding
-        sequence contains vision (images / videos) embedding and text embedding or just contains text embedding. For
-        vision embedding part, we apply rotary position embedding on temporal, height and width dimension seperately.
-        Here we split the channel dimension to 3 chunks for the temporal, height and width rotary position embedding.
-        For text embedding part, we just apply 1D rotary position embedding. The three rotary position index (temporal,
-        height and width) of text embedding is always the same, so the text embedding rotary position embedding has no
-        difference with modern LLMs.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        mrope_section(`List(int)`):
-            Multimodal rope section is for channel dimension of temporal, height and width in rope calculation.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    del mrope_section
+    cos = cos[position_ids]
+    sin = sin[position_ids]
+    cos = torch.cat([cos[0, ..., 0:32], cos[1, ..., 32:80], cos[2, ..., 80:128]], dim=-1).unsqueeze(unsqueeze_dim)
+    sin = torch.cat([sin[0, ..., 0:32], sin[1, ..., 32:80], sin[2, ..., 80:128]], dim=-1).unsqueeze(unsqueeze_dim)
 
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-
-    return q_embed.to(q.dtype), k_embed.to(k.dtype)
+    return q_embed, k_embed
 
 
 def eager_attention_forward(
@@ -244,6 +238,7 @@ def eager_attention_forward(
     scaling: float,
     **kwargs,
 ):
+    del kwargs
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
@@ -306,22 +301,74 @@ class QEffQwen3_5Attention(Qwen3_5Attention):
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        # query_states, key_states = qeff_apply_rotary_pos_emb(
-        #     query_states, key_states, cos, sin, position_ids, None
-        # )
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "batch_index": batch_index,
-                "position_ids": position_ids,
-            }
+            cache_kwargs = {"batch_index": batch_index}
+            if position_ids is not None:
+                if torch.onnx.is_in_onnx_export():
+                    cache_layer = past_key_values.kv_layers[self.layer_idx]
+                    fallback_position = (
+                        cache_layer.keys.shape[2] - 1
+                        if cache_layer is not None and cache_layer.keys is not None
+                        else position_ids.shape[-1] - 1
+                    )
+                    invalid_token_mask = (position_ids < 0).unsqueeze(1).unsqueeze(-1)
+                    key_states = torch.where(invalid_token_mask, torch.zeros_like(key_states), key_states)
+                    value_states = torch.where(invalid_token_mask, torch.zeros_like(value_states), value_states)
+                    cache_kwargs["position_ids"] = torch.where(
+                        position_ids < 0,
+                        torch.tensor(fallback_position, dtype=position_ids.dtype, device=position_ids.device),
+                        position_ids,
+                    )
+                else:
+                    scatter_position_ids = position_ids
+                    if torch.any(position_ids < 0):
+                        cache_layer = past_key_values.kv_layers[self.layer_idx]
+                        if cache_layer is not None and cache_layer.keys is not None:
+                            fallback_position = cache_layer.keys.shape[2] - 1
+                        else:
+                            fallback_position = int(position_ids.max().item())
+                        scatter_position_ids = torch.where(
+                            position_ids < 0,
+                            torch.tensor(fallback_position, dtype=position_ids.dtype, device=position_ids.device),
+                            position_ids,
+                        )
+                        invalid_token_mask = (position_ids < 0).unsqueeze(1).unsqueeze(-1)
+                        key_states = torch.where(invalid_token_mask, torch.zeros_like(key_states), key_states)
+                        value_states = torch.where(invalid_token_mask, torch.zeros_like(value_states), value_states)
+                    cache_kwargs["position_ids"] = scatter_position_ids
+            elif cache_position is not None:
+                cache_kwargs["position_ids"] = cache_position.unsqueeze(0).expand(hidden_states.shape[0], -1)
             if comp_ctx_lengths is not None:
                 attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
                 cache_kwargs["CCL"] = attention_mask.shape[-1]
+            elif attention_mask is not None:
+                if torch.onnx.is_in_onnx_export() and position_ids is not None:
+                    cache_kwargs["CCL"] = position_ids.max().to(torch.int64) + 1
+                else:
+                    cache_kwargs["CCL"] = attention_mask.shape[-1]
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        local_position_ids = position_ids
+        if local_position_ids is None and cache_position is not None:
+            local_position_ids = cache_position.unsqueeze(0).expand(hidden_states.shape[0], -1)
+
+        if local_position_ids is not None:
+            attention_mask = _create_causal_mask(
+                position_ids=local_position_ids,
+                target_length=key_states.shape[-2],
+                sliding_window=None,
+            )
+        elif attention_mask is not None and attention_mask.shape[-1] != key_states.shape[-2]:
+            if attention_mask.shape[-1] < key_states.shape[-2]:
+                pad = torch.ones(
+                    (*attention_mask.shape[:-1], key_states.shape[-2] - attention_mask.shape[-1]),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                attention_mask = torch.cat([attention_mask, pad], dim=-1)
+            else:
+                attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
         attn_output, attn_weights = eager_attention_forward(
             self,
@@ -344,281 +391,142 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
     Linear-attention path with explicit conv/recurrent retained-state updates.
     """
 
-    # def forward(self, hidden_states, cache_params=None, cache_position=None, attention_mask=None):
-    #     batch_size, seq_len, _ = hidden_states.shape
+    deltanet_prefill_mode = "recurrent"
 
-    #     # ── Projections ──────────────────────────────────────────
-    #     mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)  # (B, conv_dim, T)
-    #     z     = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-    #     beta  = self.in_proj_b(hidden_states).sigmoid()
-    #     g     = -self.A_log.float().exp() * F.softplus(
-    #                 self.in_proj_a(hidden_states).float() + self.dt_bias)
-
-    #     # ── Conv state ───────────────────────────────────────────
-    #     if cache_params is not None:
-    #         conv_state = cache_params.conv_states[self.layer_idx]
-    #         recurrent_state = cache_params.recurrent_states[self.layer_idx]
-
-    #         # Single unified conv update — works for both prefill and decode
-    #         # For prefill: conv_state starts as zeros, slides through T tokens
-    #         # For decode:  conv_state is the retained buffer, updates by 1
-    #         mixed_qkv, new_conv_state = qeff_torch_causal_conv1d_update(
-    #             mixed_qkv, conv_state,
-    #             self.conv1d.weight.squeeze(1), self.conv1d.bias,
-    #         )
-    #         cache_params.conv_states[self.layer_idx] = new_conv_state
-    #     else:
-    #         recurrent_state = None
-    #         mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
-
-    #     # ── Split Q/K/V ──────────────────────────────────────────
-    #     mixed_qkv = mixed_qkv.transpose(1, 2)
-    #     query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-    #     query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-    #     key   = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-    #     value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-    #     if self.num_v_heads // self.num_k_heads > 1:
-    #         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-    #         key   = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-    #     # ── Recurrent / Chunk ─────────────────────────────────────
-    #     # chunk_gated_delta_rule handles BOTH cases correctly:
-    #     # - prefill: initial_state=zeros or retained, output_final_state=True
-    #     # - decode:  initial_state=retained, seq_len=1, degenerates to single step
-    #     core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-    #         query, key, value,
-    #         g=g, beta=beta,
-    #         initial_state=recurrent_state,
-    #         output_final_state=(cache_params is not None),
-    #         use_qk_l2norm_in_kernel=True,
-    #     )
-
-    #     if cache_params is not None:
-    #         cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
-
-    #     # ── Output ───────────────────────────────────────────────
-    #     core_attn_out = self.norm(
-    #         core_attn_out.reshape(-1, self.head_v_dim),
-    #         z.reshape(-1, self.head_v_dim)
-    #     )
-    #     return self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1))
-
-    def __qeff_init__(self):
-        self.chunk_gated_delta_rule = self.torch_chunk_gated_delta_rule_qeff
-        chunk_size = 64  # must match what's used in the function
-
-        # Precompute all constant masks — no triu/tril with diagonal args at runtime
-        # mask_causal: upper triangular including diagonal (diagonal=0)
-        # = triu(ones, diagonal=0)
-        mask_causal = torch.ones(chunk_size, chunk_size, dtype=torch.bool)
-        for i in range(chunk_size):
-            for j in range(i + 1):
-                mask_causal[i, j] = False
-        self.register_buffer("_mask_causal", mask_causal, persistent=False)
-        # shape: (C, C), True above diagonal inclusive
-
-        # mask_strict: strict upper triangular (diagonal=1)
-        # = triu(ones, diagonal=1)
-        mask_strict = torch.zeros(chunk_size, chunk_size, dtype=torch.bool)
-        for i in range(chunk_size):
-            for j in range(i + 1, chunk_size):
-                mask_strict[i, j] = True
-        self.register_buffer("_mask_strict", mask_strict, persistent=False)
-        # shape: (C, C), True strictly above diagonal
-
-        # ones_lower: lower triangular all-ones for cumsum replacement
-        # = tril(ones, diagonal=0)
-        ones_lower = torch.zeros(chunk_size, chunk_size)
-        for i in range(chunk_size):
-            for j in range(i + 1):
-                ones_lower[i, j] = 1.0
-        self.register_buffer("_ones_lower", ones_lower, persistent=False)
-        # shape: (C, C)
-
-        # eye: identity matrix
-        self.register_buffer("_eye", torch.eye(chunk_size), persistent=False)
-
-    def torch_chunk_gated_delta_rule_qeff(
+    def _build_prefill_conv_state(
         self,
-        query,
-        key,
-        value,
-        g,
-        beta,
-        chunk_size=64,
-        initial_state=None,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=False,
-        mask_causal=None,
-        mask_strict=None,
-        ones_lower=None,
-        eye=None,
-    ):
+        mixed_qkv_inputs: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, hidden_size, seq_len = mixed_qkv_inputs.shape
+        valid_lengths = attention_mask.to(torch.int64).sum(dim=-1)
+        window_positions = torch.arange(self.conv_kernel_size, device=mixed_qkv_inputs.device).view(1, -1)
+        window_positions = window_positions + (valid_lengths.view(-1, 1) - self.conv_kernel_size)
+        valid_window = window_positions >= 0
+        gather_positions = window_positions.clamp(min=0, max=seq_len - 1)
+        gather_positions = gather_positions.unsqueeze(1).expand(batch_size, hidden_size, self.conv_kernel_size)
+        conv_state = mixed_qkv_inputs.gather(2, gather_positions)
+        return torch.where(valid_window.unsqueeze(1), conv_state, torch.zeros_like(conv_state))
+
+    def _recurrent_scan_gated_delta_rule(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: Optional[torch.Tensor],
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Unifies prefill and decode using recurrent state updates only.
+        The loop length is fixed at trace time, while runtime sequence lengths are
+        handled safely by clamped indexing + per-step validity masking.
+        """
         initial_dtype = query.dtype
-        if use_qk_l2norm_in_kernel:
-            query = l2norm(query, dim=-1, eps=1e-6)
-            key = l2norm(key, dim=-1, eps=1e-6)
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
 
         query, key, value, beta, g = [
             x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
         ]
-        batch_size, num_heads, sequence_length, k_head_dim = key.shape
+        query = query * (1 / (query.shape[-1] ** 0.5))
+
+        batch_size, num_heads, traced_seq_len, k_head_dim = key.shape
         v_head_dim = value.shape[-1]
+        seq_len_tensor = torch._shape_as_tensor(key)[2]
 
-        pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-        query = F.pad(query, (0, 0, 0, pad_size))
-        key = F.pad(key, (0, 0, 0, pad_size))
-        value = F.pad(value, (0, 0, 0, pad_size))
-        beta = F.pad(beta, (0, pad_size))
-        g = F.pad(g, (0, pad_size))
-        total_sequence_length = sequence_length + pad_size
-
-        scale = 1.0 / (query.shape[-1] ** 0.5)
-        query = query * scale
-
-        v_beta = value * beta.unsqueeze(-1)
-        k_beta = key * beta.unsqueeze(-1)
-
-        # reshape to chunks
-        query, key, value, k_beta, v_beta = [
-            x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
-        ]
-        g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-        # g: (B, H, num_chunks, chunk_size)
-
-        # ── Cumsum replacement (no CumSum op) ────────────────────────────────────
-        # ones_lower is precomputed (chunk_size, chunk_size) lower triangular
-        # g @ ones_lower.T = prefix sum along last dim = cumsum
-        ones_lower = ones_lower.to(g.dtype)
-        g = (g.unsqueeze(-2) @ ones_lower.T).squeeze(-2)
-        # ─────────────────────────────────────────────────────────────────────────
-
-        # ── Decay mask (no tril with diagonal arg) ────────────────────────────────
-        # g.unsqueeze(-1) - g.unsqueeze(-2): (B, H, num_chunks, C, C)
-        # .tril() here means zero out upper triangle — use precomputed mask instead
-        diff = g.unsqueeze(-1) - g.unsqueeze(-2)  # (B, H, num_chunks, C, C)
-        diff = diff * (~mask_strict).float()  # zero upper triangle (strict)
-        decay_mask = diff.exp().float()
-        decay_mask = decay_mask * (~mask_strict).float()  # ensure upper is zero
-        # ─────────────────────────────────────────────────────────────────────────
-
-        # mask_causal: True where we want to MASK (upper triangle including diagonal)
-        attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask_causal, 0)
-
-        for i in range(1, chunk_size):
-            row = attn[..., i, :i].clone()
-            sub = attn[..., :i, :i].clone()
-            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-
-        # eye is precomputed identity
-        attn = attn + eye.to(attn.dtype)
-        value = attn @ v_beta
-        k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-
-        last_recurrent_state = (
-            torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
-            if initial_state is None
-            else initial_state.to(value)
-        )
-        core_attn_out = torch.zeros_like(value)
-
-        # mask_strict: True strictly above diagonal
-        for i in range(0, total_sequence_length // chunk_size):
-            q_i = query[:, :, i]
-            k_i = key[:, :, i]
-            v_i = value[:, :, i]
-
-            attn_i = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask_strict, 0)
-            v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-            v_new = v_i - v_prime
-            attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-
-            core_attn_out[:, :, i] = attn_inter + attn_i @ v_new
-
-            last_recurrent_state = (
-                last_recurrent_state * g[:, :, i, -1, None, None].exp()
-                + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        if initial_state is None:
+            recurrent_state = torch.zeros(
+                batch_size, num_heads, k_head_dim, v_head_dim, device=key.device, dtype=torch.float32
             )
+        else:
+            recurrent_state = initial_state.to(torch.float32)
 
-        if not output_final_state:
-            last_recurrent_state = None
+        if token_mask is not None:
+            token_mask = token_mask.to(dtype=torch.bool)
 
-        core_attn_out = core_attn_out.reshape(
-            core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
-        )
-        core_attn_out = core_attn_out[:, :, :sequence_length]
+        core_attn_steps = []
+        for i in range(traced_seq_len):
+            i_tensor = torch.tensor(i, dtype=torch.int64, device=key.device)
+            safe_idx = torch.clamp(i_tensor, min=0, max=seq_len_tensor - 1)
+            valid_idx = safe_idx.eq(i_tensor)
+
+            q_t = query.index_select(2, safe_idx.view(1)).squeeze(2)
+            k_t = key.index_select(2, safe_idx.view(1)).squeeze(2)
+            v_t = value.index_select(2, safe_idx.view(1)).squeeze(2)
+            g_t = g.index_select(2, safe_idx.view(1)).squeeze(2).exp().unsqueeze(-1).unsqueeze(-1)
+            beta_t = beta.index_select(2, safe_idx.view(1)).squeeze(2).unsqueeze(-1)
+
+            if token_mask is not None:
+                mask_t = token_mask.index_select(1, safe_idx.view(1)).squeeze(1)
+                valid = valid_idx & mask_t
+            else:
+                valid = valid_idx.expand(batch_size)
+
+            decayed_state = recurrent_state * g_t
+            kv_mem = (decayed_state * k_t.unsqueeze(-1)).sum(dim=-2)
+            delta = (v_t - kv_mem) * beta_t
+            candidate_state = decayed_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+            candidate_out = (candidate_state * q_t.unsqueeze(-1)).sum(dim=-2)
+
+            state_valid = valid.view(batch_size, 1, 1, 1)
+            out_valid = valid.view(batch_size, 1, 1)
+            recurrent_state = torch.where(state_valid, candidate_state, recurrent_state)
+            out_t = torch.where(out_valid, candidate_out, torch.zeros_like(candidate_out))
+            core_attn_steps.append(out_t.unsqueeze(2))
+
+        core_attn_out = torch.cat(core_attn_steps, dim=2)
+        core_attn_out = core_attn_out[:, :, : key.shape[2]]
         core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-        return core_attn_out, last_recurrent_state
+        return core_attn_out, recurrent_state
 
-    def _recurrent_step_batched(self, query, key, value, g, beta, recurrent_state):
-        """
-        Pure tensor ops, no loop, no padding.
-        Works for any T but intended for T=1 decode.
-        Shapes: query/key/value (B, T, H, d_k/d_v)
-        """
-        dtype = query.dtype
-
-        # L2 norm (matching chunk kernel behavior)
-        q = query.float()
-        k = key.float()
-        q = q * torch.rsqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)
-        k = k * torch.rsqrt((k * k).sum(dim=-1, keepdim=True) + 1e-6)
-        v = value.float()
-
-        scale = 1.0 / (q.shape[-1] ** 0.5)
-        q = q * scale  # (B, T, H, d_k)
-
-        # For T=1 decode, this is a single step
-        # Transpose to (B, H, T, d_k/d_v) to match recurrent state layout
-        q = q.transpose(1, 2)  # (B, H, T, d_k)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        b = beta.transpose(1, 2).float().unsqueeze(-1)  # (B, H, T, 1)
-        decay = g.transpose(1, 2).float().exp()  # (B, H, T)
-        decay = decay.unsqueeze(-1).unsqueeze(-1)  # (B, H, T, 1, 1)
-
-        S = recurrent_state.float()  # (B, H, d_k, d_v)
-
-        # Single step — no loop because T=1
-        # S update
-        S_decayed = S * decay[:, :, 0]  # (B, H, d_k, d_v)
-        kv_mem = (S_decayed * k[:, :, 0].unsqueeze(-1)).sum(dim=-2)  # (B, H, d_v)
-        delta = (v[:, :, 0] - kv_mem) * b[:, :, 0]  # (B, H, d_v)
-        S_new = S_decayed + k[:, :, 0].unsqueeze(-1) * delta.unsqueeze(-2)  # (B, H, d_k, d_v)
-        out = (S_new * q[:, :, 0].unsqueeze(-1)).sum(dim=-2)  # (B, H, d_v)
-
-        out = out.unsqueeze(2).transpose(1, 2).to(dtype)  # (B, 1, H, d_v) → (B, T, H, d_v)
-        return out, S_new.to(recurrent_state.dtype)
-
-    def forward(self, hidden_states, cache_params=None, cache_position=None, attention_mask=None):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_params: Optional[QEffQwen3_5DynamicCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        del cache_position
         batch_size, seq_len, _ = hidden_states.shape
+        seq_len_tensor = torch._shape_as_tensor(hidden_states)[1]
+        is_decode = seq_len_tensor.eq(1)
 
-        # ── Projections ──────────────────────────────────────
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        pre_conv_qkv = mixed_qkv
         z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
         beta = self.in_proj_b(hidden_states).sigmoid()
         g = -self.A_log.float().exp() * F.softplus(self.in_proj_a(hidden_states).float() + self.dt_bias)
 
-        # ── Conv (unified, handles T=1 and T=N) ──────────────
         if cache_params is not None:
             conv_state = cache_params.conv_states[self.layer_idx]
             recurrent_state = cache_params.recurrent_states[self.layer_idx]
+            if conv_state is None:
+                conv_state = mixed_qkv.new_zeros((batch_size, self.conv_dim, self.conv_kernel_size))
+            if recurrent_state is None:
+                recurrent_state = hidden_states.new_zeros(
+                    (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim)
+                )
 
-            mixed_qkv, new_conv_state = qeff_torch_causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
+            decode_mixed_qkv, decode_conv_state = qeff_torch_causal_conv1d_update(
+                mixed_qkv, conv_state, self.conv1d.weight.squeeze(1), self.conv1d.bias
             )
+            prefill_mixed_qkv = F.silu(self.conv1d(pre_conv_qkv)[:, :, :seq_len])
+            if attention_mask is not None:
+                prefill_conv_state = self._build_prefill_conv_state(pre_conv_qkv, attention_mask)
+            else:
+                prefill_conv_state = decode_conv_state
+            mixed_qkv = torch.where(is_decode, decode_mixed_qkv, prefill_mixed_qkv)
+            new_conv_state = torch.where(is_decode, decode_conv_state, prefill_conv_state)
             cache_params.conv_states[self.layer_idx] = new_conv_state
         else:
             recurrent_state = None
             mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
 
-        # ── Split Q/K/V ──────────────────────────────────────
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+
         query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
@@ -627,73 +535,78 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        # ── Recurrent State ───────────────────────────────────
+        if attention_mask is not None:
+            valid_token_mask = attention_mask.to(dtype=torch.bool).unsqueeze(-1).unsqueeze(-1)
+            scalar_valid_mask = attention_mask.to(dtype=torch.bool).unsqueeze(-1)
+            query = torch.where(valid_token_mask, query, torch.zeros_like(query))
+            key = torch.where(valid_token_mask, key, torch.zeros_like(key))
+            value = torch.where(valid_token_mask, value, torch.zeros_like(value))
+            z = torch.where(valid_token_mask, z, torch.zeros_like(z))
+            beta = torch.where(scalar_valid_mask, beta, torch.zeros_like(beta))
+            g = torch.where(scalar_valid_mask, g, torch.zeros_like(g))
+
+        prefill_mode = getattr(self, "deltanet_prefill_mode", "recurrent")
+        if prefill_mode not in {"recurrent", "chunk"}:
+            raise ValueError(f"Unsupported DeltaNet prefill mode: {prefill_mode}")
+        use_recurrent_path = prefill_mode == "recurrent" or (cache_params is not None and seq_len == 1)
+
         if cache_params is not None:
-            # Decode branch — pure tensor ops, no loop, no padding
-            # Shape: (B, 1, H, d_v), (B, H, d_k, d_v)
-            recurrent_out, recurrent_S = self._recurrent_step_batched(query, key, value, g, beta, recurrent_state)
-
-            # Prefill branch — chunked parallel scan
-            # Shape: (B, T, H, d_v), (B, H, d_k, d_v)
-            chunk_out, chunk_S = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                mask_causal=self._mask_causal,
-                mask_strict=self._mask_strict,
-                ones_lower=self._ones_lower,
-                eye=self._eye,
-            )
-
-            # Select based on seq_len
-            # is_decode is SCALAR — torch.where broadcasts efficiently
-            # HW predicates entire branch at runtime
-            is_decode = hidden_states.shape[1] == torch.tensor(1)
-
-            core_attn_out = torch.where(is_decode, recurrent_out, chunk_out)
-            last_recurrent_state = torch.where(is_decode, recurrent_S, chunk_S)
-
+            if use_recurrent_path:
+                core_attn_out, last_recurrent_state = self._recurrent_scan_gated_delta_rule(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    token_mask=attention_mask,
+                )
+            else:
+                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                )
             cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
-
         else:
-            # No cache — prefill only, no state needed
-            core_attn_out, _ = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=True,
-                mask_causal=self._mask_causal,
-                mask_strict=self._mask_strict,
-                ones_lower=self._ones_lower,
-                eye=self._eye,
-            )
+            if use_recurrent_path:
+                core_attn_out, _ = self._recurrent_scan_gated_delta_rule(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=None,
+                    token_mask=attention_mask,
+                )
+            else:
+                core_attn_out, _ = self.chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g=g,
+                    beta=beta,
+                    initial_state=None,
+                    output_final_state=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
 
-        # ── Output ────────────────────────────────────────────
-        core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
-        return self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1))
-
-    @staticmethod
-    def apply_mask_to_padding_states(hidden_states, attention_mask):
-        if attention_mask is not None and attention_mask.shape[1] > 1:
-            dtype = hidden_states.dtype
-            hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
-        return hidden_states
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+        return self.out_proj(core_attn_out)
 
 
 class QEffQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
     def __qeff_init__(self):
         if self.layer_type == "linear_attention":
             self.linear_attn.__class__ = QEffQwen3_5GatedDeltaNet
-            self.linear_attn.__qeff_init__()
         elif self.layer_type == "full_attention":
             self.self_attn.__class__ = QEffQwen3_5Attention
 
@@ -745,6 +658,16 @@ class QEffQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
 class QEffQwen3_5TextModel(Qwen3_5TextModel):
     def __qeff_init__(self):
         self.rotary_emb = QEffQwen3_5TextRotaryEmbedding(config=self.config)
+        prefill_mode = getattr(self.config, "qeff_deltanet_prefill_mode", "recurrent")
+        for layer in self.layers:
+            if getattr(layer, "layer_type", None) == "linear_attention" and hasattr(layer, "linear_attn"):
+                layer.linear_attn.deltanet_prefill_mode = prefill_mode
+
+    def _update_linear_attn_mask(self, attention_mask, cache_position):
+        if torch.onnx.is_in_onnx_export():
+            del cache_position
+            return attention_mask
+        return super()._update_linear_attn_mask(attention_mask, cache_position)
 
     def forward(
         self,
@@ -778,20 +701,65 @@ class QEffQwen3_5TextModel(Qwen3_5TextModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
 
-        target_length = attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else past_seen_tokens
-        causal_mask = _create_causal_mask(position_ids=position_ids, target_length=target_length, sliding_window=None)
+        if position_ids is None:
+            position_ids = cache_position.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+        elif position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
+
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+            rotary_position_ids = position_ids[1:]
+        else:
+            text_position_ids = position_ids
+            rotary_position_ids = position_ids
+
+        if attention_mask is None and text_position_ids is not None:
+            attention_mask = (text_position_ids >= 0).to(dtype=inputs_embeds.dtype)
+
+        if text_position_ids is not None:
+            cache_position = torch.where(text_position_ids[0] >= 0, text_position_ids[0], 0)
+
+        if torch.onnx.is_in_onnx_export():
+            full_attention_layer = next(
+                (idx for idx, layer_type in enumerate(self.config.layer_types) if layer_type == "full_attention"),
+                None,
+            )
+            if full_attention_layer is not None and past_key_values is not None:
+                cache_layer = past_key_values.kv_layers[full_attention_layer]
+                target_length = (
+                    cache_layer.keys.shape[2]
+                    if cache_layer is not None and cache_layer.keys is not None
+                    else attention_mask.shape[-1]
+                )
+            else:
+                target_length = (
+                    attention_mask.shape[-1]
+                    if isinstance(attention_mask, torch.Tensor)
+                    else past_seen_tokens + inputs_embeds.shape[1]
+                )
+        else:
+            target_length = (
+                int(text_position_ids.max().item()) + 1
+                if text_position_ids is not None
+                else (
+                    attention_mask.shape[-1]
+                    if isinstance(attention_mask, torch.Tensor)
+                    else past_seen_tokens + inputs_embeds.shape[1]
+                )
+            )
+        causal_mask = _create_causal_mask(
+            position_ids=text_position_ids, target_length=target_length, sliding_window=None
+        )
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, past_seen_tokens)
+        position_embeddings = self.rotary_emb(hidden_states, rotary_position_ids)
 
         all_hidden_states = () if output_hidden_states else None
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
@@ -803,7 +771,7 @@ class QEffQwen3_5TextModel(Qwen3_5TextModel):
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=layer_mask,
-                position_ids=position_ids,
+                position_ids=text_position_ids,
                 past_key_values=past_key_values,
                 comp_ctx_lengths=comp_ctx_lengths,
                 batch_index=batch_index,

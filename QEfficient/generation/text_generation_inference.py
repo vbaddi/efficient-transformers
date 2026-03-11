@@ -499,6 +499,11 @@ class QEffTextGenerationBase:
         retained_state_inputs = {
             name[: -len("_RetainedState")] for name in self._session.output_names if name.endswith("_RetainedState")
         }
+        self._retained_state_input_names = [
+            x for x in self._session.input_names if x.startswith("past_") or x in retained_state_inputs
+        ]
+        self._retained_state_init_buffers = self._build_retained_state_init_buffers()
+        self._needs_retained_state_init = True
         self._session.skip_buffers(
             [
                 x
@@ -506,6 +511,28 @@ class QEffTextGenerationBase:
                 if x.startswith("past_") or x.endswith("_RetainedState") or x in retained_state_inputs
             ]
         )
+
+    def _build_retained_state_init_buffers(self) -> Dict[str, np.ndarray]:
+        """
+        Build zero tensors for retained-state input buffers so request-level
+        initialization can match the ORT path that feeds explicit zero states.
+        """
+        buffers: Dict[str, np.ndarray] = {}
+        for name in self._retained_state_input_names:
+            idx = self._session.binding_index_map[name]
+            if self._session.allowed_shapes:
+                shape = tuple(self._session.allowed_shapes[0][idx][1])
+            else:
+                shape = tuple(self._session.bindings[idx].dims)
+            dtype = self._session.aic_to_np_dtype_mapping[self._session.bindings[idx].type]
+            buffers[name] = np.zeros(shape, dtype=dtype)
+        return buffers
+
+    def mark_retained_state_for_reset(self):
+        """
+        Mark that retained states must be re-initialized for the next request.
+        """
+        self._needs_retained_state_init = True
 
     def _set_tokenizer_params(self):
         """
@@ -845,6 +872,9 @@ class QEffTextGenerationBase:
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
             ]
+            if self._needs_retained_state_init and i == 0:
+                chunk_inputs.update(self._retained_state_init_buffers)
+                self._needs_retained_state_init = False
             if self.include_sampler:
                 chunk_inputs["last_accepted_output_tokens"] = chunk_inputs["input_ids"]
             outputs = self._session.run(chunk_inputs)
@@ -1144,6 +1174,8 @@ class TextGeneration:
         if prompt_to_lora_id_mapping:
             self._qaic_model.initialize_lora_id_mapping(prompt_to_lora_id_mapping)
 
+        # Reset retained buffers at request start so prefill runs from clean state.
+        self._qaic_model.mark_retained_state_for_reset()
         self._qaic_model.initialize_decode_inputs(num_prompts, execution_batch_size, max_gen_length)
 
     def _regular_model_execution(
