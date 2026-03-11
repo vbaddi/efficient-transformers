@@ -55,6 +55,14 @@ class InvalidIndexProvider:
             return 0
 
 
+def _remainder_with_symbolic_divisor(value: torch.Tensor, divisor) -> torch.Tensor:
+    if torch.is_tensor(divisor):
+        divisor_tensor = divisor.to(device=value.device, dtype=value.dtype)
+    else:
+        divisor_tensor = torch.scalar_tensor(divisor, dtype=value.dtype, device=value.device)
+    return torch.remainder(value, divisor_tensor)
+
+
 class QEffDynamicLayer(DynamicLayer):
     def read_only(self, cache_kwargs):
         """
@@ -533,12 +541,14 @@ class QEffHybridCache(HybridCache):
             is_sliding_layer = torch.tensor(bool((layer_idx + 1) % sliding_window_pattern))
             layer_ctx_len = self.key_cache[layer_idx].shape[2]
             kv_position_ids = torch.where(
-                (~is_sliding_layer | (position_ids == -1)), position_ids, position_ids % (layer_ctx_len - 1)
+                (~is_sliding_layer | (position_ids == -1)),
+                position_ids,
+                _remainder_with_symbolic_divisor(position_ids, layer_ctx_len - 1),
             )
 
             kv_position_ids = torch.where(
                 is_sliding_layer & (position_ids.max() >= (layer_ctx_len - 1) * 2),
-                (position_ids + 1) % layer_ctx_len,
+                _remainder_with_symbolic_divisor(position_ids + 1, layer_ctx_len),
                 kv_position_ids,
             )
 
@@ -565,7 +575,11 @@ class QEffHybridCache(HybridCache):
             ctx_indices = torch.where(invalid_mask, invalid_idx_value, ctx_indices)
 
             all_indices = torch.arange(layer_ctx_len) + kv_position_ids.max() + 1
-            rolling_indices = torch.where(all_indices > layer_ctx_len - 1, all_indices % layer_ctx_len, all_indices)
+            rolling_indices = torch.where(
+                all_indices > layer_ctx_len - 1,
+                _remainder_with_symbolic_divisor(all_indices, layer_ctx_len),
+                all_indices,
+            )
             rolling_indices = rolling_indices[:ctx_len]
             final_indices = torch.where(
                 (is_sliding_layer & (position_ids.max() >= (layer_ctx_len - 1))), rolling_indices, ctx_indices
@@ -643,12 +657,14 @@ class QEffHybridChunkedCache(HybridChunkedCache):
             # Update the position_ids to handle the sliding window
             layer_ctx_len = self.key_cache[layer_idx].shape[2]
             kv_position_ids = torch.where(
-                (~is_sliding_layer | (position_ids == -1)), position_ids, position_ids % (layer_ctx_len - 1)
+                (~is_sliding_layer | (position_ids == -1)),
+                position_ids,
+                _remainder_with_symbolic_divisor(position_ids, layer_ctx_len - 1),
             )
 
             kv_position_ids = torch.where(
                 is_sliding_layer & (position_ids.max() >= (layer_ctx_len - 1) * 2),
-                (position_ids + 1) % layer_ctx_len,
+                _remainder_with_symbolic_divisor(position_ids + 1, layer_ctx_len),
                 kv_position_ids,
             )
 
@@ -680,7 +696,11 @@ class QEffHybridChunkedCache(HybridChunkedCache):
 
             # Rolling indices for sliding window
             all_indices = torch.arange(layer_ctx_len) + kv_position_ids.max() + 1
-            rolling_indices = torch.where(all_indices > layer_ctx_len - 1, all_indices % layer_ctx_len, all_indices)
+            rolling_indices = torch.where(
+                all_indices > layer_ctx_len - 1,
+                _remainder_with_symbolic_divisor(all_indices, layer_ctx_len),
+                all_indices,
+            )
             rolling_indices = rolling_indices[:ctx_len]
             final_indices = torch.where(
                 (is_sliding_layer & (position_ids.max() >= (layer_ctx_len - 1))), rolling_indices, ctx_indices
@@ -801,7 +821,11 @@ class QEffHybridCacheForGPTOSS:
             batch_index = cache_kwargs.get("batch_index", None)  # Check and fetch batch index value from the kwargs
 
             if is_sliding_layer:
-                kv_position_ids = torch.where(position_ids == -1, position_ids, position_ids % sliding_window)
+                kv_position_ids = torch.where(
+                    position_ids == -1,
+                    position_ids,
+                    _remainder_with_symbolic_divisor(position_ids, sliding_window),
+                )
             else:
                 kv_position_ids = position_ids
 
