@@ -17,8 +17,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5ForCausalLM,
     Qwen3_5GatedDeltaNet,
-    Qwen3_5TextModel,
     Qwen3_5TextRotaryEmbedding,
+    Qwen3_5TextModel,
     apply_rotary_pos_emb,
     l2norm,
     repeat_kv,
@@ -47,9 +47,7 @@ class QEffQwen3_5DynamicCache(Cache):
             (i for i in range(len(self.layer_types) - 1, -1, -1) if self.layer_types[i] == "linear_attention"),
             None,
         )
-        self.kv_layers = [
-            QEffDynamicLayer() if layer_type == "full_attention" else None for layer_type in self.layer_types
-        ]
+        self.kv_layers = [QEffDynamicLayer() if layer_type == "full_attention" else None for layer_type in self.layer_types]
         self.conv_states = [None for _ in self.layer_types]
         self.recurrent_states = [None for _ in self.layer_types]
 
@@ -194,10 +192,8 @@ class QEffQwen3_5TextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
 
     def _apply_interleaved_mrope_cache(self, gathered_cache: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         safe_position_ids = torch.where(position_ids < 0, torch.zeros_like(position_ids), position_ids)
-        cache = (
-            gathered_cache.unsqueeze(0)
-            .unsqueeze(1)
-            .expand(position_ids.shape[0], position_ids.shape[1], -1, gathered_cache.shape[-1])
+        cache = gathered_cache.unsqueeze(0).unsqueeze(1).expand(
+            position_ids.shape[0], position_ids.shape[1], -1, gathered_cache.shape[-1]
         )
         gather_index = safe_position_ids.unsqueeze(-1).expand(-1, -1, -1, gathered_cache.shape[-1])
         stacked_cache = torch.gather(cache, 2, gather_index).permute(1, 2, 3, 0)
@@ -275,6 +271,8 @@ class QEffQwen3_5Attention(Qwen3_5Attention):
     Full-attention path with QEff cache updates for retained-state export.
     """
 
+    qeff_export_mode = "unified"
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -305,7 +303,7 @@ class QEffQwen3_5Attention(Qwen3_5Attention):
         if past_key_values is not None:
             cache_kwargs = {"batch_index": batch_index}
             if position_ids is not None:
-                if torch.onnx.is_in_onnx_export():
+                if torch.onnx.is_in_onnx_export() and self.qeff_export_mode != "decode":
                     cache_layer = past_key_values.kv_layers[self.layer_idx]
                     fallback_position = (
                         cache_layer.keys.shape[2] - 1
@@ -320,6 +318,8 @@ class QEffQwen3_5Attention(Qwen3_5Attention):
                         torch.tensor(fallback_position, dtype=position_ids.dtype, device=position_ids.device),
                         position_ids,
                     )
+                elif torch.onnx.is_in_onnx_export():
+                    cache_kwargs["position_ids"] = position_ids
                 else:
                     scatter_position_ids = position_ids
                     if torch.any(position_ids < 0):
@@ -390,8 +390,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
     """
     Linear-attention path with explicit conv/recurrent retained-state updates.
     """
-
-    deltanet_prefill_mode = "recurrent"
+    qeff_export_mode = "unified"
 
     def _build_prefill_conv_state(
         self,
@@ -437,9 +436,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         seq_len_tensor = torch._shape_as_tensor(key)[2]
 
         if initial_state is None:
-            recurrent_state = torch.zeros(
-                batch_size, num_heads, k_head_dim, v_head_dim, device=key.device, dtype=torch.float32
-            )
+            recurrent_state = torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=key.device, dtype=torch.float32)
         else:
             recurrent_state = initial_state.to(torch.float32)
 
@@ -470,16 +467,42 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             candidate_state = decayed_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
             candidate_out = (candidate_state * q_t.unsqueeze(-1)).sum(dim=-2)
 
-            state_valid = valid.view(batch_size, 1, 1, 1)
-            out_valid = valid.view(batch_size, 1, 1)
-            recurrent_state = torch.where(state_valid, candidate_state, recurrent_state)
-            out_t = torch.where(out_valid, candidate_out, torch.zeros_like(candidate_out))
+            state_valid = valid.view(batch_size, 1, 1, 1).to(candidate_state.dtype)
+            out_valid = valid.view(batch_size, 1, 1).to(candidate_out.dtype)
+            recurrent_state = recurrent_state + state_valid * (candidate_state - recurrent_state)
+            out_t = candidate_out * out_valid
             core_attn_steps.append(out_t.unsqueeze(2))
 
         core_attn_out = torch.cat(core_attn_steps, dim=2)
         core_attn_out = core_attn_out[:, :, : key.shape[2]]
         core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
         return core_attn_out, recurrent_state
+
+    def _run_causal_conv_with_state(
+        self,
+        mixed_qkv: torch.Tensor,
+        pre_conv_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        seq_len: int,
+        is_decode: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Use the same conv flow for prefill and decode, only switching on runtime seq_len.
+        Prefill keeps HF-compatible retained conv state, while decode uses the retained sliding window update.
+        """
+        decode_mixed_qkv, decode_conv_state = qeff_torch_causal_conv1d_update(
+            mixed_qkv, conv_state, self.conv1d.weight.squeeze(1), self.conv1d.bias
+        )
+        prefill_mixed_qkv = F.silu(self.conv1d(pre_conv_qkv)[:, :, :seq_len])
+        if attention_mask is not None:
+            prefill_conv_state = self._build_prefill_conv_state(pre_conv_qkv, attention_mask)
+        else:
+            prefill_conv_state = pre_conv_qkv[:, :, -self.conv_kernel_size :]
+
+        mixed_qkv = torch.where(is_decode, decode_mixed_qkv, prefill_mixed_qkv)
+        new_conv_state = torch.where(is_decode, decode_conv_state, prefill_conv_state)
+        return mixed_qkv, new_conv_state
 
     def forward(
         self,
@@ -509,16 +532,14 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                     (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim)
                 )
 
-            decode_mixed_qkv, decode_conv_state = qeff_torch_causal_conv1d_update(
-                mixed_qkv, conv_state, self.conv1d.weight.squeeze(1), self.conv1d.bias
+            mixed_qkv, new_conv_state = self._run_causal_conv_with_state(
+                mixed_qkv=mixed_qkv,
+                pre_conv_qkv=pre_conv_qkv,
+                conv_state=conv_state,
+                attention_mask=attention_mask,
+                seq_len=seq_len,
+                is_decode=is_decode,
             )
-            prefill_mixed_qkv = F.silu(self.conv1d(pre_conv_qkv)[:, :, :seq_len])
-            if attention_mask is not None:
-                prefill_conv_state = self._build_prefill_conv_state(pre_conv_qkv, attention_mask)
-            else:
-                prefill_conv_state = decode_conv_state
-            mixed_qkv = torch.where(is_decode, decode_mixed_qkv, prefill_mixed_qkv)
-            new_conv_state = torch.where(is_decode, decode_conv_state, prefill_conv_state)
             cache_params.conv_states[self.layer_idx] = new_conv_state
         else:
             recurrent_state = None
@@ -545,56 +566,27 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             beta = torch.where(scalar_valid_mask, beta, torch.zeros_like(beta))
             g = torch.where(scalar_valid_mask, g, torch.zeros_like(g))
 
-        prefill_mode = getattr(self, "deltanet_prefill_mode", "recurrent")
-        if prefill_mode not in {"recurrent", "chunk"}:
-            raise ValueError(f"Unsupported DeltaNet prefill mode: {prefill_mode}")
-        use_recurrent_path = prefill_mode == "recurrent" or (cache_params is not None and seq_len == 1)
-
         if cache_params is not None:
-            if use_recurrent_path:
-                core_attn_out, last_recurrent_state = self._recurrent_scan_gated_delta_rule(
-                    query=query,
-                    key=key,
-                    value=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=recurrent_state,
-                    token_mask=attention_mask,
-                )
-            else:
-                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                    query,
-                    key,
-                    value,
-                    g=g,
-                    beta=beta,
-                    initial_state=recurrent_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                )
+            core_attn_out, last_recurrent_state = self._recurrent_scan_gated_delta_rule(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                token_mask=attention_mask,
+            )
             cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
         else:
-            if use_recurrent_path:
-                core_attn_out, _ = self._recurrent_scan_gated_delta_rule(
-                    query=query,
-                    key=key,
-                    value=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=None,
-                    token_mask=attention_mask,
-                )
-            else:
-                core_attn_out, _ = self.chunk_gated_delta_rule(
-                    query,
-                    key,
-                    value,
-                    g=g,
-                    beta=beta,
-                    initial_state=None,
-                    output_final_state=False,
-                    use_qk_l2norm_in_kernel=True,
-                )
+            core_attn_out, _ = self._recurrent_scan_gated_delta_rule(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                token_mask=attention_mask,
+            )
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -658,10 +650,12 @@ class QEffQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
 class QEffQwen3_5TextModel(Qwen3_5TextModel):
     def __qeff_init__(self):
         self.rotary_emb = QEffQwen3_5TextRotaryEmbedding(config=self.config)
-        prefill_mode = getattr(self.config, "qeff_deltanet_prefill_mode", "recurrent")
+        export_mode = getattr(self.config, "qeff_export_mode", "unified")
         for layer in self.layers:
             if getattr(layer, "layer_type", None) == "linear_attention" and hasattr(layer, "linear_attn"):
-                layer.linear_attn.deltanet_prefill_mode = prefill_mode
+                layer.linear_attn.qeff_export_mode = export_mode
+            elif getattr(layer, "layer_type", None) == "full_attention" and hasattr(layer, "self_attn"):
+                layer.self_attn.qeff_export_mode = export_mode
 
     def _update_linear_attn_mask(self, attention_mask, cache_position):
         if torch.onnx.is_in_onnx_export():
@@ -732,11 +726,7 @@ class QEffQwen3_5TextModel(Qwen3_5TextModel):
             )
             if full_attention_layer is not None and past_key_values is not None:
                 cache_layer = past_key_values.kv_layers[full_attention_layer]
-                target_length = (
-                    cache_layer.keys.shape[2]
-                    if cache_layer is not None and cache_layer.keys is not None
-                    else attention_mask.shape[-1]
-                )
+                target_length = cache_layer.keys.shape[2] if cache_layer is not None and cache_layer.keys is not None else attention_mask.shape[-1]
             else:
                 target_length = (
                     attention_mask.shape[-1]
@@ -753,9 +743,7 @@ class QEffQwen3_5TextModel(Qwen3_5TextModel):
                     else past_seen_tokens + inputs_embeds.shape[1]
                 )
             )
-        causal_mask = _create_causal_mask(
-            position_ids=text_position_ids, target_length=target_length, sliding_window=None
-        )
+        causal_mask = _create_causal_mask(position_ids=text_position_ids, target_length=target_length, sliding_window=None)
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
 
         hidden_states = inputs_embeds
