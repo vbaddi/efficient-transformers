@@ -394,13 +394,14 @@ class QEFFAutoModel(QEFFTransformersBase):
         dynamic_shapes = None
         if use_dynamo:
             dynamic_shapes = self.convert_dynamic_axes_to_dynamic_shapes(dynamic_axes)
+        use_onnx_subfunctions = kwargs.pop("use_onnx_subfunctions", False)
 
         return self._export(
             example_inputs,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
             export_dir=export_dir,
-            use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
+            use_onnx_subfunctions=use_onnx_subfunctions,
             use_dynamo=use_dynamo,
             dynamic_shapes=dynamic_shapes,
             **kwargs,
@@ -953,6 +954,7 @@ class QEffVisionEncoderForTextImageToTextModel(QEFFBaseModel):
         str
             Path to the generated ONNX graph file for the vision encoder.
         """
+        use_onnx_subfunctions = kwargs.pop("use_onnx_subfunctions", False)
         return self._export(
             inputs,
             output_names=output_names,
@@ -960,7 +962,7 @@ class QEffVisionEncoderForTextImageToTextModel(QEFFBaseModel):
             dynamic_shapes=dynamic_shapes,
             export_dir=export_dir,
             offload_pt_weights=offload_pt_weights,
-            use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
+            use_onnx_subfunctions=use_onnx_subfunctions,
             use_dynamo=use_dynamo,
             **kwargs,
         )
@@ -1117,6 +1119,7 @@ class QEffCausalLMForTextImageToTextModel(QEFFBaseModel):
         str
             Path to the generated ONNX graph file for the language decoder.
         """
+        use_onnx_subfunctions = kwargs.pop("use_onnx_subfunctions", False)
         return self._export(
             inputs,
             output_names=output_names,
@@ -1124,7 +1127,7 @@ class QEffCausalLMForTextImageToTextModel(QEFFBaseModel):
             dynamic_shapes=dynamic_shapes,
             export_dir=export_dir,
             offload_pt_weights=offload_pt_weights,
-            use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
+            use_onnx_subfunctions=use_onnx_subfunctions,
             use_dynamo=use_dynamo,
             **kwargs,
         )

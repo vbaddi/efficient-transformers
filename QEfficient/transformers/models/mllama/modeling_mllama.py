@@ -313,6 +313,7 @@ class QEffMllamaSelfAttentionDecoderLayer(MllamaSelfAttentionDecoderLayer):
         - add new args cache idx for the kv retention
     """
 
+    @torch.compiler.nested_compile_region
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -452,6 +453,7 @@ class QEffMllamaCrossAttentionDecoderLayer(MllamaCrossAttentionDecoderLayer):
         - add new args cache idx for the kv retention
     """
 
+    @torch.compiler.nested_compile_region
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -758,7 +760,6 @@ class QEffMllamaVisionEncoder(nn.Module):
             Downstream code can use this to find/build subfunctions for repeated blocks.
         """
         return {self.model.vision_model.transformer.layers[0].__class__}
-
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
