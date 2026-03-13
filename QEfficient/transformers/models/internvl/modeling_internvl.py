@@ -21,6 +21,7 @@ class QEffInternEncoderWrapper(nn.Module):
         super().__init__()
         self.model = model
 
+    # TODO (vbaddi): Add nested compiler region from vision forward
     def forward(self, pixel_values):
         vision_embeds = self.model.extract_feature(pixel_values)
         # Reshape from [num_patches, 256, hidden_dim] -> [1, num_patches*256, head_dim]

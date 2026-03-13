@@ -313,6 +313,7 @@ class QEffMllamaSelfAttentionDecoderLayer(MllamaSelfAttentionDecoderLayer):
         - add new args cache idx for the kv retention
     """
 
+    @torch.compiler.nested_compile_region
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -452,6 +453,7 @@ class QEffMllamaCrossAttentionDecoderLayer(MllamaCrossAttentionDecoderLayer):
         - add new args cache idx for the kv retention
     """
 
+    @torch.compiler.nested_compile_region
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -750,6 +752,7 @@ class QEffMllamaVisionEncoder(nn.Module):
         self.model = model
         self.cross_attention_layers = self.model.config.get_text_config().cross_attention_layers
 
+    # TODO (vbaddi): Add nested compiler region from vision forward
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
