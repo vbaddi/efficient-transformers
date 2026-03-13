@@ -17,6 +17,7 @@ from QEfficient.base.onnx_transforms import (
     CustomOpTransform,
     PreserveNestedCacheRetainedStateTransform,
     RenameFunctionOutputsTransform,
+    RenameRepeatedSubgraphTransform,
 )
 from QEfficient.transformers.cache_utils import InvalidIndexProvider
 from QEfficient.transformers.models.pytorch_transforms import get_decoder_layer_classes_for_export
@@ -206,6 +207,7 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
     # Add subfunction-specific ONNX transforms
     if use_dynamo:
         qeff_model._onnx_transforms.append(PreserveNestedCacheRetainedStateTransform)
+        qeff_model._onnx_transforms.append(RenameRepeatedSubgraphTransform)
     else:
         qeff_model._onnx_transforms.append(RenameFunctionOutputsTransform)
         qeff_model._onnx_transforms.append(CustomOpTransform)
@@ -214,7 +216,11 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs):
     decoder_layer_classes = get_decoder_layer_classes_for_export(qeff_model.model)
     if decoder_layer_classes:
         if use_dynamo:
-            qeff_model._subfunction_target_classnames = [cls.__name__ for cls in decoder_layer_classes]
+            target_classnames = sorted(cls.__name__ for cls in decoder_layer_classes)
+            qeff_model._subfunction_target_classnames = target_classnames
+            onnx_transform_kwargs = dict(kwargs.get("onnx_transform_kwargs") or {})
+            onnx_transform_kwargs["target_classnames"] = target_classnames
+            kwargs["onnx_transform_kwargs"] = onnx_transform_kwargs
         else:
             kwargs["export_modules_as_functions"] = decoder_layer_classes
     return args, kwargs
@@ -242,6 +248,8 @@ def _cleanup_onnx_subfunctions(qeff_model):
     InvalidIndexProvider.SUBFUNC_ENABLED = False
     if PreserveNestedCacheRetainedStateTransform in qeff_model._onnx_transforms:
         qeff_model._onnx_transforms.remove(PreserveNestedCacheRetainedStateTransform)
+    if RenameRepeatedSubgraphTransform in qeff_model._onnx_transforms:
+        qeff_model._onnx_transforms.remove(RenameRepeatedSubgraphTransform)
     if RenameFunctionOutputsTransform in qeff_model._onnx_transforms:
         qeff_model._onnx_transforms.remove(RenameFunctionOutputsTransform)
     if CustomOpTransform in qeff_model._onnx_transforms:

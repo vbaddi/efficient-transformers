@@ -277,6 +277,60 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
         return changed
 
 
+class RenameRepeatedSubgraphTransform(BaseOnnxTransform):
+    """Rename dynamo repeated_subgraph function names to model-specific layer class names."""
+
+    _REPEATED_SUBGRAPH_RE = re.compile(r"^repeated_subgraph(\d+)$")
+
+    @classmethod
+    def apply(cls, model: ModelProto, target_classnames: Optional[List[str]] = None, **kwargs) -> bool:
+        target_classnames = [name for name in (target_classnames or []) if name]
+        if not target_classnames:
+            return False
+
+        repeated_functions = []
+        for fn in model.functions:
+            match = cls._REPEATED_SUBGRAPH_RE.match(fn.name)
+            if match:
+                repeated_functions.append((int(match.group(1)), fn))
+
+        if not repeated_functions:
+            return False
+
+        repeated_functions.sort(key=lambda item: item[0])
+        old_to_new = {}
+        used_names = {fn.name for fn in model.functions}
+
+        for idx, (_, fn) in enumerate(repeated_functions):
+            base_name = target_classnames[min(idx, len(target_classnames) - 1)]
+            candidate = base_name
+            suffix = 1
+            while candidate in used_names and candidate != fn.name:
+                candidate = f"{base_name}_{suffix}"
+                suffix += 1
+            used_names.discard(fn.name)
+            used_names.add(candidate)
+            old_to_new[fn.name] = candidate
+
+        if not old_to_new:
+            return False
+
+        for fn in model.functions:
+            if fn.name in old_to_new:
+                fn.name = old_to_new[fn.name]
+
+        def _rename_op_types(nodes: List[onnx.NodeProto]):
+            for node in nodes:
+                if node.op_type in old_to_new:
+                    node.op_type = old_to_new[node.op_type]
+
+        _rename_op_types(model.graph.node)
+        for fn in model.functions:
+            _rename_op_types(fn.node)
+
+        return True
+
+
 class AdapterWeightsToInputsTransform(BaseOnnxTransform):
     @classmethod
     def apply(cls, model: onnx.ModelProto, *, adapter_name: str, **kwargs) -> Tuple[onnx.ModelProto, bool]:
@@ -716,6 +770,9 @@ class OnnxTransformPipeline(BaseOnnxTransform):
 
         if PreserveNestedCacheRetainedStateTransform in requested:
             applied[PreserveNestedCacheRetainedStateTransform] = PreserveNestedCacheRetainedStateTransform.apply(model)
+
+        if RenameRepeatedSubgraphTransform in requested:
+            applied[RenameRepeatedSubgraphTransform] = RenameRepeatedSubgraphTransform.apply(model, **kwargs)
 
         if AdapterWeightsToInputsTransform in requested:
             applied[AdapterWeightsToInputsTransform] = AdapterWeightsToInputsTransform.apply(model, **kwargs)
