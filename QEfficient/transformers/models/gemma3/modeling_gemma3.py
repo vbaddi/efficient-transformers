@@ -299,6 +299,7 @@ class QEffGemma3Attention(Gemma3Attention):
 
 
 class QEffGemma3DecoderLayer(Gemma3DecoderLayer):
+    @torch.compiler.nested_compile_region
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -612,7 +613,6 @@ class QEffGemma3EncoderWrapper(nn.Module):
             Downstream code can use this to find/build subfunctions for repeated blocks.
         """
         return {self.model.vision_tower.vision_model.encoder.layers[0].__class__}
-
     def forward(self, pixel_values):
         image_features = self.model.get_image_features(pixel_values=pixel_values)
         return image_features
