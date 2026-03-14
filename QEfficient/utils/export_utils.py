@@ -20,7 +20,6 @@ from QEfficient.base.onnx_transforms import (
     RenameRepeatedSubgraphTransform,
 )
 from QEfficient.transformers.cache_utils import InvalidIndexProvider
-from QEfficient.transformers.models.pytorch_transforms import get_decoder_layer_classes_for_export
 from QEfficient.utils.cache import QEFF_HOME
 from QEfficient.utils.hash_utils import create_export_hash
 from QEfficient.utils.logging_utils import logger
@@ -29,6 +28,16 @@ from QEfficient.utils.torch_patches import (
     temporarily_disable_nested_compile_regions,
     undo_torch_patches,
 )
+
+
+def get_decoder_layer_classes_for_export(model):
+    get_submodules_for_export = getattr(model, "get_submodules_for_export", None)
+    if get_submodules_for_export is None:
+        return []
+    submodule_classes = get_submodules_for_export()
+    if not submodule_classes:
+        return []
+    return set(submodule_classes)
 
 
 def export_wrapper(func):
@@ -57,13 +66,13 @@ def export_wrapper(func):
 
         export_context = nullcontext()
         subfunction_setup_done = False
+        decoder_layer_classes = get_decoder_layer_classes_for_export(self.model)
         try:
             # 1. Setup the requested export mode
             if use_onnx_subfunctions:
                 args, kwargs = _setup_onnx_subfunctions(self, args, kwargs)
                 subfunction_setup_done = True
             elif use_dynamo:
-                decoder_layer_classes = get_decoder_layer_classes_for_export(self.model)
                 export_context = temporarily_disable_nested_compile_regions(self.model, decoder_layer_classes)
 
             # 2. Prepare export directory
@@ -76,8 +85,19 @@ def export_wrapper(func):
             self.export_hash = export_hash
 
             # 4. Execute the actual export
-            with export_context:
-                onnx_path = func(self, *args, **kwargs)
+            try:
+                with export_context:
+                    onnx_path = func(self, *args, **kwargs)
+            except Exception as export_exc:
+                if use_onnx_subfunctions and use_dynamo and decoder_layer_classes:
+                    logger.warning(
+                        "Retrying dynamo+subfunction export with nested compile regions disabled due to export "
+                        f"failure: {type(export_exc).__name__}: {export_exc}"
+                    )
+                    with temporarily_disable_nested_compile_regions(self.model, decoder_layer_classes):
+                        onnx_path = func(self, *args, **kwargs)
+                else:
+                    raise
 
             # 5. Save export metadata
             _save_export_metadata(export_dir, filtered_hash_params)
