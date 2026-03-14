@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from transformers.cache_utils import DynamicCache, DynamicLayer, EncoderDecoderCache
+from transformers.cache_utils import Cache, EncoderDecoderCache
 
 try:
     # transformers<5.3 had these hybrid cache classes
@@ -73,13 +73,90 @@ def _match_invalid_mask(invalid_mask: torch.Tensor, target_len: int) -> torch.Te
     return invalid_mask[..., :target_len]
 
 
-class QEffDynamicLayer(DynamicLayer):
+class QEffDynamicLayer:
+    is_compileable = False
+
+    def __init__(self):
+        self.keys: Optional[torch.Tensor] = None
+        self.values: Optional[torch.Tensor] = None
+        self.is_initialized = False
+        self.device = None
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.keys = key_states
+        self.values = value_states
+        self.is_initialized = True
+        self.device = key_states.device
+
     @classmethod
     def from_tensors(cls, key_states: torch.Tensor, value_states: torch.Tensor) -> "QEffDynamicLayer":
         layer = cls()
         layer.keys = key_states
         layer.values = value_states
+        layer.is_initialized = True
+        layer.device = key_states.device
         return layer
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        return self.get_seq_length() + cache_position.shape[0], 0
+
+    def get_seq_length(self) -> int:
+        return self.keys.shape[-2] if self.keys is not None else 0
+
+    def get_max_cache_shape(self) -> int:
+        return -1
+
+    @property
+    def max_batch_size(self) -> int:
+        return self.keys.shape[0] if self.keys is not None else 0
+
+    @property
+    def max_cache_len(self) -> int:
+        return self.keys.shape[-2] if self.keys is not None else 0
+
+    def reset(self) -> None:
+        if self.keys is not None:
+            self.keys.zero_()
+        if self.values is not None:
+            self.values.zero_()
+
+    def offload(self) -> None:
+        if self.keys is not None and self.values is not None:
+            self.keys = self.keys.to("cpu", non_blocking=True)
+            self.values = self.values.to("cpu", non_blocking=True)
+
+    def prefetch(self) -> None:
+        if (
+            self.keys is not None
+            and self.values is not None
+            and self.device is not None
+            and self.keys.device != self.device
+        ):
+            self.keys = self.keys.to(self.device, non_blocking=True)
+            self.values = self.values.to(self.device, non_blocking=True)
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        if self.keys is not None and self.values is not None and self.get_seq_length() > 0:
+            self.keys = self.keys.index_select(0, beam_idx.to(self.keys.device))
+            self.values = self.values.index_select(0, beam_idx.to(self.values.device))
+
+    def crop(self, max_length: int) -> None:
+        if self.keys is not None:
+            self.keys = self.keys[:, :, :max_length, :]
+        if self.values is not None:
+            self.values = self.values[:, :, :max_length, :]
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        if self.keys is not None:
+            self.keys = self.keys.repeat_interleave(repeats, dim=0)
+        if self.values is not None:
+            self.values = self.values.repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        if self.keys is not None:
+            self.keys = self.keys[indices, ...]
+        if self.values is not None:
+            self.values = self.values[indices, ...]
 
     def read_only(self, cache_kwargs):
         """
@@ -178,6 +255,8 @@ class QEffDynamicLayer(DynamicLayer):
         if self.keys is None:
             self.keys = key_states
             self.values = value_states
+            self.is_initialized = True
+            self.device = key_states.device
         else:
             position_ids = cache_kwargs.get("position_ids")
             batch_index = cache_kwargs.get("batch_index", None)  # Check and fetch batch index value form the kwargs
@@ -217,6 +296,8 @@ class QEffDynamicLayer(DynamicLayer):
         if self.keys is None:
             self.keys = key_states
             self.values = value_states
+            self.is_initialized = True
+            self.device = key_states.device
             k_out, v_out = self.keys, self.values
         else:
             position_ids = cache_kwargs.get("position_ids")
@@ -281,6 +362,8 @@ class QEffDynamicLayer(DynamicLayer):
         if self.keys is None:
             self.keys = key_states
             self.values = value_states
+            self.is_initialized = True
+            self.device = key_states.device
             k_out, v_out = self.keys, self.values
         else:
             position_ids = cache_kwargs.get("position_ids")
@@ -323,7 +406,7 @@ class QEffDynamicLayer(DynamicLayer):
         return k_out, v_out
 
 
-class QEffDynamicCache(DynamicCache):
+class QEffDynamicCache(Cache):
     """
     A cache that grows dynamically as more tokens are generated. This is the default for generative models.
 
@@ -337,14 +420,16 @@ class QEffDynamicCache(DynamicCache):
     """
 
     def __init__(self, ddp_cache_data: Optional[Iterable[tuple[torch.Tensor, torch.Tensor]]] = None, *args, **kwargs):
-        from transformers.cache_utils import Cache  # Import here to avoid circular import
-
         kwargs.pop("layers", None)
         kwargs.pop("layer_class_to_replicate", None)
-        Cache.__init__(self, layer_class_to_replicate=QEffDynamicLayer, *args, **kwargs)
+        super().__init__(layer_class_to_replicate=QEffDynamicLayer, *args, **kwargs)
         if ddp_cache_data is not None:
             for key_states, value_states in ddp_cache_data:
                 self.layers.append(QEffDynamicLayer.from_tensors(key_states, value_states))
+
+    def append_new_layers(self, layer_idx: int) -> None:
+        while len(self.layers) <= layer_idx:
+            self.layers.append(QEffDynamicLayer())
 
     def read_only(self, layer_idx, cache_kwargs):
         """
@@ -486,6 +571,16 @@ class QEffEncoderDecoderCache(EncoderDecoderCache):
                     cache.cross_attention_cache.update(key_states, value_states, layer_idx)
                     cache.is_updated[layer_idx] = True
         return cache
+
+    def check_dynamic_cache(self, method: str):
+        if not (
+            isinstance(self.self_attention_cache, QEffDynamicCache)
+            and isinstance(self.cross_attention_cache, QEffDynamicCache)
+        ):
+            raise TypeError(
+                f"`{method}` requires QEffDynamicCache objects, got "
+                f"{self.self_attention_cache.__class__.__name__} and {self.cross_attention_cache.__class__.__name__}."
+            )
 
     def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor, ...], ...]:
         legacy_cache = ()
