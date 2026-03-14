@@ -289,33 +289,17 @@ class QEFFBaseModel(ABC):
                     input_names.append(param)
 
         try:
-            is_decoder_like = bool(
-                getattr(self.model.config, "is_decoder", False)
-                or getattr(self.model.config, "is_encoder_decoder", False)
+            torch.onnx.export(
+                self.model,
+                (),
+                str(tmp_onnx_path),
+                kwargs=example_inputs,
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes,
+                opset_version=constants.ONNX_EXPORT_OPSET,
+                **export_kwargs,
             )
-            if is_decoder_like:
-                torch.onnx.export(
-                    self.model,
-                    (example_inputs,),
-                    str(tmp_onnx_path),
-                    input_names=input_names,
-                    output_names=output_names,
-                    dynamic_axes=dynamic_axes,
-                    opset_version=constants.ONNX_EXPORT_OPSET,
-                    **export_kwargs,
-                )
-            else:
-                torch.onnx.export(
-                    self.model,
-                    (),
-                    str(tmp_onnx_path),
-                    kwargs=example_inputs,
-                    input_names=input_names,
-                    output_names=output_names,
-                    dynamic_axes=dynamic_axes,
-                    opset_version=constants.ONNX_EXPORT_OPSET,
-                    **export_kwargs,
-                )
             logger.info("PyTorch export successful")
             _ = self._offload_model_weights(offload_pt_weights)
             model = onnx.load(tmp_onnx_path, load_external_data=False)
