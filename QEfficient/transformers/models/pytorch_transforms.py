@@ -44,6 +44,14 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
     Gemma3RMSNorm,
 )
+from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
+    Glm4MoeLiteAttention,
+    Glm4MoeLiteDecoderLayer,
+    Glm4MoeLiteForCausalLM,
+    Glm4MoeLiteModel,
+    Glm4MoeLiteMoE,
+    Glm4MoeLiteRMSNorm,
+)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2Block, GPT2LMHeadModel, GPT2Model
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
     GPTBigCodeAttention,
@@ -246,6 +254,13 @@ from QEfficient.transformers.models.gemma3.modeling_gemma3 import (
     QEffGemma3CustomRMSNormAIC,
     QEffGemma3DecoderWrapper,
     QEffGemma3ForConditionalGeneration,
+)
+from QEfficient.transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
+    QEffGlm4MoeLiteAttention,
+    QEffGlm4MoeLiteDecoderLayer,
+    QEffGlm4MoeLiteForCausalLM,
+    QEffGlm4MoeLiteModel,
+    QEffGlm4MoeLiteMoE,
 )
 from QEfficient.transformers.models.gpt2.modeling_gpt2 import (
     QEffGPT2Attention,
@@ -472,6 +487,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         PixtralRMSNorm: CustomRMSNormAIC,
         GraniteMoeRMSNorm: CustomRMSNormAIC,
         Qwen3MoeRMSNorm: CustomRMSNormAIC,
+        Glm4MoeLiteRMSNorm: CustomRMSNormAIC,
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
         Olmo2RMSNorm: CustomRMSNormAIC,
     }
@@ -628,6 +644,12 @@ class KVCacheTransform(ModuleMappingTransform):
         GPTBigCodeBlock: QEffGPTBigCodeBlock,
         GPTBigCodeModel: QEffGPTBigCodeModel,
         GPTBigCodeForCausalLM: QEffGPTBigCodeForCausalLM,
+        # Glm4MoeLite
+        Glm4MoeLiteAttention: QEffGlm4MoeLiteAttention,
+        Glm4MoeLiteDecoderLayer: QEffGlm4MoeLiteDecoderLayer,
+        Glm4MoeLiteModel: QEffGlm4MoeLiteModel,
+        Glm4MoeLiteForCausalLM: QEffGlm4MoeLiteForCausalLM,
+        Glm4MoeLiteMoE: QEffGlm4MoeLiteMoE,
         # Olmo2
         Olmo2Attention: QEffOlmo2Attention,
         Olmo2DecoderLayer: QEffOlmo2DecoderLayer,

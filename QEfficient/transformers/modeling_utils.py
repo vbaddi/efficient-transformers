@@ -36,6 +36,14 @@ from transformers.models.gemma2.modeling_gemma2 import (
     Gemma2Model,
     Gemma2RMSNorm,
 )
+from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
+    Glm4MoeLiteAttention,
+    Glm4MoeLiteDecoderLayer,
+    Glm4MoeLiteForCausalLM,
+    Glm4MoeLiteModel,
+    Glm4MoeLiteMoE,
+    Glm4MoeLiteRMSNorm,
+)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2Block, GPT2LMHeadModel, GPT2Model
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
     GPTBigCodeAttention,
@@ -110,6 +118,13 @@ from .models.gemma2.modeling_gemma2 import (
     QEffGemma2ForCausalLM,
     QEffGemma2Model,
 )
+from .models.glm4_moe_lite.modeling_glm4_moe_lite import (
+    QEffGlm4MoeLiteAttention,
+    QEffGlm4MoeLiteDecoderLayer,
+    QEffGlm4MoeLiteForCausalLM,
+    QEffGlm4MoeLiteModel,
+    QEffGlm4MoeLiteMoE,
+)
 from .models.gpt2.modeling_gpt2 import QEffGPT2Attention, QEffGPT2Block, QEffGPT2LMHeadModel, QEffGPT2Model
 from .models.gpt_bigcode.modeling_gpt_bigcode import (
     QEffGPTBigCodeAttention,
@@ -180,6 +195,7 @@ qeff_supported_architectures = ModelArchitectures(
         Qwen2ForCausalLM.__name__,
         Starcoder2ForCausalLM.__name__,
         GPTBigCodeForCausalLM.__name__,
+        Glm4MoeLiteForCausalLM.__name__,
         MllamaForCausalLM.__name__,
         WhisperForConditionalGeneration.__name__,
     ]
@@ -273,6 +289,13 @@ TransformersToQEffModulesDict: Dict[Type[nn.Module], Type[nn.Module]] = {
     GPTBigCodeAttention: QEffGPTBigCodeAttention,
     GPTBigCodeBlock: QEffGPTBigCodeBlock,
     GPTBigCodeModel: QEffGPTBigCodeModel,
+    # Glm4MoeLite model layers
+    Glm4MoeLiteAttention: QEffGlm4MoeLiteAttention,
+    Glm4MoeLiteDecoderLayer: QEffGlm4MoeLiteDecoderLayer,
+    Glm4MoeLiteModel: QEffGlm4MoeLiteModel,
+    Glm4MoeLiteForCausalLM: QEffGlm4MoeLiteForCausalLM,
+    Glm4MoeLiteMoE: QEffGlm4MoeLiteMoE,
+    Glm4MoeLiteRMSNorm: CustomRMSNormAIC,
     # Whisper encoder and decoder layers
     WhisperAttention: QEffWhisperAttention,
     WhisperDecoderLayer: QEffWhisperDecoderLayer,

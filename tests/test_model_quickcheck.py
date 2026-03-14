@@ -13,6 +13,8 @@ This file intentionally uses two coverage tiers:
 
 import logging
 import os
+import shutil
+import tempfile
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -66,6 +68,7 @@ CAUSAL_RUNTIME_MODEL_IDS = {
     "granite": "hf-internal-testing/tiny-random-GraniteForCausalLM",
     "olmo2": "hf-internal-testing/tiny-random-Olmo2ForCausalLM",
     "gpt_oss": "tiny-random/gpt-oss-bf16",
+    "glm4_moe_lite": "tiny-random/glm-4.7-flash",
 }
 
 VLM_TEXT_RUNTIME_MODEL_ID = "tiny-random/gemma-3"
@@ -112,6 +115,29 @@ def _ort_session(onnx_path: Path) -> ort.InferenceSession:
 _configure_torch_threads()
 
 
+def _cleanup_stale_tmp_exports() -> None:
+    tmp_root = Path(tempfile.gettempdir())
+    for pattern in ("qeff_*", "*qeff*", "*onnx*", "*qnn*"):
+        for path in tmp_root.glob(pattern):
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                elif path.is_file():
+                    path.unlink(missing_ok=True)
+            except OSError:
+                # Best-effort cleanup only.
+                pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _clean_tmp_exports_before_quickcheck():
+    # Avoid concurrent cleanup from all xdist workers.
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker not in (None, "gw0"):
+        return
+    _cleanup_stale_tmp_exports()
+
+
 @contextmanager
 def _suppress_native_output():
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
@@ -151,8 +177,8 @@ def _run_embedding_ort(onnx_path: Path, inputs: Dict[str, torch.Tensor]) -> np.n
     return session.run(None, ort_inputs)[0]
 
 
-def _run_whisper_export_smoke(qeff_model: QEFFAutoModelForSpeechSeq2Seq) -> Path:
-    onnx_path = _exported_onnx_path(qeff_model.export())
+def _run_whisper_export_smoke(qeff_model: QEFFAutoModelForSpeechSeq2Seq, out_dir: Path) -> Path:
+    onnx_path = _exported_onnx_path(qeff_model.export(out_dir))
     _assert_has_retained_state_outputs(onnx_path)
     return onnx_path
 
@@ -376,7 +402,7 @@ def test_whisper_export_smoke(tmp_path):
     model_hf.eval()
 
     qeff_model = QEFFAutoModelForSpeechSeq2Seq(model_hf, pretrained_model_name_or_path=TINY_WHISPER_MODEL_ID)
-    onnx_path = _run_whisper_export_smoke(qeff_model)
+    onnx_path = _run_whisper_export_smoke(qeff_model, tmp_path / "whisper")
 
     assert onnx_path.name.endswith(".onnx")
 

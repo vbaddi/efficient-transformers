@@ -410,7 +410,12 @@ def get_padding_shape_from_config(config, batch_size, seq_len):
     ):  # Check for num_key_value_heads (Llama/Mistral)
         n_heads = config.num_key_value_heads
 
-        if hasattr(config, "head_dim") and config.head_dim is not None:
+        if getattr(config, "model_type", "") == "glm4_moe_lite" and hasattr(config, "qk_head_dim"):
+            # GLM4 MoE Lite stores attention keys at qk_head_dim while values are v_head_dim.
+            # QEff cache uses a single K/V head dim allocation, so use qk_head_dim and
+            # let attention path pad/slice value states accordingly.
+            d_head = config.qk_head_dim
+        elif hasattr(config, "head_dim") and config.head_dim is not None:
             d_head = config.head_dim
         else:
             d_head = config.hidden_size // config.num_attention_heads
