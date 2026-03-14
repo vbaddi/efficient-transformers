@@ -169,6 +169,15 @@ def _assert_has_retained_state_outputs(onnx_path: Path) -> None:
     assert retained_outputs
 
 
+def _assert_repeated_block_functions(onnx_path: Path, expected_classnames) -> None:
+    onnx_model = onnx.load(onnx_path, load_external_data=False)
+    function_names = [func.name for func in onnx_model.functions]
+    assert any(any(class_name in name for class_name in expected_classnames) for name in function_names), (
+        f"Expected repeated subfunction class names {expected_classnames} not found in exported ONNX functions: "
+        f"{function_names}"
+    )
+
+
 def _run_embedding_ort(onnx_path: Path, inputs: Dict[str, torch.Tensor]) -> np.ndarray:
     session = _ort_session(onnx_path)
     input_names = {item.name for item in session.get_inputs()}
@@ -234,6 +243,33 @@ def _export_vlm_with_text_fallback(model_id: str, out_dir: Path) -> Path:
             _skip_on_model_fetch_error(text_exc, model_id)
     except Exception as cfg_exc:
         _skip_on_model_fetch_error(cfg_exc, model_id)
+
+
+def _build_vlm_text_qeff_model(model_id: str):
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+
+    if getattr(config, "model_type", "") == "qwen2_5_vl" and getattr(config, "text_config", None) is not None:
+        qwen2_cfg_dict = config.text_config.to_dict()
+        qwen2_cfg_dict["model_type"] = "qwen2"
+        qwen2_allowed_keys = set(Qwen2Config().to_dict().keys())
+        qwen2_cfg = Qwen2Config(**{k: v for k, v in qwen2_cfg_dict.items() if k in qwen2_allowed_keys})
+        text_model = AutoModelForCausalLM.from_config(qwen2_cfg, trust_remote_code=True, **MODEL_KWARGS)
+        text_model = text_model.to(torch.float32)
+        text_model.eval()
+        return QEFFAutoModelForCausalLM(text_model)
+
+    for text_config in [getattr(config, "text_config", None), getattr(config, "llm_config", None)]:
+        if text_config is None:
+            continue
+        try:
+            text_model = AutoModelForCausalLM.from_config(text_config, trust_remote_code=True, **MODEL_KWARGS)
+            text_model = text_model.to(torch.float32)
+            text_model.eval()
+            return QEFFAutoModelForCausalLM(text_model)
+        except Exception:
+            continue
+
+    raise RuntimeError(f"No text-side causal LM config path available for {model_id}")
 
 
 @pytest.mark.llm_model
@@ -421,6 +457,41 @@ def test_whisper_export_smoke(tmp_path):
     onnx_path = _run_whisper_export_smoke(qeff_model, tmp_path / "whisper")
 
     assert onnx_path.name.endswith(".onnx")
+
+
+@pytest.mark.llm_model
+def test_whisper_repeated_subfunction_export_smoke(tmp_path):
+    model_hf = AutoModelForSpeechSeq2Seq.from_pretrained(
+        TINY_WHISPER_MODEL_ID,
+        **MODEL_KWARGS,
+        low_cpu_mem_usage=False,
+    )
+    model_hf.eval()
+    qeff_model = QEFFAutoModelForSpeechSeq2Seq(model_hf, pretrained_model_name_or_path=TINY_WHISPER_MODEL_ID)
+    expected = [cls.__name__ for cls in qeff_model.model.get_submodules_for_export()]
+    onnx_path = _exported_onnx_path(
+        qeff_model.export(tmp_path / "whisper-repeated", use_dynamo=True, use_onnx_subfunctions=True)
+    )
+    _assert_repeated_block_functions(onnx_path, expected)
+
+
+@pytest.mark.llm_model
+@pytest.mark.parametrize(
+    ("vlm_name", "model_id"),
+    [item for item in sorted(VLM_EXPORT_MODEL_IDS.items()) if item[0] in {"qwen2_5_vl", "internvl2"}],
+    ids=[item[0] for item in sorted(VLM_EXPORT_MODEL_IDS.items()) if item[0] in {"qwen2_5_vl", "internvl2"}],
+)
+def test_vlm_text_side_repeated_subfunction_export(vlm_name, model_id, tmp_path):
+    try:
+        qeff_text_model = _build_vlm_text_qeff_model(model_id)
+    except Exception as exc:
+        _skip_on_model_fetch_error(exc, model_id)
+
+    expected = [cls.__name__ for cls in qeff_text_model.model.get_submodules_for_export()]
+    onnx_path = _exported_onnx_path(
+        qeff_text_model.export(tmp_path / f"vlm-text-repeated-{vlm_name}", use_dynamo=True, use_onnx_subfunctions=True)
+    )
+    _assert_repeated_block_functions(onnx_path, expected)
 
 
 @pytest.mark.llm_model
