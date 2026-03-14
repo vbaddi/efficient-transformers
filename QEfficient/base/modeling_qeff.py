@@ -250,15 +250,33 @@ class QEFFBaseModel(ABC):
         tmp_onnx_path = tmp_onnx_dir / f"{self.model_name}.onnx"
         tmp_onnx_dir.mkdir(parents=True, exist_ok=True)
 
+        def _resolve_pkv_layers(pkv_obj):
+            if isinstance(pkv_obj, (list, tuple)):
+                return pkv_obj
+            if hasattr(pkv_obj, "to_legacy_cache"):
+                return pkv_obj.to_legacy_cache()
+            if hasattr(pkv_obj, "layers"):
+                layers = []
+                for layer in pkv_obj.layers:
+                    keys = getattr(layer, "keys", None)
+                    values = getattr(layer, "values", None)
+                    layers.append((keys, values))
+                return tuple(layers)
+            return None
+
         # Create input_names from example_inputs
         input_names = []
         for param in inspect.signature(self.model.forward).parameters:
             if param in example_inputs:
                 if param == "past_key_values":
-                    for i in range(len(example_inputs["past_key_values"])):
-                        if len(example_inputs["past_key_values"][0]) == 2:
+                    pkv_layers = _resolve_pkv_layers(example_inputs["past_key_values"])
+                    if pkv_layers is None:
+                        input_names.append(param)
+                        continue
+                    for i in range(len(pkv_layers)):
+                        if len(pkv_layers[0]) == 2:
                             input_names.extend([f"past_key.{i}", f"past_value.{i}"])
-                        elif len(example_inputs["past_key_values"][0]) == 4:
+                        elif len(pkv_layers[0]) == 4:
                             input_names.extend(
                                 [
                                     f"past_key_self.{i}",
@@ -269,22 +287,39 @@ class QEFFBaseModel(ABC):
                             )
                         else:
                             raise ValueError(
-                                f"Unknown shape of past_key_values! Expected length of past_key_values for each layer to be either 2 or 4 but got {len(example_inputs['past_key_values'][0])}"
+                                f"Unknown shape of past_key_values! Expected length of past_key_values for each layer to be either 2 or 4 but got {len(pkv_layers[0])}"
                             )
                 else:
                     input_names.append(param)
 
         try:
-            torch.onnx.export(
-                self.model,
-                (example_inputs,),
-                str(tmp_onnx_path),
-                input_names=input_names,
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                opset_version=constants.ONNX_EXPORT_OPSET,
-                **export_kwargs,
+            is_decoder_like = bool(
+                getattr(self.model.config, "is_decoder", False)
+                or getattr(self.model.config, "is_encoder_decoder", False)
             )
+            if is_decoder_like:
+                torch.onnx.export(
+                    self.model,
+                    (example_inputs,),
+                    str(tmp_onnx_path),
+                    input_names=input_names,
+                    output_names=output_names,
+                    dynamic_axes=dynamic_axes,
+                    opset_version=constants.ONNX_EXPORT_OPSET,
+                    **export_kwargs,
+                )
+            else:
+                torch.onnx.export(
+                    self.model,
+                    (),
+                    str(tmp_onnx_path),
+                    kwargs=example_inputs,
+                    input_names=input_names,
+                    output_names=output_names,
+                    dynamic_axes=dynamic_axes,
+                    opset_version=constants.ONNX_EXPORT_OPSET,
+                    **export_kwargs,
+                )
             logger.info("PyTorch export successful")
             _ = self._offload_model_weights(offload_pt_weights)
             model = onnx.load(tmp_onnx_path, load_external_data=False)
