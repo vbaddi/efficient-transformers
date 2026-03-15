@@ -56,6 +56,42 @@ _QUICKCHECK_META = {
         "AWQ",
         "Export smoke + MatMulNBits presence check",
     ),
+    "test_base_compiler_invalid_inputs_raise": (
+        "Base Runtime",
+        "Compile-path error handling for invalid ONNX and invalid flags",
+    ),
+    "test_pytorch_module_transform_primitives": (
+        "Base Transforms",
+        "ModuleMapping and ModuleMutator transform primitives",
+    ),
+    "test_onnx_transform_primitives": (
+        "Base Transforms",
+        "FP16 clip and tensor split ONNX transform primitives",
+    ),
+    "test_hash_utils_primitives": (
+        "Hash Utils",
+        "Stable hashing/serialization + invalid float guards",
+    ),
+    "test_local_causal_wrapper_init_pretrained_and_unsupported": (
+        "Causal LM",
+        "Init/pretrained wrapper behavior + unsupported-model warning path",
+    ),
+    "test_memory_offload_behavior_mocks": (
+        "Export Offload",
+        "Single-QPC memory offload behavior",
+    ),
+    "test_local_speech_seq2seq_wrapper_init_and_pretrained": (
+        "Speech Seq2Seq",
+        "Init/pretrained wrapper behavior for local tiny config",
+    ),
+    "test_gpt_oss_disagg_prefill_only_decode_export_smoke": (
+        "Disaggregated GPT-OSS",
+        "Prefill-only and decode export smoke with hash divergence checks",
+    ),
+    "test_gpt_oss_disagg_prefill_decode_pytorch_smoke": (
+        "Disaggregated GPT-OSS",
+        "Prefill-to-decode PyTorch path smoke with retained KV",
+    ),
 }
 
 

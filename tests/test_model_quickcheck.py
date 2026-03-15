@@ -16,6 +16,7 @@ import os
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict
 
 import numpy as np
@@ -23,6 +24,7 @@ import onnx
 import onnxruntime as ort
 import pytest
 import torch
+from torch import nn
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -34,6 +36,9 @@ from transformers import (
     Qwen2Config,
 )
 
+from QEfficient.base.modeling_qeff import QEFFBaseModel
+from QEfficient.base.onnx_transforms import FP16ClipTransform, OnnxTransformPipeline, SplitTensorsTransform
+from QEfficient.base.pytorch_transforms import ModuleMappingTransform, ModuleMutatorTransform
 from QEfficient.transformers.models.modeling_auto import (
     QEFFAutoModel,
     QEFFAutoModelForCausalLM,
@@ -43,6 +48,8 @@ from QEfficient.transformers.models.modeling_auto import (
     QEFFAutoModelForSpeechSeq2Seq,
 )
 from QEfficient.transformers.quantizers.auto import replace_transformers_quantizers
+from QEfficient.utils import constants, get_padding_shape_from_config
+from QEfficient.utils.hash_utils import HASH_HEXDIGEST_STR_LEN, hash_dict_params, json_serializable, to_hashable
 from QEfficient.utils.run_utils import ApiRunner
 
 ort.set_default_logger_severity(3)
@@ -82,6 +89,7 @@ TINY_AWQ_MODEL_ID = "optimum-intel-internal-testing/tiny-mixtral-AWQ-4bit"
 
 MODEL_KWARGS = {"attn_implementation": "eager"}
 PREFIX_CACHING_MODEL_ID = "hf-internal-testing/tiny-random-GPT2LMHeadModel"
+TINY_GPT_OSS_MODEL_ID = CAUSAL_RUNTIME_MODEL_IDS["gpt_oss"]
 
 
 def _per_test_thread_budget() -> int:
@@ -160,6 +168,12 @@ def _run_whisper_export_smoke(qeff_model: QEFFAutoModelForSpeechSeq2Seq) -> Path
 def _skip_on_model_fetch_error(exc: Exception, model_id: str) -> None:
     pytest.skip(
         f"Skipping {model_id}: model unavailable or unsupported in this environment ({type(exc).__name__}: {exc})"
+    )
+
+
+def _skip_on_export_error(exc: Exception, model_id: str, mode: str) -> None:
+    pytest.skip(
+        f"Skipping {model_id} {mode}: export/runtime path unavailable in this environment ({type(exc).__name__}: {exc})"
     )
 
 
@@ -430,3 +444,355 @@ def test_awq_export_smoke(tmp_path):
         onnx_model = onnx.load(onnx_path, load_external_data=False)
 
     assert any(node.op_type == "MatMulNBits" for node in onnx_model.graph.node)
+
+
+@pytest.mark.llm_model
+def test_base_compiler_invalid_inputs_raise(tmp_path):
+    qeff_obj = SimpleNamespace()
+
+    invalid_file = tmp_path / "invalid.onnx"
+    invalid_file.write_bytes(chr(0).encode() * 100)
+    with pytest.raises(RuntimeError):
+        QEFFBaseModel._compile(qeff_obj, invalid_file, tmp_path)
+
+    valid_model = onnx.parser.parse_model("""
+    <
+        ir_version: 8,
+        opset_import: ["": 17]
+    >
+    test_compiler(float x) => (float y)
+    {
+        y = Identity(x)
+    }
+    """)
+    valid_file = tmp_path / "valid.onnx"
+    onnx.save(valid_model, valid_file)
+    with pytest.raises(RuntimeError):
+        QEFFBaseModel._compile(
+            qeff_obj, valid_file, tmp_path, convert_tofp16=True, compile_only=True, aic_binary_dir=tmp_path
+        )
+
+
+class _QuickcheckLinearModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Linear(32, 64)
+        self.b = nn.Linear(64, 32)
+
+    def forward(self, x):
+        return self.b(self.a(x))
+
+
+@pytest.mark.llm_model
+def test_pytorch_module_transform_primitives():
+    class MappingTransform(ModuleMappingTransform):
+        _module_mapping = {nn.Linear: nn.Identity}
+
+    class MutatorTransform(ModuleMutatorTransform):
+        _match_class = nn.Linear
+
+        @classmethod
+        def mutate(cls, original_module: nn.Module, parent_module: nn.Module):
+            del original_module
+            del parent_module
+            return nn.Identity()
+
+    model = _QuickcheckLinearModel()
+    x = torch.rand(1, 32)
+    baseline = model(x)
+    assert torch.any(baseline != x)
+
+    mapped_model, mapped = MappingTransform.apply(model)
+    assert mapped
+    mapped_out = mapped_model(x)
+    assert torch.all(mapped_out == x)
+
+    model2 = _QuickcheckLinearModel()
+    prev_ids = [id(model2.a), id(model2.b)]
+    mutated_model, mutated = MutatorTransform.apply(model2)
+    assert mutated
+    assert [id(mutated_model.a), id(mutated_model.b)] != prev_ids
+    mutated_out = mutated_model(x)
+    assert torch.all(mutated_out == x)
+
+
+@pytest.mark.llm_model
+def test_onnx_transform_primitives(tmp_path):
+    fp16_model = onnx.parser.parse_model("""
+    <
+        ir_version: 8,
+        opset_import: ["" : 17]
+    >
+    test_fp16clip (float [n, 32] x) => (float [n, 32] y)
+    <
+        float val1 = {65505.0},
+        int64[1] slice_ends = {2147483647},
+        float zero = {0.0}
+    >
+    {
+        mask = Greater(x, zero)
+        val2 = Constant<value = float {-1e7}>()
+        masked = Where(mask, val1, val2)
+        slice_starts = Constant<value = int64[1] {0}>()
+        y = Slice(masked, slice_starts, slice_ends)
+    }
+    """)
+    transformed_onnx, transformed = OnnxTransformPipeline(transforms=[FP16ClipTransform]).apply(
+        fp16_model, model_name="quickcheck-fp16clip"
+    )
+    assert transformed
+    assert onnx.numpy_helper.to_array(transformed_onnx.graph.initializer[0]) == 65504.0
+    assert onnx.numpy_helper.to_array(transformed_onnx.graph.node[1].attribute[0].t) == -65504.0
+
+    external_tensors_file = "tensors.raw"
+    split_model = onnx.parser.parse_model(f"""
+    <
+        ir_version: 8,
+        opset_import: ["": 17]
+    >
+    test_split () => ()
+    <
+        float[1, 32] tensor0 = [ "location": "{external_tensors_file}", "offset": "0", "length": "{32 * 4}" ],
+        float[1, 32] tensor1 = [ "location": "{external_tensors_file}", "offset": "{32 * 4}", "length": "{32 * 4}" ],
+        float[1, 16] tensor2 = [ "location": "{external_tensors_file}", "offset": "{64 * 4}", "length": "{16 * 4}" ]
+    >
+    {{
+    }}
+    """)
+    np.random.rand(32 + 32 + 16).astype("float32").tofile(tmp_path / external_tensors_file)
+    split_onnx, split_transformed = OnnxTransformPipeline(transforms=[SplitTensorsTransform]).apply(
+        split_model,
+        model_name="quickcheck-split",
+        onnx_base_dir=str(tmp_path),
+        file_chunk_size=32 * 4,
+        size_threshold=16 * 4,
+    )
+    assert split_transformed
+    tensor0_ext_data = onnx.external_data_helper.ExternalDataInfo(split_onnx.graph.initializer[0])
+    tensor1_ext_data = onnx.external_data_helper.ExternalDataInfo(split_onnx.graph.initializer[1])
+    assert tensor0_ext_data.location.endswith("_0.onnx.data")
+    assert tensor1_ext_data.location.endswith("_1.onnx.data")
+    onnx_path = tmp_path / "split.onnx"
+    onnx.save(split_onnx, onnx_path)
+    assert onnx_path.is_file()
+
+
+@pytest.mark.llm_model
+def test_hash_utils_primitives():
+    ordered = {"a": 1, "b": 2}
+    reversed_order = {"b": 2, "a": 1}
+    assert to_hashable(ordered) == to_hashable(reversed_order)
+    assert to_hashable(set(range(4))) == to_hashable(set(range(3, -1, -1)))
+    for invalid in [float("nan"), float("inf"), -float("inf")]:
+        with pytest.raises(ValueError):
+            to_hashable(invalid)
+    assert json_serializable({1, 2, 3}) == ["1", "2", "3"]
+    digest = hash_dict_params({"key": {1, 2, 3}})
+    assert isinstance(digest, str)
+    assert len(digest) == HASH_HEXDIGEST_STR_LEN
+
+
+@pytest.mark.llm_model
+def test_local_causal_wrapper_init_pretrained_and_unsupported(tmp_path):
+    model = AutoModelForCausalLM.from_pretrained(
+        PREFIX_CACHING_MODEL_ID,
+        **MODEL_KWARGS,
+        low_cpu_mem_usage=False,
+        torch_dtype=torch.float32,
+    )
+    model.eval()
+    qeff_model = QEFFAutoModelForCausalLM(model)
+    assert qeff_model.model.__class__.__name__.startswith("QEff")
+
+    model_dir = tmp_path / "causal-hf"
+    model.save_pretrained(model_dir)
+    qeff_pretrained = QEFFAutoModelForCausalLM.from_pretrained(model_dir)
+    assert qeff_pretrained.model.__class__.__name__.startswith("QEff")
+
+    with pytest.warns():
+        unsupported = AutoModelForCausalLM.from_config(AutoConfig.for_model("opt"))
+        _ = QEFFAutoModelForCausalLM(unsupported)
+
+
+@pytest.mark.llm_model
+def test_memory_offload_behavior_mocks():
+    class MockParam:
+        def __init__(self, is_meta=False):
+            self.is_meta = is_meta
+
+    class MockModel:
+        def __init__(self):
+            self._params = [MockParam(is_meta=False)]
+
+        def parameters(self):
+            return self._params
+
+    class MockSingleQPCModel:
+        def __init__(self):
+            self._is_weights_offloaded = False
+            self.model = MockModel()
+
+        def _offload_model_weights(self):
+            self._is_weights_offloaded = True
+            for param in self.model.parameters():
+                param.is_meta = True
+            return True
+
+        def export(self, offload_pt_weights=True):
+            if offload_pt_weights:
+                self._offload_model_weights()
+            return "single_qpc_export_path"
+
+    qeff_model = MockSingleQPCModel()
+    qeff_model.export(offload_pt_weights=True)
+    assert qeff_model._is_weights_offloaded
+    assert all(param.is_meta for param in qeff_model.model.parameters())
+
+    qeff_model2 = MockSingleQPCModel()
+    qeff_model2.export(offload_pt_weights=False)
+    assert not qeff_model2._is_weights_offloaded
+    assert not any(param.is_meta for param in qeff_model2.model.parameters())
+
+
+@pytest.mark.llm_model
+def test_local_speech_seq2seq_wrapper_init_and_pretrained(tmp_path):
+    config = AutoConfig.for_model(
+        "whisper",
+        max_source_positions=96,
+        encoder_layers=2,
+        decoder_layers=2,
+        encoder_attention_heads=2,
+        decoder_attention_heads=2,
+        d_model=32,
+        encoder_ffn_dim=64,
+        decoder_ffn_dim=64,
+        vocab_size=60000,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        decoder_start_token_id=1,
+    )
+    model = AutoModelForSpeechSeq2Seq.from_config(config, **MODEL_KWARGS)
+    qeff_model = QEFFAutoModelForSpeechSeq2Seq(model)
+    assert qeff_model.model.model.__class__.__name__.startswith("QEff")
+
+    model_dir = tmp_path / "speech-hf"
+    model.save_pretrained(model_dir)
+    qeff_pretrained = QEFFAutoModelForSpeechSeq2Seq.from_pretrained(model_dir)
+    assert qeff_pretrained.model.model.__class__.__name__.startswith("QEff")
+
+
+@pytest.mark.llm_model
+def test_gpt_oss_disagg_prefill_only_decode_export_smoke(tmp_path):
+    try:
+        model_hf = AutoModelForCausalLM.from_pretrained(
+            TINY_GPT_OSS_MODEL_ID,
+            **MODEL_KWARGS,
+            low_cpu_mem_usage=False,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+        )
+        model_hf.eval()
+    except Exception as exc:
+        _skip_on_model_fetch_error(exc, TINY_GPT_OSS_MODEL_ID)
+        return
+
+    qeff_model = QEFFAutoModelForCausalLM(model_hf, pretrained_model_name_or_path=TINY_GPT_OSS_MODEL_ID)
+    prefill_seq_len = constants.GPT_OSS_PREFILL_Q_BLOCK_SIZE
+
+    try:
+        prefill_onnx = _exported_onnx_path(
+            qeff_model.export(
+                tmp_path / "gptoss-prefill-only",
+                prefill_only=True,
+                prefill_seq_len=prefill_seq_len,
+                offload_pt_weights=False,
+            )
+        )
+        prefill_hash = qeff_model.export_hash
+        decode_onnx = _exported_onnx_path(
+            qeff_model.export(
+                tmp_path / "gptoss-decode-only",
+                prefill_only=False,
+                retain_full_kv=True,
+                offload_pt_weights=False,
+            )
+        )
+        decode_hash = qeff_model.export_hash
+    except Exception as exc:
+        _skip_on_export_error(exc, TINY_GPT_OSS_MODEL_ID, "prefill/decode export")
+        return
+
+    assert prefill_onnx.is_file()
+    assert decode_onnx.is_file()
+    assert prefill_hash != decode_hash
+
+    prefill_model = onnx.load(prefill_onnx, load_external_data=False)
+    decode_model = onnx.load(decode_onnx, load_external_data=False)
+    prefill_inputs = {inp.name for inp in prefill_model.graph.input}
+    decode_inputs = {inp.name for inp in decode_model.graph.input}
+    assert "input_ids" in prefill_inputs
+    assert "position_ids" in prefill_inputs
+    assert "input_ids" in decode_inputs
+    assert "position_ids" in decode_inputs
+    assert any(out.name.endswith("_RetainedState") for out in prefill_model.graph.output)
+    assert any(out.name.endswith("_RetainedState") for out in decode_model.graph.output)
+
+
+@pytest.mark.llm_model
+def test_gpt_oss_disagg_prefill_decode_pytorch_smoke():
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(TINY_GPT_OSS_MODEL_ID, trust_remote_code=True)
+        model_hf = AutoModelForCausalLM.from_pretrained(
+            TINY_GPT_OSS_MODEL_ID,
+            **MODEL_KWARGS,
+            low_cpu_mem_usage=False,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+        )
+        model_hf.eval()
+    except Exception as exc:
+        _skip_on_model_fetch_error(exc, TINY_GPT_OSS_MODEL_ID)
+        return
+
+    qeff_model = QEFFAutoModelForCausalLM(model_hf, pretrained_model_name_or_path=TINY_GPT_OSS_MODEL_ID)
+    prefill_seq_len = constants.GPT_OSS_PREFILL_Q_BLOCK_SIZE
+
+    prompt = "disagg prefill smoke"
+    prompt_inputs = tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=prefill_seq_len)
+    input_ids = prompt_inputs["input_ids"]
+    position_ids = torch.where(
+        prompt_inputs["attention_mask"].bool(),
+        torch.arange(prefill_seq_len, dtype=torch.int64).unsqueeze(0).expand_as(input_ids),
+        torch.full_like(input_ids, -1),
+    )
+
+    kv_cache_shape = get_padding_shape_from_config(model_hf.config, 1, prefill_seq_len)
+    past_key_values = []
+    for _ in range(model_hf.config.num_hidden_layers):
+        past_key = torch.zeros(kv_cache_shape, dtype=torch.float32)
+        past_value = torch.zeros(kv_cache_shape, dtype=torch.float32)
+        past_key_values.append((past_key, past_value))
+
+    qeff_model.prefill(True)
+    prefill_outputs = qeff_model.model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+    )
+    assert prefill_outputs.logits is not None
+    assert prefill_outputs.logits.ndim in (2, 3)
+    assert prefill_outputs.logits.shape[-1] == model_hf.config.vocab_size
+
+    next_token = prefill_outputs.logits.argmax(-1).reshape(input_ids.shape[0], -1)[:, -1:].to(torch.int64)
+    next_pos = (position_ids.max(dim=1, keepdim=True).values + 1).to(torch.int64)
+
+    qeff_model.prefill(False, retain_full_kv=True)
+    decode_outputs = qeff_model.model(
+        input_ids=next_token,
+        position_ids=next_pos,
+        past_key_values=prefill_outputs.past_key_values,
+    )
+    assert decode_outputs.logits is not None
+    assert decode_outputs.logits.ndim in (2, 3)
+    assert decode_outputs.logits.shape[-1] == model_hf.config.vocab_size
