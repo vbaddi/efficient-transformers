@@ -13,6 +13,8 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict
 
+import torch.nn as nn
+
 from QEfficient.base.onnx_transforms import (
     CustomOpTransform,
     PreserveNestedCacheRetainedStateTransform,
@@ -26,18 +28,118 @@ from QEfficient.utils.logging_utils import logger
 from QEfficient.utils.torch_patches import (
     apply_torch_patches,
     temporarily_disable_nested_compile_regions,
+    temporarily_enable_nested_compile_regions,
     undo_torch_patches,
 )
 
 
+def _resolve_attr_path(root, attr_path):
+    current = root
+    for attr in attr_path.split("."):
+        if current is None or not hasattr(current, attr):
+            return None
+        current = getattr(current, attr)
+    return current
+
+
+def _extract_repeated_block_class(candidate):
+    if isinstance(candidate, (nn.ModuleList, nn.Sequential, list, tuple)):
+        modules = [item for item in candidate if isinstance(item, nn.Module)]
+        if len(modules) < 2:
+            return None
+        first_cls = modules[0].__class__
+        if all(isinstance(item, first_cls) for item in modules):
+            return first_cls
+    return None
+
+
+def _discover_submodule_classes_for_export(model):
+    discovered = set()
+
+    attr_paths = [
+        "layers",
+        "h",
+        "model.layers",
+        "model.h",
+        "decoder.layers",
+        "model.decoder.layers",
+        "encoder.layer",
+        "encoder.layers",
+        "model.encoder.layer",
+        "model.encoder.layers",
+        "transformer.h",
+        "transformer.layers",
+        "model.transformer.h",
+        "model.transformer.layers",
+        "language_model.layers",
+        "language_model.model.layers",
+        "llm.layers",
+        "llm.model.layers",
+        "vision_model.encoder.layers",
+        "vision_model.transformer.layers",
+        "model.vision_model.encoder.layers",
+        "model.vision_model.transformer.layers",
+        "vision_tower.transformer.layers",
+        "vision_tower.vision_model.encoder.layers",
+        "model.vision_tower.transformer.layers",
+        "model.vision_tower.vision_model.encoder.layers",
+    ]
+
+    for attr_path in attr_paths:
+        candidate = _resolve_attr_path(model, attr_path)
+        repeated_cls = _extract_repeated_block_class(candidate)
+        if repeated_cls is not None:
+            discovered.add(repeated_cls)
+
+    if discovered:
+        return discovered
+
+    repeated_suffixes = (
+        ".layers",
+        ".layer",
+        ".h",
+        ".blocks",
+        ".block",
+        ".encoder_layers",
+        ".decoder_layers",
+    )
+
+    for module_name, module in model.named_modules():
+        if not module_name:
+            continue
+        if not module_name.endswith(repeated_suffixes):
+            continue
+        repeated_cls = _extract_repeated_block_class(module)
+        if repeated_cls is None:
+            continue
+        cls_name = repeated_cls.__name__.lower()
+        if any(token in cls_name for token in ("layer", "block", "decoder", "encoder")):
+            discovered.add(repeated_cls)
+
+    return discovered
+
+
 def get_decoder_layer_classes_for_export(model):
     get_submodules_for_export = getattr(model, "get_submodules_for_export", None)
-    if get_submodules_for_export is None:
-        return []
-    submodule_classes = get_submodules_for_export()
-    if not submodule_classes:
-        return []
-    return set(submodule_classes)
+    if get_submodules_for_export is not None:
+        try:
+            submodule_classes = get_submodules_for_export()
+            if submodule_classes:
+                return {cls for cls in submodule_classes if inspect.isclass(cls)}
+        except Exception as exc:
+            logger.warning(
+                f"get_submodules_for_export failed for {model.__class__.__name__}: "
+                f"{type(exc).__name__}: {exc}. Falling back to auto-discovery."
+            )
+
+    discovered = _discover_submodule_classes_for_export(model)
+    if discovered:
+        logger.info(
+            "Auto-discovered repeated submodule classes for export: "
+            + ", ".join(sorted(cls.__name__ for cls in discovered))
+        )
+        return discovered
+    return []
 
 
 def export_wrapper(func):
@@ -72,6 +174,8 @@ def export_wrapper(func):
             if use_onnx_subfunctions:
                 args, kwargs = _setup_onnx_subfunctions(self, args, kwargs)
                 subfunction_setup_done = True
+                if use_dynamo and decoder_layer_classes:
+                    export_context = temporarily_enable_nested_compile_regions(self.model, decoder_layer_classes)
             elif use_dynamo:
                 export_context = temporarily_disable_nested_compile_regions(self.model, decoder_layer_classes)
 
@@ -90,12 +194,11 @@ def export_wrapper(func):
                     onnx_path = func(self, *args, **kwargs)
             except Exception as export_exc:
                 if use_onnx_subfunctions and use_dynamo and decoder_layer_classes:
-                    logger.warning(
-                        "Retrying dynamo+subfunction export with nested compile regions disabled due to export "
-                        f"failure: {type(export_exc).__name__}: {export_exc}"
-                    )
-                    with temporarily_disable_nested_compile_regions(self.model, decoder_layer_classes):
-                        onnx_path = func(self, *args, **kwargs)
+                    raise RuntimeError(
+                        "Export failed with use_dynamo=True and use_onnx_subfunctions=True while nested compile "
+                        f"regions were enabled for repeated-subgraph extraction ({type(export_exc).__name__}: "
+                        f"{export_exc}). Retry export with use_onnx_subfunctions=False for this model/runtime."
+                    ) from export_exc
                 else:
                     raise
 
