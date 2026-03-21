@@ -36,6 +36,11 @@ from transformers import (
     Qwen2Config,
 )
 
+try:
+    from transformers.models.mistral4.modeling_mistral4 import Mistral4ForCausalLM
+except ImportError:
+    Mistral4ForCausalLM = None
+
 from QEfficient.transformers.models.modeling_auto import (
     QEFFAutoModel,
     QEFFAutoModelForCausalLM,
@@ -70,6 +75,8 @@ CAUSAL_RUNTIME_MODEL_IDS = {
     "gpt_oss": "tiny-random/gpt-oss-bf16",
     "glm4_moe_lite": "tiny-random/glm-4.7-flash",
 }
+if Mistral4ForCausalLM is not None:
+    CAUSAL_RUNTIME_MODEL_IDS["mistral4"] = "onnx-internal-testing/tiny-random-Mistral4ForCausalLM"
 
 VLM_TEXT_RUNTIME_MODEL_ID = "tiny-random/gemma-3"
 VLM_EXPORT_MODEL_IDS = {
@@ -251,13 +258,29 @@ def test_causal_lm_cpu_runtime_parity_with_api_runner(model_type, model_id, tmp_
     prompt_len = 8
     ctx_len = 12
 
-    model_hf = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        **MODEL_KWARGS,
-        low_cpu_mem_usage=False,
-        trust_remote_code=True,
-        torch_dtype=torch.float32,
-    )
+    if model_type == "mistral4":
+        # Decode-focused validation: keep prefill length at 1 token.
+        # For tiny-random-Mistral4 tokenizer, empty string tokenizes to BOS-only length 1.
+        prompt = [""]
+        prompt_len = 1
+        ctx_len = 5
+        if Mistral4ForCausalLM is None:
+            pytest.skip("Mistral4 is unavailable in this transformers build.")
+        model_hf = Mistral4ForCausalLM.from_pretrained(
+            model_id,
+            **MODEL_KWARGS,
+            low_cpu_mem_usage=False,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+        )
+    else:
+        model_hf = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            **MODEL_KWARGS,
+            low_cpu_mem_usage=False,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+        )
     model_hf.eval()
 
     api_runner = ApiRunner(

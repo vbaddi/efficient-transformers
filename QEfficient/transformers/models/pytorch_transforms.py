@@ -120,6 +120,23 @@ from transformers.models.mistral.modeling_mistral import (
     MistralModel,
     MistralRMSNorm,
 )
+
+try:
+    from transformers.models.mistral4.modeling_mistral4 import (
+        Mistral4Attention,
+        Mistral4DecoderLayer,
+        Mistral4ForCausalLM,
+        Mistral4Model,
+        Mistral4MoE,
+        Mistral4RMSNorm,
+    )
+except ImportError:
+    Mistral4Attention = None
+    Mistral4DecoderLayer = None
+    Mistral4ForCausalLM = None
+    Mistral4Model = None
+    Mistral4MoE = None
+    Mistral4RMSNorm = None
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration,
     Mistral3Model,
@@ -355,6 +372,21 @@ from QEfficient.transformers.models.mistral.modeling_mistral import (
     QEffMistralForCausalLM,
     QEffMistralModel,
 )
+
+try:
+    from QEfficient.transformers.models.mistral4.modeling_mistral4 import (
+        QEffMistral4Attention,
+        QEffMistral4DecoderLayer,
+        QEffMistral4ForCausalLM,
+        QEffMistral4Model,
+        QEffMistral4MoE,
+    )
+except ImportError:
+    QEffMistral4Attention = None
+    QEffMistral4DecoderLayer = None
+    QEffMistral4ForCausalLM = None
+    QEffMistral4Model = None
+    QEffMistral4MoE = None
 from QEfficient.transformers.models.mistral3.modeling_mistral3 import (
     QEffMistral3ForConditionalGeneration,
     QEffMistral3Model,
@@ -491,6 +523,8 @@ class CustomOpsTransform(ModuleMappingTransform):
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
         Olmo2RMSNorm: CustomRMSNormAIC,
     }
+    if Mistral4RMSNorm is not None:
+        _module_mapping[Mistral4RMSNorm] = CustomRMSNormAIC
 
 
 class KVCacheTransform(ModuleMappingTransform):
@@ -664,6 +698,16 @@ class KVCacheTransform(ModuleMappingTransform):
         WhisperModel: QEffWhisperModel,
         WhisperForConditionalGeneration: QEffWhisperForConditionalGeneration,
     }
+    if Mistral4Attention is not None and QEffMistral4Attention is not None:
+        _module_mapping.update(
+            {
+                Mistral4Attention: QEffMistral4Attention,
+                Mistral4DecoderLayer: QEffMistral4DecoderLayer,
+                Mistral4Model: QEffMistral4Model,
+                Mistral4ForCausalLM: QEffMistral4ForCausalLM,
+                Mistral4MoE: QEffMistral4MoE,
+            }
+        )
 
     @classmethod
     def apply(cls, model: nn.Module) -> Tuple[nn.Module, bool]:

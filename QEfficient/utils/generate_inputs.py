@@ -51,10 +51,12 @@ class InputHandler:
         self.global_shape, self.sliding_shape = get_sliding_window_shapes(
             config=config, batch_size=full_batch_size if full_batch_size else batch_size, seq_len=ctx_len
         )
+        model_type = getattr(config, "model_type", "")
         mla_env = os.environ.get("QEFF_ENABLE_GLM4_MLA_ABSORPTION", "0").lower()
-        self.glm_mla_enabled = (
-            getattr(config, "model_type", "") == "glm4_moe_lite"
-            and mla_env in {"1", "true", "yes", "on"}
+        glm_mla_enabled = model_type == "glm4_moe_lite" and mla_env in {"1", "true", "yes", "on"}
+        mistral4_mla_enabled = model_type == "mistral4"
+        self.compressed_mla_enabled = (
+            (glm_mla_enabled or mistral4_mla_enabled)
             and hasattr(config, "kv_lora_rank")
             and hasattr(config, "qk_rope_head_dim")
         )
@@ -101,7 +103,7 @@ class InputHandler:
 
         past_key_values = []
         for i in range(self.n_layer):
-            if self.glm_mla_enabled:
+            if self.compressed_mla_enabled:
                 cache_bs = self.full_batch_size if self.full_batch_size else batch_size
                 ckv_shape = (cache_bs, self.ctx_len, self.config.kv_lora_rank)
                 kpe_shape = (cache_bs, 1, self.ctx_len, self.config.qk_rope_head_dim)
@@ -189,7 +191,7 @@ class InputHandler:
             axis=1,
         ).astype(np.int64)
 
-        if self.glm_mla_enabled:
+        if self.compressed_mla_enabled:
             cache_bs = self.full_batch_size if self.full_batch_size else batch_size
             for i in range(self.n_layer):
                 inputs["past_key." + str(i)] = np.zeros(

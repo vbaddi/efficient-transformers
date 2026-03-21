@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from transformers import (
+    AutoConfig,
     AutoImageProcessor,
     AutoModel,
     AutoModelForCausalLM,
@@ -2823,7 +2824,17 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         kv_offload = kwargs.pop("kv_offload", None)
 
         kwargs.update({"attn_implementation": "eager", "low_cpu_mem_usage": False})
-        model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        try:
+            model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        except ValueError as exc:
+            cfg = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+            if getattr(cfg, "model_type", "") != "mistral4":
+                raise
+            try:
+                from transformers.models.mistral4.modeling_mistral4 import Mistral4ForCausalLM
+            except ImportError:
+                raise exc
+            model = Mistral4ForCausalLM.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         if qaic_config is not None:
             qaic_config["pretrained_model_name_or_path"] = pretrained_model_name_or_path
 
