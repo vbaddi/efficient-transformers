@@ -10,7 +10,6 @@ from typing import List, Optional, Tuple, Type, Union
 import torch
 from torch import nn
 from transformers.cache_utils import Cache
-from transformers.integrations.moe import batched_mm_experts_forward
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.models.minimax_m2.modeling_minimax_m2 import (
     MiniMaxM2Attention,
@@ -118,26 +117,23 @@ class QEffMiniMaxM2SparseMoeBlock(MiniMaxM2SparseMoeBlock):
                 1.0 - self.jitter_noise, 1.0 + self.jitter_noise
             )
 
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        tokens = batch_size * sequence_length
+        hidden_states = hidden_states.view(tokens, hidden_dim)
         router_logits, top_k_weights, top_k_index = self.gate(hidden_states, self.e_score_correction_bias)
 
-        if callable(self.experts) and not hasattr(self.experts, "__getitem__"):
-            experts_dtype = None
-            for param in self.experts.parameters():
-                experts_dtype = param.dtype
-                break
-            hidden_states_for_experts = hidden_states.to(experts_dtype) if experts_dtype else hidden_states
-            if torch.onnx.is_in_onnx_export():
-                final_hidden_states = batched_mm_experts_forward(
-                    self.experts, hidden_states_for_experts, top_k_index, top_k_weights
-                )
-            else:
-                final_hidden_states = self.experts(hidden_states_for_experts, top_k_index, top_k_weights)
-            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-            return final_hidden_states, router_logits
+        # Decode-optimized MoE path: gather selected expert weights and run batched BMM.
+        gate_up_proj = self.experts.gate_up_proj[top_k_index.flatten()]  # [T*K, 2I, H]
+        down_proj = self.experts.down_proj[top_k_index.flatten()]  # [T*K, H, I]
+        expert_in = hidden_states.unsqueeze(1).expand(-1, self.top_k, -1).contiguous().view(-1, 1, hidden_dim)
 
-        final_hidden_states = self.experts(hidden_states, top_k_index, top_k_weights)
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        gate_up = torch.bmm(expert_in, gate_up_proj.transpose(1, 2))
+        gate, up = gate_up.chunk(2, dim=-1)
+        intermediate = self.experts.act_fn(gate) * up
+        experts_out = torch.bmm(intermediate, down_proj.transpose(1, 2))
+        experts_out = experts_out.view(tokens, self.top_k, hidden_dim)
+        experts_out = experts_out * top_k_weights.unsqueeze(-1).to(experts_out.dtype)
+        final_hidden_states = torch.einsum("tkh->th", experts_out).view(batch_size, sequence_length, hidden_dim)
+
         return final_hidden_states, router_logits
 
 
