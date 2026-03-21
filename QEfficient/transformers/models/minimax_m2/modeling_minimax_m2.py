@@ -17,6 +17,7 @@ from transformers.models.minimax_m2.modeling_minimax_m2 import (
     MiniMaxM2ForCausalLM,
     MiniMaxM2Model,
     MiniMaxM2SparseMoeBlock,
+    MiniMaxM2TopKRouter,
     repeat_kv,
     rotate_half,
 )
@@ -26,16 +27,22 @@ from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
 
 
-def qeff_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+def qeff_apply_rotary_pos_emb(q, k, cos, sin, rotary_dim: int, head_dim: int, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-    q_embed = torch.cat([q_embed, q_pass], dim=-1)
-    k_embed = torch.cat([k_embed, k_pass], dim=-1)
+    q_rot = q[..., :rotary_dim]
+    k_rot = k[..., :rotary_dim]
+    q_embed_rot = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed_rot = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    if rotary_dim < head_dim:
+        q_pass = q[..., rotary_dim:head_dim]
+        k_pass = k[..., rotary_dim:head_dim]
+        q_embed = torch.cat([q_embed_rot, q_pass], dim=-1)
+        k_embed = torch.cat([k_embed_rot, k_pass], dim=-1)
+    else:
+        q_embed = q_embed_rot
+        k_embed = k_embed_rot
     return q_embed.to(q.dtype), k_embed.to(k.dtype)
 
 
@@ -62,6 +69,12 @@ def eager_attention_forward(
 
 
 class QEffMiniMaxM2Attention(MiniMaxM2Attention):
+    def __qeff_init__(self):
+        rotary_dim = int(getattr(self.config, "rotary_dim", self.head_dim))
+        if rotary_dim <= 0 or rotary_dim > self.head_dim:
+            rotary_dim = self.head_dim
+        self.rotary_dim = rotary_dim
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -86,7 +99,9 @@ class QEffMiniMaxM2Attention(MiniMaxM2Attention):
         value_states = value_states.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = qeff_apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, rotary_dim=self.rotary_dim, head_dim=self.head_dim
+        )
 
         if past_key_values is not None:
             cache_kwargs = {"batch_index": batch_index, "position_ids": position_ids}
@@ -107,6 +122,19 @@ class QEffMiniMaxM2Attention(MiniMaxM2Attention):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+
+class QEffMiniMaxM2TopKRouter(MiniMaxM2TopKRouter):
+    def forward(self, hidden_states, e_score_correction_bias):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = nn.functional.linear(hidden_states.to(self.weight.dtype), self.weight)
+        routing_weights = nn.functional.sigmoid(router_logits.float())
+        scores_for_choice = routing_weights + e_score_correction_bias
+        _, top_k_index = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)
+        top_k_weights = routing_weights.gather(1, top_k_index)
+        denom = torch.einsum("tk->t", top_k_weights).unsqueeze(-1)
+        top_k_weights = top_k_weights / denom
+        return router_logits, top_k_weights, top_k_index
 
 
 class QEffMiniMaxM2SparseMoeBlock(MiniMaxM2SparseMoeBlock):

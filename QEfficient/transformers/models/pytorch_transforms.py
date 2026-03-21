@@ -112,6 +112,7 @@ from transformers.models.minimax_m2.modeling_minimax_m2 import (
     MiniMaxM2Model,
     MiniMaxM2RMSNorm,
     MiniMaxM2SparseMoeBlock,
+    MiniMaxM2TopKRouter,
 )
 from transformers.models.mistral.modeling_mistral import (
     MistralAttention,
@@ -348,6 +349,7 @@ from QEfficient.transformers.models.minimax_m2.modeling_minimax_m2 import (
     QEffMiniMaxM2ForCausalLM,
     QEffMiniMaxM2Model,
     QEffMiniMaxM2SparseMoeBlock,
+    QEffMiniMaxM2TopKRouter,
 )
 from QEfficient.transformers.models.mistral.modeling_mistral import (
     QEffMistralAttention,
@@ -602,6 +604,7 @@ class KVCacheTransform(ModuleMappingTransform):
         # MiniMaxM2
         MiniMaxM2Attention: QEffMiniMaxM2Attention,
         MiniMaxM2SparseMoeBlock: QEffMiniMaxM2SparseMoeBlock,
+        MiniMaxM2TopKRouter: QEffMiniMaxM2TopKRouter,
         MiniMaxM2DecoderLayer: QEffMiniMaxM2DecoderLayer,
         MiniMaxM2Model: QEffMiniMaxM2Model,
         MiniMaxM2ForCausalLM: QEffMiniMaxM2ForCausalLM,
