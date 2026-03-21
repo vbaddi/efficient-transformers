@@ -60,6 +60,7 @@ CAUSAL_RUNTIME_MODEL_IDS = {
     "llama": "hf-internal-testing/tiny-random-LlamaForCausalLM",
     "mistral": "hf-internal-testing/tiny-random-MistralForCausalLM",
     "mixtral": "hf-internal-testing/tiny-random-MixtralForCausalLM",
+    "minimax_m2": "tiny-random/minimax-m2.5",
     "mpt": "hf-internal-testing/tiny-random-MptForCausalLM",
     "phi": "hf-internal-testing/tiny-random-PhiForCausalLM",
     "phi3": "tiny-random/phi-4",
@@ -243,7 +244,8 @@ def _export_vlm_with_text_fallback(model_id: str, out_dir: Path) -> Path:
     ids=sorted(CAUSAL_RUNTIME_MODEL_IDS),
 )
 def test_causal_lm_cpu_runtime_parity_with_api_runner(model_type, model_id, tmp_path):
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    trust_remote_code = model_type != "minimax_m2"
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
     if hasattr(tokenizer, "model_input_names"):
         tokenizer.model_input_names = ["input_ids", "attention_mask"]
     prompt = ["hello world"]
@@ -254,7 +256,7 @@ def test_causal_lm_cpu_runtime_parity_with_api_runner(model_type, model_id, tmp_
         model_id,
         **MODEL_KWARGS,
         low_cpu_mem_usage=False,
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
         torch_dtype=torch.float32,
     )
     model_hf.eval()

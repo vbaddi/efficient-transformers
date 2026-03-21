@@ -105,6 +105,14 @@ from transformers.models.llava.modeling_llava import (
 from transformers.models.llava_next.modeling_llava_next import (
     LlavaNextForConditionalGeneration,
 )
+from transformers.models.minimax_m2.modeling_minimax_m2 import (
+    MiniMaxM2Attention,
+    MiniMaxM2DecoderLayer,
+    MiniMaxM2ForCausalLM,
+    MiniMaxM2Model,
+    MiniMaxM2RMSNorm,
+    MiniMaxM2SparseMoeBlock,
+)
 from transformers.models.mistral.modeling_mistral import (
     MistralAttention,
     MistralDecoderLayer,
@@ -334,6 +342,13 @@ from QEfficient.transformers.models.llava_next.modeling_llava_next import (
     QEffLlavaNextDecoderWrapper,
     QEffLlavaNextForConditionalGeneration,
 )
+from QEfficient.transformers.models.minimax_m2.modeling_minimax_m2 import (
+    QEffMiniMaxM2Attention,
+    QEffMiniMaxM2DecoderLayer,
+    QEffMiniMaxM2ForCausalLM,
+    QEffMiniMaxM2Model,
+    QEffMiniMaxM2SparseMoeBlock,
+)
 from QEfficient.transformers.models.mistral.modeling_mistral import (
     QEffMistralAttention,
     QEffMistralDecoderLayer,
@@ -471,6 +486,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         GraniteRMSNorm: CustomRMSNormAIC,
         PixtralRMSNorm: CustomRMSNormAIC,
         GraniteMoeRMSNorm: CustomRMSNormAIC,
+        MiniMaxM2RMSNorm: CustomRMSNormAIC,
         Qwen3MoeRMSNorm: CustomRMSNormAIC,
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
         Olmo2RMSNorm: CustomRMSNormAIC,
@@ -583,6 +599,12 @@ class KVCacheTransform(ModuleMappingTransform):
         MixtralDecoderLayer: QeffMixtralDecoderLayer,
         MixtralModel: QEffMixtralModel,
         MixtralForCausalLM: QEffMixtralForCausalLM,
+        # MiniMaxM2
+        MiniMaxM2Attention: QEffMiniMaxM2Attention,
+        MiniMaxM2SparseMoeBlock: QEffMiniMaxM2SparseMoeBlock,
+        MiniMaxM2DecoderLayer: QEffMiniMaxM2DecoderLayer,
+        MiniMaxM2Model: QEffMiniMaxM2Model,
+        MiniMaxM2ForCausalLM: QEffMiniMaxM2ForCausalLM,
         # Mpt
         MptAttention: QEffMptAttention,
         MptBlock: QEffMptBlock,
