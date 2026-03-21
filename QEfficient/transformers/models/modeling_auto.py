@@ -2937,7 +2937,12 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         kv_cache_shape = get_padding_shape_from_config(
             self.model.config, fbs if self.continuous_batching else bs, seq_len
         )
+        enable_mla = bool(getattr(getattr(self.model, "model", None), "enable_mla", False))
         enable_chunking = kwargs.get("enable_chunking", False)
+        # GLM MLA + compressed cache uses decode-style attention path; trace with seq_len=1
+        # so ONNX captures the same branch used at runtime decode.
+        if enable_mla:
+            seq_len = 1
         if self.model.config.model_type in SPECIALIZED_DISAGG_SERVING_MODEL_ARCH:
             if prefill_only:
                 if not enable_chunking and self.continuous_batching:
@@ -3030,11 +3035,44 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 else pkv_dynamic_axes
             )
 
-            for i in range(self.num_layers):
-                for kv in ["key", "value"]:
-                    example_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=torch.float32))
-                    dynamic_axes[f"past_{kv}.{i}"] = pkv_dynamic_axes[i]
-                    output_names.append(f"past_{kv}.{i}_RetainedState")
+            if (
+                enable_mla
+                and hasattr(self.model.config, "kv_lora_rank")
+                and hasattr(self.model.config, "qk_rope_head_dim")
+            ):
+                cache_ctx_len = kv_cache_shape[2] if len(kv_cache_shape) > 2 else seq_len
+                ckv_shape = (
+                    fbs if self.continuous_batching else bs,
+                    cache_ctx_len,
+                    self.model.config.kv_lora_rank,
+                )
+                kpe_shape = (
+                    fbs if self.continuous_batching else bs,
+                    1,
+                    cache_ctx_len,
+                    self.model.config.qk_rope_head_dim,
+                )
+                ckv_dynamic_axes = {
+                    0: "full_batch_size" if self.continuous_batching else "batch_size",
+                    1: "ctx_len",
+                }
+                kpe_dynamic_axes = {
+                    0: "full_batch_size" if self.continuous_batching else "batch_size",
+                    2: "ctx_len",
+                }
+                for i in range(self.num_layers):
+                    example_inputs["past_key_values"][i].append(torch.zeros(ckv_shape, dtype=torch.float32))
+                    dynamic_axes[f"past_key.{i}"] = ckv_dynamic_axes
+                    output_names.append(f"past_key.{i}_RetainedState")
+                    example_inputs["past_key_values"][i].append(torch.zeros(kpe_shape, dtype=torch.float32))
+                    dynamic_axes[f"past_value.{i}"] = kpe_dynamic_axes
+                    output_names.append(f"past_value.{i}_RetainedState")
+            else:
+                for i in range(self.num_layers):
+                    for kv in ["key", "value"]:
+                        example_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=torch.float32))
+                        dynamic_axes[f"past_{kv}.{i}"] = pkv_dynamic_axes[i]
+                        output_names.append(f"past_{kv}.{i}_RetainedState")
 
         if self.continuous_batching:
             example_inputs["batch_index"] = torch.arange(bs).view(bs, 1)

@@ -16,7 +16,7 @@ from transformers import TextStreamer
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 
 from QEfficient.generation.text_generation_inference import TextGeneration
-from QEfficient.transformers.cache_utils import QEffDynamicCache
+from QEfficient.transformers.cache_utils import QEffDynamicCache, QEffDynamicCompressedKVRopeCache
 from QEfficient.utils.generate_inputs import InputHandler, InputHandlerInternVL, InputHandlerVLM
 
 
@@ -145,6 +145,12 @@ class ApiRunner:
             if len(first) == 2:
                 model_type = getattr(getattr(model, "config", None), "model_type", "")
                 if model_type.startswith("gpt_oss"):
+                    return past_key_values
+                if model_type == "glm4_moe_lite":
+                    mla_env = os.environ.get("QEFF_ENABLE_GLM4_MLA_ABSORPTION", "0").lower()
+                    mla_enabled = mla_env in {"1", "true", "yes", "on"}
+                    if mla_enabled and first[0].dim() == 3:
+                        return QEffDynamicCompressedKVRopeCache.from_legacy_cache(past_key_values)
                     return past_key_values
                 if model_type.startswith("gemma3"):
                     return DynamicCache(past_key_values)

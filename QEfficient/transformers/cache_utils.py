@@ -551,6 +551,163 @@ class QEffDynamicCache(Cache):
         return cache
 
 
+class QEffDynamicCompressedKVRopeLayer:
+    def __init__(self):
+        self.ckv: Optional[torch.Tensor] = None
+        self.k_pe: Optional[torch.Tensor] = None
+        self.is_initialized = False
+        self.device = None
+
+    @classmethod
+    def from_tensors(
+        cls, compressed_kv_states: torch.Tensor, rope_k_states: torch.Tensor
+    ) -> "QEffDynamicCompressedKVRopeLayer":
+        layer = cls()
+        layer.ckv = compressed_kv_states
+        layer.k_pe = rope_k_states
+        layer.is_initialized = True
+        layer.device = compressed_kv_states.device
+        return layer
+
+    def _update_tensor(
+        self, cache: Optional[torch.Tensor], states: torch.Tensor, cache_kwargs: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        position_ids = cache_kwargs.get("position_ids")
+        batch_index = cache_kwargs.get("batch_index", None)
+        if position_ids is None:
+            if cache is None:
+                cache = states
+            return cache, cache[:, : states.shape[1], :]
+
+        valid_mask = position_ids >= 0
+        scatter_position_ids = torch.where(valid_mask, position_ids, torch.zeros_like(position_ids))
+        states = torch.where(valid_mask.unsqueeze(-1), states, torch.zeros_like(states))
+
+        required_len = (
+            int(scatter_position_ids.max().item()) + 1 if scatter_position_ids.numel() > 0 else states.shape[1]
+        )
+        if cache is None:
+            init_len = max(required_len, states.shape[1], int(cache_kwargs.get("CCL", 0)))
+            cache = torch.zeros(
+                (states.shape[0], init_len, states.shape[-1]),
+                dtype=states.dtype,
+                device=states.device,
+            )
+        elif required_len > cache.shape[1]:
+            pad = required_len - cache.shape[1]
+            cache = torch.cat(
+                [cache, torch.zeros((cache.shape[0], pad, cache.shape[-1]), dtype=cache.dtype, device=cache.device)],
+                dim=1,
+            )
+
+        if batch_index is not None:
+            invalid_scatter_index = torch.iinfo(torch.int32).max
+            cb_scatter_pos = torch.where(valid_mask, scatter_position_ids, invalid_scatter_index)
+            cache = CtxScatterFuncCB3D.apply(cache, batch_index, cb_scatter_pos, states)
+        else:
+            cache = CtxScatterFunc3D.apply(cache, scatter_position_ids, states)
+
+        ctx_len = min(int(cache_kwargs.get("CCL", cache.shape[1])), cache.shape[1])
+        if batch_index is not None:
+            out = cache[batch_index.view(-1), :ctx_len, :]
+        else:
+            out = cache[:, :ctx_len, :]
+        return cache, out
+
+    def update_ckv(self, compressed_kv_states: torch.Tensor, cache_kwargs: dict[str, Any]) -> torch.Tensor:
+        self.ckv, ckv_out = self._update_tensor(self.ckv, compressed_kv_states, cache_kwargs)
+        if not self.is_initialized:
+            self.is_initialized = True
+            self.device = compressed_kv_states.device
+        return ckv_out
+
+    def update_k_pe(self, rope_k_states: torch.Tensor, cache_kwargs: dict[str, Any]) -> torch.Tensor:
+        rope_k_states_3d = rope_k_states.squeeze(1)
+        self.k_pe, k_pe_out = self._update_tensor(self.k_pe, rope_k_states_3d, cache_kwargs)
+        if not self.is_initialized:
+            self.is_initialized = True
+            self.device = rope_k_states.device
+        return k_pe_out.unsqueeze(1)
+
+    def get_seq_length(self) -> int:
+        return self.ckv.shape[-2] if self.ckv is not None else 0
+
+
+class QEffDynamicCompressedKVRopeCache(Cache):
+    """
+    Cache for MLA-style compressed KV and rope key tensors.
+
+    Each layer stores:
+    - compressed kv tensor: [batch, seq, kv_lora_rank]
+    - rope key tensor: [batch, seq, qk_rope_head_dim]
+    """
+
+    def __init__(self, ddp_cache_data: Optional[Iterable[tuple[torch.Tensor, torch.Tensor]]] = None, *args, **kwargs):
+        kwargs.pop("layers", None)
+        kwargs.pop("layer_class_to_replicate", None)
+        super().__init__(layer_class_to_replicate=QEffDynamicCompressedKVRopeLayer, *args, **kwargs)
+        if ddp_cache_data is not None:
+            for compressed_kv_states, rope_k_states in ddp_cache_data:
+                if rope_k_states.dim() == 4:
+                    rope_k_states = rope_k_states.squeeze(1)
+                self.layers.append(QEffDynamicCompressedKVRopeLayer.from_tensors(compressed_kv_states, rope_k_states))
+
+    def append_new_layers(self, layer_idx: int) -> None:
+        while len(self.layers) <= layer_idx:
+            self.layers.append(QEffDynamicCompressedKVRopeLayer())
+
+    def update_ckv(
+        self, compressed_kv_states: torch.Tensor, layer_idx: int, cache_kwargs: Optional[dict[str, Any]] = None
+    ) -> torch.Tensor:
+        self.append_new_layers(layer_idx)
+        return self.layers[layer_idx].update_ckv(compressed_kv_states, cache_kwargs or {})
+
+    def update_k_pe(
+        self, rope_k_states: torch.Tensor, layer_idx: int, cache_kwargs: Optional[dict[str, Any]] = None
+    ) -> torch.Tensor:
+        self.append_new_layers(layer_idx)
+        return self.layers[layer_idx].update_k_pe(rope_k_states, cache_kwargs or {})
+
+    def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        layer = self.layers[layer_idx]
+        k_pe = layer.k_pe.unsqueeze(1) if layer.k_pe is not None else None
+        return (layer.ckv, k_pe)
+
+    def __iter__(self):
+        for idx in range(len(self.layers)):
+            yield self[idx]
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0, *args, **kwargs) -> int:
+        if layer_idx is None:
+            layer_idx = 0
+        is_empty_layer = (
+            len(self.layers) == 0
+            or len(self.layers) <= layer_idx
+            or getattr(self.layers[layer_idx], "ckv", None) is None
+            or len(self.layers[layer_idx].ckv) == 0
+        )
+        return self.layers[layer_idx].ckv.shape[-2] if not is_empty_layer else 0
+
+    def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
+        legacy_cache = ()
+        for layer in self.layers:
+            k_pe = layer.k_pe.unsqueeze(1) if layer.k_pe is not None else None
+            legacy_cache += ((layer.ckv, k_pe),)
+        return legacy_cache
+
+    @classmethod
+    def from_legacy_cache(
+        cls, compressed_kvs: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
+    ) -> "QEffDynamicCompressedKVRopeCache":
+        cache = cls()
+        if compressed_kvs is not None:
+            for compressed_kv_states, rope_k_states in compressed_kvs:
+                if rope_k_states.dim() == 4:
+                    rope_k_states = rope_k_states.squeeze(1)
+                cache.layers.append(QEffDynamicCompressedKVRopeLayer.from_tensors(compressed_kv_states, rope_k_states))
+        return cache
+
+
 class QEffEncoderDecoderCache(EncoderDecoderCache):
     """
     Updated the `EncoderDecoderCache` to use the `QEffDynamicCache` for both self-attention and cross-attention caches.

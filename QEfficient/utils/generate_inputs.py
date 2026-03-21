@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
 # -----------------------------------------------------------------------------
+import os
 from typing import List
 
 import numpy as np
@@ -50,6 +51,13 @@ class InputHandler:
         self.global_shape, self.sliding_shape = get_sliding_window_shapes(
             config=config, batch_size=full_batch_size if full_batch_size else batch_size, seq_len=ctx_len
         )
+        mla_env = os.environ.get("QEFF_ENABLE_GLM4_MLA_ABSORPTION", "0").lower()
+        self.glm_mla_enabled = (
+            getattr(config, "model_type", "") == "glm4_moe_lite"
+            and mla_env in {"1", "true", "yes", "on"}
+            and hasattr(config, "kv_lora_rank")
+            and hasattr(config, "qk_rope_head_dim")
+        )
 
     def prepare_pytorch_inputs(self):
         """
@@ -93,15 +101,22 @@ class InputHandler:
 
         past_key_values = []
         for i in range(self.n_layer):
-            if (
-                all(hasattr(self.config, attr) for attr in ["sliding_window", "layer_types"])
-                and self.config.layer_types[i] == "sliding_attention"
-            ):
-                pad_shape = self.padding_shape[:2] + [self.config.sliding_window] + [self.padding_shape[-1]]
+            if self.glm_mla_enabled:
+                cache_bs = self.full_batch_size if self.full_batch_size else batch_size
+                ckv_shape = (cache_bs, self.ctx_len, self.config.kv_lora_rank)
+                kpe_shape = (cache_bs, 1, self.ctx_len, self.config.qk_rope_head_dim)
+                past_key = torch.zeros(ckv_shape, dtype=torch.float32)
+                past_value = torch.zeros(kpe_shape, dtype=torch.float32)
             else:
-                pad_shape = self.padding_shape
-            past_key = torch.zeros((pad_shape), dtype=torch.float32)
-            past_value = torch.zeros((pad_shape), dtype=torch.float32)
+                if (
+                    all(hasattr(self.config, attr) for attr in ["sliding_window", "layer_types"])
+                    and self.config.layer_types[i] == "sliding_attention"
+                ):
+                    pad_shape = self.padding_shape[:2] + [self.config.sliding_window] + [self.padding_shape[-1]]
+                else:
+                    pad_shape = self.padding_shape
+                past_key = torch.zeros((pad_shape), dtype=torch.float32)
+                past_value = torch.zeros((pad_shape), dtype=torch.float32)
             pkv = (past_key, past_value)
             past_key_values.append(pkv)
         inputs["past_key_values"] = tuple(past_key_values)
@@ -174,7 +189,16 @@ class InputHandler:
             axis=1,
         ).astype(np.int64)
 
-        if hasattr(self.config, "model_type") and self.config.model_type in DYNAMIC_SEQ_LEN_SUPPORTED_MODEL_ARCH:
+        if self.glm_mla_enabled:
+            cache_bs = self.full_batch_size if self.full_batch_size else batch_size
+            for i in range(self.n_layer):
+                inputs["past_key." + str(i)] = np.zeros(
+                    (cache_bs, self.ctx_len, self.config.kv_lora_rank), dtype=np.float32
+                )
+                inputs["past_value." + str(i)] = np.zeros(
+                    (cache_bs, 1, self.ctx_len, self.config.qk_rope_head_dim), dtype=np.float32
+                )
+        elif hasattr(self.config, "model_type") and self.config.model_type in DYNAMIC_SEQ_LEN_SUPPORTED_MODEL_ARCH:
             for i in range(self.n_layer):
                 cache_shape = self.global_shape if not self.is_chunked_attention[i] else self.sliding_shape
                 inputs["past_key." + str(i)] = np.zeros((cache_shape), dtype=np.float32)

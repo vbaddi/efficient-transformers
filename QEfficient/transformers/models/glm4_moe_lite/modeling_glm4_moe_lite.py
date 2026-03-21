@@ -23,7 +23,7 @@ from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
     apply_rotary_pos_emb_interleave,
 )
 
-from QEfficient.transformers.cache_utils import QEffDynamicCache
+from QEfficient.transformers.cache_utils import QEffDynamicCache, QEffDynamicCompressedKVRopeCache
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
 
@@ -37,6 +37,7 @@ def _qeff_attention_forward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
+        attention_mask = attention_mask[..., : key_states.shape[-2]]
         attn_weights = torch.where(
             attention_mask,
             torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32),
@@ -118,6 +119,7 @@ class QEffGlm4MoeLiteAttention(Glm4MoeLiteAttention):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.LongTensor],
+        compressed_kvs: Optional[QEffDynamicCompressedKVRopeCache],
         past_key_values: Optional[Cache],
         cache_position: Optional[torch.LongTensor],
         batch_index: Optional[torch.LongTensor],
@@ -127,15 +129,10 @@ class QEffGlm4MoeLiteAttention(Glm4MoeLiteAttention):
         q_a_out = self.q_a_layernorm(self.q_a_proj(hidden_states))
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         compressed_kv, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kva = self.kv_a_layernorm(compressed_kv)
 
         # Absorption path: compute query no-pe directly from q_a output and pre-split q weights.
         q_nope = torch.einsum("bsr,hrd->bhsd", q_a_out, self.q_nope_from_q_a)
         q_rot = torch.einsum("bsr,hrd->bhsd", q_a_out, self.q_rope_from_q_a)
-
-        key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
-        k_pass = self.kv_b_proj(kva).view(key_shape).transpose(1, 2)
-        k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
         cos, sin = position_embeddings
@@ -144,21 +141,7 @@ class QEffGlm4MoeLiteAttention(Glm4MoeLiteAttention):
         else:
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
 
-        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
-        query_states = torch.cat((q_nope, q_rot), dim=-1)
-        key_states = torch.cat((k_pass, k_rot), dim=-1)
-
-        value_dim = value_states.shape[-1]
-        if past_key_values is not None:
-            value_states_cache = value_states
-            key_states_cache = key_states
-            layer = past_key_values.layers[self.layer_idx]
-            cache_value_dim = layer.values.shape[-1] if getattr(layer, "values", None) is not None else value_dim
-            cache_key_dim = layer.keys.shape[-1] if getattr(layer, "keys", None) is not None else key_states.shape[-1]
-            if cache_value_dim > value_dim:
-                value_states_cache = F.pad(value_states, [0, cache_value_dim - value_dim])
-            if cache_key_dim > key_states.shape[-1]:
-                key_states_cache = F.pad(key_states, [0, cache_key_dim - key_states.shape[-1]])
+        if compressed_kvs is not None:
             cache_kwargs = {
                 "position_ids": position_ids,
                 "batch_index": batch_index,
@@ -166,14 +149,47 @@ class QEffGlm4MoeLiteAttention(Glm4MoeLiteAttention):
             }
             if attention_mask is not None:
                 cache_kwargs["CCL"] = attention_mask.shape[-1]
-            key_states, value_states = past_key_values.update(
-                key_states_cache,
-                value_states_cache,
+            compressed_kv = compressed_kvs.update_ckv(compressed_kv, self.layer_idx, cache_kwargs)
+            k_rot = compressed_kvs.update_k_pe(k_rot, self.layer_idx, cache_kwargs)
+            past_key_values = None
+
+        if past_key_values is not None:
+            ckv_cache = compressed_kv
+            k_rot_cache = k_rot
+            layer = past_key_values.layers[self.layer_idx]
+            cache_ckv_dim = layer.keys.shape[-1] if getattr(layer, "keys", None) is not None else ckv_cache.shape[-1]
+            cache_kpe_dim = (
+                layer.values.shape[-1] if getattr(layer, "values", None) is not None else k_rot_cache.shape[-1]
+            )
+            if cache_ckv_dim > ckv_cache.shape[-1]:
+                ckv_cache = F.pad(ckv_cache, [0, cache_ckv_dim - ckv_cache.shape[-1]])
+            if cache_kpe_dim > k_rot_cache.shape[-1]:
+                k_rot_cache = F.pad(k_rot_cache, [0, cache_kpe_dim - k_rot_cache.shape[-1]])
+            cache_kwargs = {
+                "position_ids": position_ids,
+                "batch_index": batch_index,
+                "cache_position": cache_position,
+            }
+            if attention_mask is not None:
+                cache_kwargs["CCL"] = attention_mask.shape[-1]
+            compressed_kv, k_rot = past_key_values.update(
+                ckv_cache,
+                k_rot_cache,
                 self.layer_idx,
                 cache_kwargs,
             )
-            key_states = key_states[..., : query_states.shape[-1]]
-            value_states = value_states[..., :value_dim]
+            compressed_kv = compressed_kv[..., : self.kv_lora_rank]
+            k_rot = k_rot[..., : self.qk_rope_head_dim]
+
+        ckv_seq_len = compressed_kv.shape[1]
+        kva = self.kv_a_layernorm(compressed_kv)
+        key_shape = (batch_size, ckv_seq_len, -1, self.qk_nope_head_dim + self.v_head_dim)
+        k_pass = self.kv_b_proj(kva).view(key_shape).transpose(1, 2)
+        k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+        query_states = torch.cat((q_nope, q_rot), dim=-1)
+        key_states = torch.cat((k_pass, k_rot), dim=-1)
 
         attn_output, attn_weights = _qeff_attention_forward(
             query_states=query_states,
@@ -194,22 +210,19 @@ class QEffGlm4MoeLiteAttention(Glm4MoeLiteAttention):
         attention_mask: torch.Tensor | None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Cache | None = None,
+        compressed_kvs: Optional[QEffDynamicCompressedKVRopeCache] = None,
         batch_index: Optional[torch.LongTensor] = None,
         cache_position: torch.LongTensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
-        # MLA absorption path only for decode token-step.
-        if (
-            getattr(self, "q_nope_from_q_a", None) is not None
-            and hidden_states.shape[1] == 1
-            and kwargs.get("enable_mla", False)
-            and kwargs.get("mla_absorption", {}).get("enable", True)
-        ):
+        use_mla_absorption = kwargs.get("enable_mla", False) and kwargs.get("mla_absorption", {}).get("enable", True)
+        if getattr(self, "q_nope_from_q_a", None) is not None and use_mla_absorption and hidden_states.shape[1] == 1:
             attn_output, attn_weights = self._decode_absorption(
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                compressed_kvs=compressed_kvs,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 batch_index=batch_index,
@@ -228,12 +241,13 @@ class QEffGlm4MoeLiteAttention(Glm4MoeLiteAttention):
         q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        compressed_kv, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
-        k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
+        k_pass = self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(key_shape).transpose(1, 2)
         k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
+        k_rot_for_cache = k_rot
 
         cos, sin = position_embeddings
         if self.config.rope_interleave:
@@ -241,6 +255,17 @@ class QEffGlm4MoeLiteAttention(Glm4MoeLiteAttention):
         else:
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+
+        if compressed_kvs is not None:
+            cache_kwargs = {
+                "position_ids": position_ids,
+                "batch_index": batch_index,
+                "cache_position": cache_position,
+            }
+            if attention_mask is not None:
+                cache_kwargs["CCL"] = attention_mask.shape[-1]
+            compressed_kvs.update_ckv(compressed_kv, self.layer_idx, cache_kwargs)
+            compressed_kvs.update_k_pe(k_rot_for_cache, self.layer_idx, cache_kwargs)
 
         query_states = torch.cat((q_pass, q_rot), dim=-1)
         key_states = torch.cat((k_pass, k_rot), dim=-1)
@@ -292,6 +317,7 @@ class QEffGlm4MoeLiteDecoderLayer(Glm4MoeLiteDecoderLayer):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
+        compressed_kvs: Optional[QEffDynamicCompressedKVRopeCache] = None,
         batch_index: Optional[torch.LongTensor] = None,
         use_cache: bool | None = False,
         cache_position: torch.LongTensor | None = None,
@@ -306,6 +332,7 @@ class QEffGlm4MoeLiteDecoderLayer(Glm4MoeLiteDecoderLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            compressed_kvs=compressed_kvs,
             batch_index=batch_index,
             use_cache=use_cache,
             cache_position=cache_position,
@@ -360,6 +387,7 @@ class QEffGlm4MoeLiteModel(Glm4MoeLiteModel):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        compressed_kvs: Optional[List[torch.FloatTensor]] = None,
         past_key_values: Optional[Cache] = None,
         batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -382,13 +410,31 @@ class QEffGlm4MoeLiteModel(Glm4MoeLiteModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         legacy_cache = past_key_values if isinstance(past_key_values, (list, tuple)) else None
-        if use_cache and not isinstance(past_key_values, Cache) and past_key_values is not None:
-            past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
-        elif use_cache and past_key_values is None:
-            past_key_values = QEffDynamicCache()
+        enable_mla = getattr(self, "enable_mla", False)
+        if enable_mla:
+            if compressed_kvs is None and isinstance(past_key_values, QEffDynamicCompressedKVRopeCache):
+                compressed_kvs = past_key_values
+            if compressed_kvs is None and legacy_cache is not None and len(legacy_cache) > 0:
+                first = legacy_cache[0]
+                if isinstance(first, (list, tuple)) and len(first) >= 2 and first[0].dim() == 3:
+                    compressed_kvs = legacy_cache
+            if use_cache and not isinstance(compressed_kvs, QEffDynamicCompressedKVRopeCache):
+                compressed_kvs = QEffDynamicCompressedKVRopeCache.from_legacy_cache(compressed_kvs)
+            elif use_cache and compressed_kvs is None:
+                compressed_kvs = QEffDynamicCompressedKVRopeCache()
+            past_key_values = None
+        else:
+            if use_cache and not isinstance(past_key_values, Cache) and past_key_values is not None:
+                past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
+            elif use_cache and past_key_values is None:
+                past_key_values = QEffDynamicCache()
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_seen_tokens = (
+                compressed_kvs.get_seq_length()
+                if (enable_mla and compressed_kvs is not None)
+                else (past_key_values.get_seq_length() if past_key_values is not None else 0)
+            )
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
@@ -398,7 +444,12 @@ class QEffGlm4MoeLiteModel(Glm4MoeLiteModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        target_len = self._resolve_target_length(past_key_values, legacy_cache, position_ids, inputs_embeds)
+        target_len = self._resolve_target_length(
+            compressed_kvs if enable_mla else past_key_values,
+            legacy_cache,
+            position_ids,
+            inputs_embeds,
+        )
         causal_mask = _create_causal_mask(position_ids=position_ids, target_length=target_len)
 
         hidden_states = inputs_embeds
@@ -416,6 +467,7 @@ class QEffGlm4MoeLiteModel(Glm4MoeLiteModel):
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
+                compressed_kvs=compressed_kvs,
                 batch_index=batch_index,
                 use_cache=use_cache,
                 cache_position=cache_position,
@@ -429,7 +481,11 @@ class QEffGlm4MoeLiteModel(Glm4MoeLiteModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = past_key_values.to_legacy_cache() if (use_cache and past_key_values is not None) else None
+        next_cache = (
+            compressed_kvs.to_legacy_cache()
+            if (enable_mla and use_cache and compressed_kvs is not None)
+            else (past_key_values.to_legacy_cache() if (use_cache and past_key_values is not None) else None)
+        )
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states] if v is not None)
@@ -450,6 +506,7 @@ class QEffGlm4MoeLiteForCausalLM(Glm4MoeLiteForCausalLM):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        compressed_kvs: Optional[List[torch.FloatTensor]] = None,
         past_key_values: Optional[Cache] = None,
         batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -466,6 +523,7 @@ class QEffGlm4MoeLiteForCausalLM(Glm4MoeLiteForCausalLM):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            compressed_kvs=compressed_kvs,
             past_key_values=past_key_values,
             batch_index=batch_index,
             inputs_embeds=inputs_embeds,
