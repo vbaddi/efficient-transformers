@@ -425,7 +425,9 @@ def test_whisper_export_smoke(tmp_path):
 @pytest.mark.llm_model
 def test_causal_subfunction_export_smoke(tmp_path):
     model_id = CAUSAL_RUNTIME_MODEL_IDS["gpt2"]
-    model_hf = AutoModelForCausalLM.from_pretrained(model_id, **MODEL_KWARGS, low_cpu_mem_usage=False)
+    model_hf = AutoModelForCausalLM.from_pretrained(
+        model_id, **MODEL_KWARGS, low_cpu_mem_usage=False, torch_dtype=torch.float32
+    )
     model_hf.eval()
     qeff_model = QEFFAutoModelForCausalLM(model_hf)
 
@@ -453,7 +455,9 @@ def test_causal_subfunction_export_smoke(tmp_path):
 def test_causal_subfunction_export_smoke_all_models(model_type, model_id, tmp_path):
     del model_type
     try:
-        qeff_model = QEFFAutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+        qeff_model = QEFFAutoModelForCausalLM.from_pretrained(
+            model_id, trust_remote_code=True, torch_dtype=torch.float32
+        )
     except Exception as exc:
         _skip_on_model_fetch_error(exc, model_id)
 
@@ -470,6 +474,7 @@ def test_causal_subfunction_and_proxy_export_smoke_gpt2(tmp_path):
             model_id,
             trust_remote_code=True,
             enable_proxy=True,
+            torch_dtype=torch.float32,
         )
     except Exception as exc:
         _skip_on_model_fetch_error(exc, model_id)
@@ -484,7 +489,9 @@ def test_causal_subfunction_and_proxy_export_smoke_gpt2(tmp_path):
 
 @pytest.mark.llm_model
 def test_prefix_caching_continuous_batching_export_and_ort_smoke(tmp_path):
-    qeff_model = QEFFAutoModelForCausalLM.from_pretrained(PREFIX_CACHING_MODEL_ID, continuous_batching=True)
+    qeff_model = QEFFAutoModelForCausalLM.from_pretrained(
+        PREFIX_CACHING_MODEL_ID, continuous_batching=True, torch_dtype=torch.float32
+    )
     onnx_path = _exported_onnx_path(qeff_model.export(tmp_path / "prefix-caching"))
     onnx_model = onnx.load(onnx_path, load_external_data=False)
 
@@ -500,7 +507,9 @@ def test_prefix_caching_continuous_batching_export_and_ort_smoke(tmp_path):
 @pytest.mark.llm_model
 def test_awq_export_smoke(tmp_path):
     replace_transformers_quantizers()
-    model_hf = AutoModelForCausalLM.from_pretrained(TINY_AWQ_MODEL_ID, low_cpu_mem_usage=False)
+    model_hf = AutoModelForCausalLM.from_pretrained(
+        TINY_AWQ_MODEL_ID, low_cpu_mem_usage=False, torch_dtype=torch.float32
+    )
     model_hf.eval()
 
     qeff_model = QEFFAutoModelForCausalLM(model_hf, pretrained_model_name_or_path=TINY_AWQ_MODEL_ID)
@@ -515,8 +524,12 @@ def test_awq_export_smoke(tmp_path):
 def test_proxy_toggle_onnx_transform_policy_for_causal_lm():
     model_id = CAUSAL_RUNTIME_MODEL_IDS["gpt2"]
     try:
-        qeff_default = QEFFAutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
-        qeff_proxy = QEFFAutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, enable_proxy=True)
+        qeff_default = QEFFAutoModelForCausalLM.from_pretrained(
+            model_id, trust_remote_code=True, torch_dtype=torch.float32
+        )
+        qeff_proxy = QEFFAutoModelForCausalLM.from_pretrained(
+            model_id, trust_remote_code=True, enable_proxy=True, torch_dtype=torch.float32
+        )
     except Exception as exc:
         _skip_on_model_fetch_error(exc, model_id)
 
