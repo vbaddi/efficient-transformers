@@ -44,8 +44,79 @@ class QEffGptOssExperts(GptOssExperts):
         self.up_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.expert_dim))
 
 
+HMX_BLOCK = 32
+
+
+def _scatter_gather_expert_forward(
+    hidden: torch.Tensor,
+    T2Ei: torch.Tensor,
+    W_g,
+    W_u,
+    W_d,
+    b_g,
+    b_u,
+    b_d,
+    limit: float,
+    alpha: float,
+    T: int,
+    H: int,
+    hmx_block: int = HMX_BLOCK,
+) -> torch.Tensor:
+    """
+    Compute one expert contribution by compacting only active tokens.
+
+    Pipeline:
+      1) Build scatter positions from T2Ei
+      2) Scatter active tokens to top of X'
+      3) Run gated MLP in fixed-size blocks over X'[:T]
+      4) Gather results back to original token order
+      5) Mask inactive tokens to zero
+    """
+    scatter_idx = torch.cumsum(T2Ei.long(), dim=0) - 1
+
+    # 1. This avoids data-dependent control flow and keeps graph shape static.
+    safe_idx = torch.where(T2Ei, scatter_idx, torch.full_like(scatter_idx, T))
+
+    # 2. Scatter hidden rows into X'  [T+1, H]
+    X_prime = torch.zeros(T + 1, H, dtype=hidden.dtype, device=hidden.device)
+    X_prime = X_prime.scatter(
+        0,
+        safe_idx.unsqueeze(-1).expand(-1, H),
+        hidden,
+    )
+
+    # 3. HMX-blocked compute over the active prefix of X' ───────────────
+    delta_prime = torch.zeros(T, H, dtype=hidden.dtype, device=hidden.device)
+
+    num_blocks = (T + hmx_block - 1) // hmx_block
+    for blk in range(num_blocks):
+        s = blk * hmx_block
+        e_b = min(s + hmx_block, T)
+        x_blk = X_prime[s:e_b]
+
+        # Same gated MLP equations as the dense reference implementation.
+        gate = (x_blk @ W_g) + b_g
+        up = (x_blk @ W_u) + b_u
+        gate = gate.clamp(min=torch.finfo(torch.float16).min, max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        glu = gate * torch.sigmoid(gate * alpha)
+        intermediate = (up + 1) * glu
+        delta_prime[s:e_b] = (intermediate @ W_d) + b_d
+
+    # Inactive tokens have a stale scatter_idx — clamp to 0
+    gather_idx = scatter_idx.clamp(0, T - 1)
+    delta_out = delta_prime[gather_idx]
+
+    mask = T2Ei.unsqueeze(-1).expand(-1, H)
+    result = torch.where(mask, delta_out, torch.zeros_like(hidden))
+
+    return result  # [T, H]
+
+
 class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
-    def forward(self, hidden: torch.Tensor):
+    # Companion class that always uses the default helper block size.
+    # Kept separate to mirror the intended product code split.
+    def orig_forward(self, hidden: torch.Tensor):
         B, S, H = hidden.shape
         T = B * S
         hidden = hidden.view(T, H)
@@ -94,6 +165,53 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
             expert_out += down_out * routing_weight
 
         # original shape [B, S, H]
+        return expert_out.view(B, S, H), router_logits
+
+    def forward(self, hidden: torch.Tensor):
+        # Flatten to token-major representation.
+        # orig_exp, orig_rout = self.orig_forward(hidden)
+
+        B, S, H = hidden.shape
+        T = B * S
+        hidden = hidden.view(T, H)
+
+        router_logits = F.linear(hidden, self.router.weight, self.router.bias)
+        top_w, top_i = torch.topk(router_logits, self.router.top_k, dim=-1)
+        top_w = F.softmax(top_w, dim=1, dtype=top_w.dtype)
+        masked_logits = torch.zeros_like(router_logits)
+        masked_logits.scatter_(1, top_i, top_w)
+        routing_weights = masked_logits
+
+        # Routing activity matrix for expert loop.
+        T2E = routing_weights > 0
+        expert_out = hidden.new_zeros(T, H)
+
+        for e in range(self.experts.num_experts):
+            T2Ei = T2E[:, e]
+
+            delta = _scatter_gather_expert_forward(
+                hidden,
+                T2Ei,
+                self.experts.gate_proj[e],
+                self.experts.up_proj[e],
+                self.experts.down_proj[e],
+                self.experts.gate_proj_bias[e],
+                self.experts.up_proj_bias[e],
+                self.experts.down_proj_bias[e],
+                self.experts.limit,
+                self.experts.alpha,
+                T,
+                H,
+            )
+
+            routing_weight = routing_weights[:, e].unsqueeze(-1)
+            update = delta * routing_weight
+            expert_out = torch.where(
+                T2Ei.unsqueeze(-1).expand(-1, H),
+                expert_out + update,
+                expert_out,
+            )
+
         return expert_out.view(B, S, H), router_logits
 
 
