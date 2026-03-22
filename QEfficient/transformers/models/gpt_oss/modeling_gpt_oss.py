@@ -48,8 +48,8 @@ HMX_BLOCK = 32
 
 
 def _scatter_gather_expert_forward(
-    hidden: torch.Tensor,
-    T2Ei: torch.Tensor,
+    hidden: torch.Tensor,  # [T, H]
+    T2Ei: torch.Tensor,  # [T] bool
     W_g,
     W_u,
     W_d,
@@ -66,15 +66,15 @@ def _scatter_gather_expert_forward(
     Compute one expert contribution by compacting only active tokens.
 
     Pipeline:
-      1) Build scatter positions from T2Ei
-      2) Scatter active tokens to top of X'
+      1) Build scatter positions from T2Ei (token->expert activity mask)
+      2) Scatter active tokens to top of X' (T+1 rows; last row is trash)
       3) Run gated MLP in fixed-size blocks over X'[:T]
       4) Gather results back to original token order
       5) Mask inactive tokens to zero
-    """
-    scatter_idx = torch.cumsum(T2Ei.long(), dim=0) - 1
 
-    # 1. This avoids data-dependent control flow and keeps graph shape static.
+    """
+    # 1. Prefix-sum scatter indices
+    scatter_idx = torch.cumsum(T2Ei.long(), dim=0) - 1
     safe_idx = torch.where(T2Ei, scatter_idx, torch.full_like(scatter_idx, T))
 
     # 2. Scatter hidden rows into X'  [T+1, H]
@@ -85,7 +85,7 @@ def _scatter_gather_expert_forward(
         hidden,
     )
 
-    # 3. HMX-blocked compute over the active prefix of X' ───────────────
+    # 3. HMX-blocked compute over the active prefix of X'
     delta_prime = torch.zeros(T, H, dtype=hidden.dtype, device=hidden.device)
 
     num_blocks = (T + hmx_block - 1) // hmx_block
@@ -93,6 +93,7 @@ def _scatter_gather_expert_forward(
         s = blk * hmx_block
         e_b = min(s + hmx_block, T)
         x_blk = X_prime[s:e_b]
+        blk_h = e_b - s
 
         # Same gated MLP equations as the dense reference implementation.
         gate = (x_blk @ W_g) + b_g
@@ -101,9 +102,16 @@ def _scatter_gather_expert_forward(
         up = up.clamp(min=-limit, max=limit)
         glu = gate * torch.sigmoid(gate * alpha)
         intermediate = (up + 1) * glu
-        delta_prime[s:e_b] = (intermediate @ W_d) + b_d
+        blk_out = (intermediate @ W_d) + b_d
 
-    # Inactive tokens have a stale scatter_idx — clamp to 0
+        # if this block has no active tokens for expert i, emit zeros.
+        block_active = T2Ei[s:e_b].long().sum() > 0
+        delta_prime[s:e_b] = torch.where(
+            block_active,
+            blk_out,
+            torch.zeros(blk_h, H, dtype=hidden.dtype, device=hidden.device),
+        )
+
     gather_idx = scatter_idx.clamp(0, T - 1)
     delta_out = delta_prime[gather_idx]
 
