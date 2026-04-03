@@ -2848,6 +2848,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         *,
         mode: str = "decode",
         layer_index: int = 0,
+        seq_len: int = 32,
         ctx_len: int = 128,
         enable_chunking: bool = False,
     ):
@@ -2859,6 +2860,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             self,
             mode=mode,
             layer_index=layer_index,
+            seq_len=seq_len,
             ctx_len=ctx_len,
             enable_chunking=enable_chunking,
         )
