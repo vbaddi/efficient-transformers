@@ -95,6 +95,16 @@ class TestQEFFAutoModelForCausalLMBasic:
         model = make_tiny_gpt2()
         qeff = QEFFAutoModelForCausalLM(model)
         assert qeff.is_tlm is False
+        assert qeff.enable_turbo is False
+
+    def test_enable_turbo_flag_is_stored(self):
+        """enable_turbo and turbo_total_bits must be persisted on the model wrapper."""
+        from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
+
+        model = make_tiny_gpt2()
+        qeff = QEFFAutoModelForCausalLM(model, enable_turbo=True, turbo_total_bits=3)
+        assert qeff.enable_turbo is True
+        assert qeff.turbo_total_bits == 3
 
     def test_has_prefill_method(self):
         """QEFFAutoModelForCausalLM must have a prefill() method."""

@@ -48,6 +48,49 @@ This example:
 - Loads any HuggingFace text model
 - Compiles and runs inference on Cloud AI 100
 
+### llama_turbo_sample.py
+Minimal Llama example with TurboQuant enabled in `QEFFAutoModelForCausalLM`.
+
+**Usage:**
+```bash
+python llama_turbo_sample.py \
+    --model-name meta-llama/Llama-3.2-1B-Instruct \
+    --prompt "Explain prefill vs decode in one paragraph." \
+    --prefill-seq-len 32 \
+    --ctx-len 128 \
+    --generation-len 64 \
+    --num-cores 16 \
+    --turbo-total-bits 3
+```
+
+This example:
+- Enables `enable_turbo=True` in the auto class
+- Runs compile + generate on QAIC
+- Prints TTFT/decode/total throughput and measured host KV compression ratio
+
+### turbo_benchmark.py
+Reproducible baseline-vs-turbo benchmark on the same model/config.
+
+**Usage:**
+```bash
+python turbo_benchmark.py \
+    --model-name meta-llama/Llama-3.2-1B-Instruct \
+    --prompt "Write two lines about KV cache compression." \
+    --prefill-seq-len 32 \
+    --ctx-len 128 \
+    --generation-len 64 \
+    --num-cores 16 \
+    --turbo-total-bits 3 \
+    --warmup-runs 1
+```
+
+This example prints:
+- TTFT
+- Decode tokens/sec
+- Total tokens/sec
+- E2E time
+- Measured TurboQuant host KV ratio
+
 ### continuous_batching.py
 Dynamic batching for processing multiple prompts efficiently.
 

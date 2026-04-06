@@ -2652,6 +2652,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         continuous_batching: bool = False,
         qaic_config: Optional[dict] = None,
         max_seq_len_cached: Optional[int] = None,
+        enable_turbo: bool = False,
+        turbo_total_bits: int = 3,
         **kwargs,
     ):
         """
@@ -2707,6 +2709,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         self.num_layers = model.config.num_hidden_layers
         self.continuous_batching = continuous_batching
         self.model.qaic_config = qaic_config
+        self.enable_turbo = enable_turbo
+        self.turbo_total_bits = turbo_total_bits
         self.model, transformed = SpDTransform.apply(self.model, qaic_config, **kwargs)
         self.is_tlm = transformed
 
@@ -2716,6 +2720,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             self.ccl_enabled = qaic_config.get("ccl_enabled", False)
         self.comp_ctx_lengths_prefill, self.comp_ctx_lengths_decode = None, None
         self.hash_params["max_seq_len_cached"] = max_seq_len_cached
+        self.hash_params["enable_turbo"] = enable_turbo
+        self.hash_params["turbo_total_bits"] = turbo_total_bits
 
         # ---Sampling---
         # Note: SamplerTransform should be applied after all other transforms
@@ -2741,6 +2747,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         continuous_batching: bool = False,
         qaic_config: Optional[dict] = None,
         max_seq_len_cached: Optional[int] = None,
+        enable_turbo: bool = False,
+        turbo_total_bits: int = 3,
         *args,
         **kwargs,
     ):
@@ -2815,6 +2823,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
                 qaic_config=qaic_config,
                 continuous_batching=continuous_batching,
+                enable_turbo=enable_turbo,
+                turbo_total_bits=turbo_total_bits,
                 **kwargs,
             )
         return cls(
@@ -2823,6 +2833,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             qaic_config=qaic_config,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             max_seq_len_cached=max_seq_len_cached,
+            enable_turbo=enable_turbo,
+            turbo_total_bits=turbo_total_bits,
             **kwargs,
         )
 
@@ -3480,6 +3492,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 iteration=kwargs.pop("iteration", 1),
                 is_tlm=self.is_tlm,
                 write_io_dir=self._write_io_dir,
+                enable_turbo=self.enable_turbo,
+                turbo_total_bits=self.turbo_total_bits,
                 **kwargs,
             )
         else:

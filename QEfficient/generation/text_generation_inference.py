@@ -7,6 +7,7 @@
 
 import json
 import os
+import re
 from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
@@ -17,6 +18,7 @@ import transformers
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from QEfficient.generation.cloud_infer import QAICInferenceSession
+from QEfficient.generation.turboquant import TurboQuantPytorchCodec, TurboQuantStatsTracker
 from QEfficient.utils import padding_check_and_fix
 from QEfficient.utils.constants import Constants
 from QEfficient.utils.logging_utils import logger
@@ -57,6 +59,7 @@ class CloudAI100ExecInfo:
     generated_texts: Union[List[str], List[List[str]]]
     generated_ids: Union[List[np.ndarray], np.ndarray]
     perf_metrics: PerfMetrics
+    turbo_metrics: Optional[Dict[str, Any]] = None
 
     def __repr__(self):
         return f"Average Prefill time a.k.a TTFT is= {round(self.perf_metrics.prefill_time, 2)} sec\
@@ -331,6 +334,8 @@ def cloud_ai_100_exec_kv(
     return_pdfs: bool = False,
     include_guided_decoding: bool = False,
     sampling_params: Optional[Dict[str, Any]] = None,
+    enable_turbo: bool = False,
+    turbo_total_bits: int = 3,
 ):
     """
     This method generates output until ``eos`` or ``generation_len`` by executing the compiled ``qpc`` on ``Cloud AI 100`` Hardware cards.
@@ -399,6 +404,8 @@ def cloud_ai_100_exec_kv(
         return_pdfs=return_pdfs,
         include_guided_decoding=include_guided_decoding,
         sampling_params=sampling_params,
+        enable_turbo=enable_turbo,
+        turbo_total_bits=turbo_total_bits,
     )
 
     for _ in range(0, int(iteration)):
@@ -413,12 +420,25 @@ def cloud_ai_100_exec_kv(
             total_time = np.average([info.perf_metrics.total_time for info in exec_info])
             generated_texts = [info.generated_texts for info in exec_info]
             generated_ids = [info.generated_ids for info in exec_info]
+            turbo_metrics = None
+            turbo_infos = [info.turbo_metrics for info in exec_info if info.turbo_metrics]
+            if turbo_infos:
+                turbo_metrics = dict(turbo_infos[0])
+                if all("fp16_bytes" in tm and "compressed_bytes" in tm for tm in turbo_infos):
+                    fp16_bytes = float(sum(tm["fp16_bytes"] for tm in turbo_infos))
+                    compressed_bytes = float(sum(tm["compressed_bytes"] for tm in turbo_infos))
+                    turbo_metrics["fp16_bytes"] = fp16_bytes
+                    turbo_metrics["compressed_bytes"] = compressed_bytes
+                    turbo_metrics["compression_ratio"] = fp16_bytes / compressed_bytes if compressed_bytes > 0 else 1.0
+                    turbo_metrics["fp16_mb"] = fp16_bytes / (1024 * 1024)
+                    turbo_metrics["compressed_mb"] = compressed_bytes / (1024 * 1024)
 
             exec_info = CloudAI100ExecInfo(
                 batch_size=batch_size,
                 generated_texts=generated_texts,
                 generated_ids=generated_ids,
                 perf_metrics=PerfMetrics(prefill_time, decode_perf, total_perf, total_time),
+                turbo_metrics=turbo_metrics,
             )
         else:
             exec_info = generate_text.generate(
@@ -448,6 +468,8 @@ class QEffTextGenerationBase:
         return_pdfs: bool = False,
         include_guided_decoding: bool = False,
         sampling_params: Optional[Dict[str, Any]] = None,
+        enable_turbo: bool = False,
+        turbo_total_bits: int = 3,
         activate: bool = True,
     ) -> None:
         self._ctx_len = ctx_len
@@ -482,6 +504,53 @@ class QEffTextGenerationBase:
 
         # Initialize the storage variables.
         self.batch_index = None
+        self.enable_turbo = enable_turbo
+        self._turbo_host_kv_mode = False
+        self._turbo_tracker = None
+        self._turbo_codec = None
+        self._turbo_compressed_cache = {}
+        self._turbo_report_printed = False
+        self._turbo_actual_report_printed = False
+        self._turbo_last_fp16_bytes = 0.0
+        self._turbo_last_compressed_bytes = 0.0
+        self._turbo_last_ratio = 1.0
+        self._past_kv_input_names = sorted(
+            [x for x in self._session.input_names if x.startswith("past_key.") or x.startswith("past_value.")]
+        )
+        self._past_kv_output_names = sorted(
+            [
+                x
+                for x in self._session.output_names
+                if (x.startswith("past_key.") or x.startswith("past_value.")) and x.endswith("_RetainedState")
+            ]
+        )
+
+        if self.enable_turbo:
+            n_layers, n_heads, head_dim = self._infer_kv_geometry()
+            exec_bs = self.full_batch_size if self.full_batch_size is not None else self.batch_size
+            self._turbo_tracker = TurboQuantStatsTracker(
+                n_layers=n_layers,
+                n_heads=n_heads,
+                head_dim=head_dim,
+                batch_size=exec_bs,
+                total_bits=turbo_total_bits,
+            )
+            supported, reason = self._turbo_tracker.is_supported()
+            if not supported:
+                logger.warning(f"enable_turbo=True but TurboQuant is disabled: {reason}")
+            elif self.full_batch_size is not None:
+                logger.warning(
+                    "enable_turbo=True requested with continuous batching. "
+                    "Host-side TurboQuant KV path is currently only enabled for non-CB execution."
+                )
+            else:
+                self._turbo_codec = TurboQuantPytorchCodec(head_dim=head_dim, total_bits=turbo_total_bits)
+                codec_supported, codec_reason = self._turbo_codec.is_supported()
+                if not codec_supported:
+                    logger.warning(f"enable_turbo=True but PyTorch codec is disabled: {codec_reason}")
+                else:
+                    self._turbo_host_kv_mode = True
+                    logger.info("TurboQuant host KV mode enabled: prefill/decode will use compressed host KV cache.")
 
         # Variables to be re-initialized for every run
         # These parameters will be initialized in initialize_lora_id_mapping method
@@ -495,10 +564,132 @@ class QEffTextGenerationBase:
 
         self.tokenizer = tokenizer
         self._set_tokenizer_params()  # set tokenizer params
-        # Skip inputs/outputs
-        self._session.skip_buffers(
-            [x for x in self._session.input_names + self._session.output_names if x.startswith("past_")]
-        )
+        if self._turbo_host_kv_mode:
+            self._reset_turbo_cache()
+        else:
+            # Skip inputs/outputs
+            self._session.skip_buffers(
+                [x for x in self._session.input_names + self._session.output_names if x.startswith("past_")]
+            )
+
+    def _infer_kv_geometry(self) -> tuple[int, int, int]:
+        key_names = set()
+        layer_ids = set()
+        n_heads = 0
+        head_dim = 0
+        pattern = re.compile(r"past_key\.(\d+)(?:_RetainedState)?$")
+
+        for name in self._session.input_names + self._session.output_names:
+            match = pattern.match(name)
+            if not match:
+                continue
+            key_names.add(name)
+            layer_ids.add(int(match.group(1)))
+
+        if key_names:
+            sample_name = sorted(key_names)[0]
+            idx = self._session.binding_index_map.get(sample_name)
+            if idx is not None:
+                if self._session.allowed_shapes:
+                    dims = self._session.allowed_shapes[0][idx][1]
+                else:
+                    dims = self._session.bindings[idx].dims
+                if len(dims) == 4:
+                    n_heads = int(dims[1])
+                    head_dim = int(dims[3])
+                elif len(dims) == 3:
+                    n_heads = 1
+                    head_dim = int(dims[2])
+
+        n_layers = len(layer_ids)
+        return n_layers, n_heads, head_dim
+
+    def _maybe_print_turbo_report(self, stage: str, seq_len: int) -> None:
+        if not self.enable_turbo or self._turbo_tracker is None or self._turbo_report_printed:
+            return
+        stats = self._turbo_tracker.estimate(stage=stage, seq_len=seq_len)
+        print(TurboQuantStatsTracker.format_report(stats), flush=True)
+        self._turbo_report_printed = True
+
+    def _zero_kv_cache_inputs(self) -> Dict[str, np.ndarray]:
+        zeros = {}
+        for name in self._past_kv_input_names:
+            idx = self._session.binding_index_map[name]
+            binding = self._session.bindings[idx]
+            dtype = self._session.aic_to_np_dtype_mapping[binding.type]
+            zeros[name] = np.zeros(tuple(binding.dims), dtype=dtype)
+        return zeros
+
+    def _reset_turbo_cache(self) -> None:
+        if not self._turbo_host_kv_mode:
+            return
+        self._turbo_compressed_cache = {}
+        self._turbo_last_fp16_bytes = 0.0
+        self._turbo_last_compressed_bytes = 0.0
+        self._turbo_last_ratio = 1.0
+        self._session.set_buffers(self._zero_kv_cache_inputs())
+
+    def _update_turbo_cache_from_outputs(self, outputs: Dict[str, np.ndarray]) -> None:
+        if not self._turbo_host_kv_mode or self._turbo_codec is None:
+            return
+        kv_outputs = {k: v for k, v in outputs.items() if k in self._past_kv_output_names}
+        if not kv_outputs:
+            return
+        self._turbo_compressed_cache = self._turbo_codec.compress_cache(kv_outputs)
+
+        if not self._turbo_actual_report_printed:
+            fp16_bytes = float(sum(v.nbytes for v in kv_outputs.values()))
+            turbo_bytes = float(self._turbo_codec.compressed_cache_bytes(self._turbo_compressed_cache))
+            ratio = fp16_bytes / turbo_bytes if turbo_bytes > 0 else 1.0
+            self._turbo_last_fp16_bytes = fp16_bytes
+            self._turbo_last_compressed_bytes = turbo_bytes
+            self._turbo_last_ratio = ratio
+            line = "=" * 69
+            print(
+                f"\n{line}\n"
+                f"TurboQuant Host KV Cache (measured)\n"
+                f"KV FP16 size     : {fp16_bytes / (1024 * 1024):.2f} MB\n"
+                f"KV TurboQuant size: {turbo_bytes / (1024 * 1024):.2f} MB\n"
+                f"compression ratio: {ratio:.2f}x\n"
+                f"{line}\n",
+                flush=True,
+            )
+            self._turbo_actual_report_printed = True
+        else:
+            fp16_bytes = float(sum(v.nbytes for v in kv_outputs.values()))
+            turbo_bytes = float(self._turbo_codec.compressed_cache_bytes(self._turbo_compressed_cache))
+            ratio = fp16_bytes / turbo_bytes if turbo_bytes > 0 else 1.0
+            self._turbo_last_fp16_bytes = fp16_bytes
+            self._turbo_last_compressed_bytes = turbo_bytes
+            self._turbo_last_ratio = ratio
+
+    def _inject_turbo_cache_inputs(self, inputs: Dict[str, np.ndarray]) -> None:
+        if not self._turbo_host_kv_mode or self._turbo_codec is None:
+            return
+        if self._turbo_compressed_cache:
+            inputs.update(self._turbo_codec.decompress_cache(self._turbo_compressed_cache))
+
+    def get_turbo_metrics(self) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
+            "requested": bool(self.enable_turbo),
+            "host_kv_mode": bool(self._turbo_host_kv_mode),
+            "total_bits": int(self._turbo_codec.total_bits) if self._turbo_codec is not None else None,
+        }
+        if self._turbo_tracker is not None:
+            supported, reason = self._turbo_tracker.is_supported()
+            metrics["supported"] = bool(supported)
+            metrics["reason"] = reason
+        else:
+            metrics["supported"] = False
+            metrics["reason"] = "TurboQuant tracker was not initialized"
+
+        if self._turbo_last_fp16_bytes > 0:
+            metrics["fp16_bytes"] = float(self._turbo_last_fp16_bytes)
+            metrics["compressed_bytes"] = float(self._turbo_last_compressed_bytes)
+            metrics["compression_ratio"] = float(self._turbo_last_ratio)
+            metrics["fp16_mb"] = float(self._turbo_last_fp16_bytes / (1024 * 1024))
+            metrics["compressed_mb"] = float(self._turbo_last_compressed_bytes / (1024 * 1024))
+        return metrics
 
     def _set_tokenizer_params(self):
         """
@@ -652,6 +843,7 @@ class QEffTextGenerationBase:
                 batch_lora_ids = [self._prompt_to_lora_id_mapping_decode.popleft() for i in range(self.batch_size)]
                 decode_inputs["lora_ids"] = np.array(batch_lora_ids, dtype=np.int64).reshape(self.batch_size, 1)
 
+        self._inject_turbo_cache_inputs(decode_inputs)
         return decode_inputs
 
     def _fetch_next_token_id(self, outputs):
@@ -683,6 +875,9 @@ class QEffTextGenerationBase:
         self.decode_input_ids = np.zeros((execution_batch_size, 1), np.int64)
         self.decode_pos_ids = np.zeros((execution_batch_size, 1), np.int64)
         self.generation_len = np.zeros((execution_batch_size, 1), np.int64)
+        self._turbo_report_printed = False
+        self._turbo_actual_report_printed = False
+        self._reset_turbo_cache()
 
     def initialize_lora_id_mapping(self, prompt_to_lora_id_mapping):
         """
@@ -780,6 +975,7 @@ class QEffTextGenerationBase:
         # Run prefill
         inputs = self.tokenizer(prompt, return_tensors="np", padding=True)
         position_ids = inputs["attention_mask"].sum(1, keepdims=True)
+        self._maybe_print_turbo_report(stage="prefill", seq_len=int(position_ids.max()))
         padded_len = inputs["input_ids"].shape[1]
         num_chunks = -(padded_len // -self._prefill_seq_len)  # ceil divide without float
         padded_len = num_chunks * self._prefill_seq_len  # Convert to a multiple of prompt_len
@@ -840,7 +1036,9 @@ class QEffTextGenerationBase:
             ]
             if self.include_sampler:
                 chunk_inputs["last_accepted_output_tokens"] = chunk_inputs["input_ids"]
+            self._inject_turbo_cache_inputs(chunk_inputs)
             outputs = self._session.run(chunk_inputs)
+            self._update_turbo_cache_from_outputs(outputs)
 
             if self._write_io_dir is not None:
                 write_io_files(inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
@@ -902,6 +1100,7 @@ class QEffTextGenerationBase:
 
         while prompt_queue or current_decode_ongoing.any():
             outputs = self._session.run(decode_inputs)
+            self._update_turbo_cache_from_outputs(outputs)
 
             # Prepare inputs for next iteration
             next_token_id = self._fetch_next_token_id(outputs)
@@ -973,6 +1172,7 @@ class QEffTextGenerationBase:
                             decode_inputs["comp_ctx_lengths"] = self.list_of_comp_ctx_lengths_decode[ccl_id]
 
                     generated_id_current_index[decode_batch_id] += 1
+            self._inject_turbo_cache_inputs(decode_inputs)
 
         return decode_pause_time
 
@@ -1013,6 +1213,7 @@ class QEffTextGenerationBase:
             if streamer:
                 streamer.put(decode_inputs["input_ids"][0])
             outputs = self._session.run(decode_inputs)
+            self._update_turbo_cache_from_outputs(outputs)
 
             if self._write_io_dir is not None:
                 write_io_files(decode_inputs, outputs, self._write_io_dir, "decode", "aic_batch_io", True, False)
@@ -1026,6 +1227,7 @@ class QEffTextGenerationBase:
             finished_sequences |= decode_inputs["input_ids"] == self.tokenizer.eos_token_id
             if self.include_sampler:
                 decode_inputs["last_accepted_output_tokens"] = decode_inputs["input_ids"]
+            self._inject_turbo_cache_inputs(decode_inputs)
 
             if finished_sequences.all() and not automation:
                 break
@@ -1048,6 +1250,7 @@ class QEffTextGenerationBase:
         for num_token in range(1, generation_len):
             yield decode_inputs["input_ids"]
             outputs = self._session.run(decode_inputs)
+            self._update_turbo_cache_from_outputs(outputs)
 
             if self._write_io_dir is not None:
                 write_io_files(decode_inputs, outputs, self._write_io_dir, "decode", "aic_batch_io", True, False)
@@ -1058,6 +1261,7 @@ class QEffTextGenerationBase:
             decode_inputs["position_ids"] += 1
             self.generated_ids[:, num_token] = decode_inputs["input_ids"].squeeze(1)
             finished_sequences |= decode_inputs["input_ids"] == self.tokenizer.eos_token_id
+            self._inject_turbo_cache_inputs(decode_inputs)
 
             if finished_sequences.all() and not automation:
                 break
@@ -1081,6 +1285,8 @@ class TextGeneration:
         return_pdfs: bool = False,
         include_guided_decoding: bool = False,
         sampling_params: Optional[Dict[str, Any]] = None,
+        enable_turbo: bool = False,
+        turbo_total_bits: int = 3,
     ) -> None:
         self._qaic_model = QEffTextGenerationBase(
             tokenizer=tokenizer,
@@ -1097,6 +1303,8 @@ class TextGeneration:
             return_pdfs=return_pdfs,
             include_guided_decoding=include_guided_decoding,
             sampling_params=sampling_params,
+            enable_turbo=enable_turbo,
+            turbo_total_bits=turbo_total_bits,
         )
         self._full_batch_size = self._qaic_model.full_batch_size
         self._tokenizer = self._qaic_model.tokenizer
@@ -1315,5 +1523,6 @@ class TextGeneration:
             generated_texts=generated_texts,
             generated_ids=self._qaic_model.generated_ids,
             perf_metrics=perf_metrics,
+            turbo_metrics=self._qaic_model.get_turbo_metrics(),
         )
         return latency_stats
