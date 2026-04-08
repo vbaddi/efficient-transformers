@@ -78,6 +78,24 @@ from QEfficient.utils.logging_utils import logger
 from QEfficient.utils.sampler_utils import get_sampling_inputs_and_outputs
 
 
+def _is_retained_state_name(name: str) -> bool:
+    return name.endswith("_RetainedState") or name.endswith("_InternalRetainedState")
+
+
+def _strip_retained_state_suffix(name: str) -> str:
+    if name.endswith("_InternalRetainedState"):
+        return name[: -len("_InternalRetainedState")]
+    if name.endswith("_RetainedState"):
+        return name[: -len("_RetainedState")]
+    return name
+
+
+def _compiled_retained_output_name(name: str, use_onnx_subfunctions: bool) -> str:
+    if use_onnx_subfunctions and name.endswith("_RetainedState") and ("key" in name or "value" in name):
+        return name[: -len("_RetainedState")] + "_InternalRetainedState"
+    return name
+
+
 class QEFFTransformersBase(QEFFBaseModel):
     """
     Base class for QEfficient wrappers around HuggingFace transformer models.
@@ -1712,15 +1730,17 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             custom_io_lang = {}
             # Inputs
             for output_name in output_names["lang"]:
-                if output_name.endswith("_RetainedState"):
-                    custom_io_lang[output_name[: -len("_RetainedState")]] = (
+                if _is_retained_state_name(output_name):
+                    custom_io_lang[_strip_retained_state_suffix(output_name)] = (
                         "float16" if "vision_embeds" in output_name else kv_cache_dtype
                     )
 
             # outputs
             for output_name in output_names["lang"]:
-                if output_name.endswith("_RetainedState"):
-                    custom_io_lang[output_name] = "float16" if "vision_embeds" in output_name else kv_cache_dtype
+                if _is_retained_state_name(output_name):
+                    custom_io_lang[_compiled_retained_output_name(output_name, lang_use_onnx_subfunctions)] = (
+                        "float16" if "vision_embeds" in output_name else kv_cache_dtype
+                    )
             self.lang_model._compile(
                 compile_dir=compile_dir,
                 compile_only=True,
@@ -1871,6 +1891,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             raise TypeError("Please run compile API for language model first!")
 
         lang_session = QAICInferenceSession(self.lang_model.qpc_path, device_ids, activate=False)
+        internal_retained_kv = any(name.endswith("_InternalRetainedState") for name in lang_session.output_names)
 
         if self.vision_model is not None and self.vision_model.qpc_path:
             vision_session = QAICInferenceSession(self.vision_model.qpc_path, device_ids)
@@ -1880,13 +1901,25 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         pad_token_id = 1
 
         # Skip inputs/outputs
-        lang_session.skip_buffers(
-            [
-                x
-                for x in lang_session.input_names + lang_session.output_names
-                if x.startswith("past_") or x.endswith("_RetainedState")
-            ]
-        )
+        if internal_retained_kv:
+            initial_past_buffers = {}
+            for input_name in lang_session.input_names:
+                if not input_name.startswith("past_"):
+                    continue
+                binding = lang_session.bindings[lang_session.binding_index_map[input_name]]
+                initial_past_buffers[input_name] = np.zeros(
+                    list(binding.dims),
+                    dtype=lang_session.aic_to_np_dtype_mapping[binding.type],
+                )
+            lang_session.set_buffers(initial_past_buffers)
+        else:
+            lang_session.skip_buffers(
+                [
+                    x
+                    for x in lang_session.input_names + lang_session.output_names
+                    if x.startswith("past_") or _is_retained_state_name(x)
+                ]
+            )
 
         # Read prompt and ctx len from session
         batch_size = max(
@@ -2010,13 +2043,14 @@ class _QEffAutoModelForImageTextToTextDualQPC:
 
         prefill_time = perf_counter() - lang_start + vision_end - vision_start
         # Skip inputs/outputs again
-        lang_session.skip_buffers(
-            [
-                x
-                for x in lang_session.input_names + lang_session.output_names
-                if x.startswith("past_") or x.endswith("_RetainedState")
-            ]
-        )
+        if not internal_retained_kv:
+            lang_session.skip_buffers(
+                [
+                    x
+                    for x in lang_session.input_names + lang_session.output_names
+                    if x.startswith("past_") or _is_retained_state_name(x)
+                ]
+            )
         if not_mllama:
             lang_session.skip_buffers(vision_outputs.keys())
 
@@ -2363,15 +2397,17 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
         kv_cache_dtype = "mxint8" if mxint8_kv_cache else "float16"
         # inputs
         for input_name in output_names:
-            if input_name.endswith("_RetainedState"):
-                custom_io[input_name[: -len("_RetainedState")]] = (
+            if _is_retained_state_name(input_name):
+                custom_io[_strip_retained_state_suffix(input_name)] = (
                     "float16" if "pixel_values" in input_name else kv_cache_dtype
                 )
 
         # outputs
         for output_name in output_names:
-            if output_name.endswith("_RetainedState"):
-                custom_io[output_name] = "float16" if "pixel_values" in output_name else kv_cache_dtype
+            if _is_retained_state_name(output_name):
+                custom_io[_compiled_retained_output_name(output_name, use_onnx_subfunctions)] = (
+                    "float16" if "pixel_values" in output_name else kv_cache_dtype
+                )
 
         # TODO this hould be removed once the continous batching is supported for all the models.
         compiler_options.pop("continuous_batching", None)
@@ -2497,7 +2533,7 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             [
                 x
                 for x in qpc_session.input_names + qpc_session.output_names
-                if x.startswith("past_") or x.endswith("_RetainedState")
+                if x.startswith("past_") or _is_retained_state_name(x)
             ]
         )
 
@@ -4077,13 +4113,13 @@ class QEFFAutoModelForSpeechSeq2Seq(QEFFTransformersBase, MultimodalUtilityMixin
 
         # Slice output_names to get input names
         for output_name in output_names:
-            if output_name.endswith("_RetainedState"):
-                custom_io[output_name[: -len("_RetainedState")]] = kv_cache_dtype
+            if _is_retained_state_name(output_name):
+                custom_io[_strip_retained_state_suffix(output_name)] = kv_cache_dtype
 
         # Get output names
         for output_name in output_names:
-            if output_name.endswith("_RetainedState"):
-                custom_io[output_name] = kv_cache_dtype
+            if _is_retained_state_name(output_name):
+                custom_io[_compiled_retained_output_name(output_name, use_onnx_subfunctions)] = kv_cache_dtype
 
         return self._compile(
             onnx_path=onnx_path,

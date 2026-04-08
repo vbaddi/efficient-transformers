@@ -166,8 +166,14 @@ class QAICInferenceSession:
         Args:
             :skipped_buffer_name: List[str]. List of buffer name to be skipped.
         """
-
-        self.set_buffers({k: np.array([]) for k in skipped_buffer_names})
+        empty_buffers = {}
+        for buffer_name in skipped_buffer_names:
+            if buffer_name not in self.binding_index_map:
+                continue
+            buffer_index = self.binding_index_map[buffer_name]
+            buffer_dtype = self.aic_to_np_dtype_mapping[self.bindings[buffer_index].type]
+            empty_buffers[buffer_name] = np.empty((0,), dtype=buffer_dtype)
+        self.set_buffers(empty_buffers)
 
     def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """

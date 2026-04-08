@@ -216,23 +216,32 @@ def build_initial_decoder_inputs(model, inputs, vision_embeds, ctx_len: int):
 
 
 def update_decoder_inputs(inputs: dict[str, np.ndarray], outputs: dict[str, np.ndarray], num_layers: int):
+    def retained(name: str):
+        return outputs.get(f"{name}_RetainedState", outputs[f"{name}_InternalRetainedState"])
+
     next_token = outputs["logits"].argmax(-1).astype(np.int64)
     next_inputs = {
         "input_ids": next_token,
         "position_ids": np.max(inputs["position_ids"], axis=1, keepdims=True) + 1,
         "image_idx": outputs["image_idx_output"],
-        "vision_embeds": outputs.get("vision_embeds_RetainedState", inputs["vision_embeds"]),
+        "vision_embeds": outputs.get(
+            "vision_embeds_RetainedState",
+            outputs.get("vision_embeds_InternalRetainedState", inputs["vision_embeds"]),
+        ),
         "mm_token_type_ids": np.zeros_like(next_token, dtype=inputs["mm_token_type_ids"].dtype),
     }
     for i in range(num_layers):
-        next_inputs[f"past_key.{i}"] = outputs[f"past_key.{i}_RetainedState"]
-        next_inputs[f"past_value.{i}"] = outputs[f"past_value.{i}_RetainedState"]
+        next_inputs[f"past_key.{i}"] = retained(f"past_key.{i}")
+        next_inputs[f"past_value.{i}"] = retained(f"past_value.{i}")
     return next_inputs
 
 
 def build_vlm_ort_tokens(
     model, onnx_paths, inputs, generation_len: int, ctx_len: int, prefill_seq_len: int, pad_token_id: int
 ):
+    def retained(outputs: dict[str, np.ndarray], name: str):
+        return outputs.get(f"{name}_RetainedState", outputs[f"{name}_InternalRetainedState"])
+
     vision_session = ort.InferenceSession(str(onnx_paths[0]))
     decoder_session = ort.InferenceSession(str(onnx_paths[1]))
 
@@ -269,10 +278,13 @@ def build_vlm_ort_tokens(
 
         outputs = run_ort_session(decoder_session, chunk_inputs)
         chunk_image_idx = outputs["image_idx_output"]
-        decoder_state["vision_embeds"] = outputs.get("vision_embeds_RetainedState", decoder_state["vision_embeds"])
+        decoder_state["vision_embeds"] = outputs.get(
+            "vision_embeds_RetainedState",
+            outputs.get("vision_embeds_InternalRetainedState", decoder_state["vision_embeds"]),
+        )
         for i in range(num_layers):
-            decoder_state[f"past_key.{i}"] = outputs[f"past_key.{i}_RetainedState"]
-            decoder_state[f"past_value.{i}"] = outputs[f"past_value.{i}_RetainedState"]
+            decoder_state[f"past_key.{i}"] = retained(outputs, f"past_key.{i}")
+            decoder_state[f"past_value.{i}"] = retained(outputs, f"past_value.{i}")
 
     if outputs is None:
         raise RuntimeError("No multimodal prefill chunk was executed.")

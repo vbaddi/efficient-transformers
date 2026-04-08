@@ -201,6 +201,10 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        is_prefill_with_cache = past_key_values is not None and hidden_states.shape[1] != 1
+        use_cached_prefill_context = (
+            is_prefill_with_cache and position_ids is not None and position_ids.max() >= hidden_states.shape[1]
+        )
 
         cos, sin = position_embeddings
 
@@ -209,7 +213,7 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
         query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2)
         query_states = query_states.transpose(1, 2)
 
-        if self.is_kv_shared_layer and past_key_values is not None:
+        if self.is_kv_shared_layer and past_key_values is not None and not is_prefill_with_cache:
             key_states, value_states = past_key_values.shared_layers[self.kv_shared_layer_index]
             key_states = key_states.to(query_states.device)
             value_states = value_states.to(query_states.device)
@@ -224,27 +228,24 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
             value_states = self.v_norm(value_states)
             value_states = value_states.transpose(1, 2)
 
+        attn_key_states = key_states
+        attn_value_states = value_states
+
         if past_key_values is not None:
-            if not self.is_kv_shared_layer:
-                key_states, value_states = past_key_values.update(
-                    key_states,
-                    value_states,
+            cached_key_states, cached_value_states = attn_key_states, attn_value_states
+            if is_prefill_with_cache or not self.is_kv_shared_layer:
+                cached_key_states, cached_value_states = past_key_values.update(
+                    attn_key_states,
+                    attn_value_states,
                     self.layer_idx,
                     {"position_ids": position_ids},
                 )
             if self.store_full_length_kv:
                 if not hasattr(past_key_values, "shared_layers"):
                     past_key_values.shared_layers = {}
-                past_key_values.shared_layers[self.layer_idx] = key_states, value_states
-
-        if mm_token_type_ids is not None and hidden_states.shape[1] != 1:
-            attention_mask = _build_bidirectional_vision_attention_mask(
-                position_ids=position_ids,
-                mm_token_type_ids=mm_token_type_ids,
-                target_length=key_states.shape[-2],
-                dtype=query_states.dtype,
-                sliding_window=self.sliding_window,
-            )
+                past_key_values.shared_layers[self.layer_idx] = cached_key_states, cached_value_states
+            if use_cached_prefill_context or not is_prefill_with_cache:
+                key_states, value_states = cached_key_states, cached_value_states
 
         attn_output, attn_weights = eager_attention_forward(
             self,
@@ -376,25 +377,28 @@ class QEffGemma4TextModel(Gemma4TextModel):
             )
             if isinstance(attention_mask, dict):
                 layer_attention_mask = attention_mask[layer_type]
-            elif use_mm_bidirectional_mask:
-                layer_attention_mask = None
             else:
                 sliding_window = self.config.sliding_window if layer_type == "sliding_attention" else None
-                target_length = (
-                    min(self.config.sliding_window, self.config.max_position_embeddings)
-                    if sliding_window
-                    else inputs_embeds.shape[1]
-                )
+                target_length = inputs_embeds.shape[1]
                 if past_key_values is not None and len(past_key_values.layers) > i:
                     layer_keys = past_key_values.layers[i].keys
                     if layer_keys is not None and layer_keys.numel() > 0:
                         target_length = layer_keys.shape[-2]
-                layer_attention_mask = _build_additive_attention_mask(
-                    position_ids=position_ids,
-                    target_length=target_length,
-                    dtype=hidden_states.dtype,
-                    sliding_window=sliding_window,
-                )
+                if use_mm_bidirectional_mask and sliding_window is not None:
+                    layer_attention_mask = _build_bidirectional_vision_attention_mask(
+                        position_ids=position_ids,
+                        mm_token_type_ids=kwargs.get("mm_token_type_ids"),
+                        target_length=target_length,
+                        dtype=hidden_states.dtype,
+                        sliding_window=sliding_window,
+                    )
+                else:
+                    layer_attention_mask = _build_additive_attention_mask(
+                        position_ids=position_ids,
+                        target_length=target_length,
+                        dtype=hidden_states.dtype,
+                        sliding_window=sliding_window,
+                    )
 
             hidden_states = decoder_layer(
                 hidden_states,
@@ -762,6 +766,7 @@ class QEffGemma4DecoderWrapper(nn.Module):
         **kwargs,
     ):
         del batch_index, comp_ctx_lengths, kwargs
+        input_past_key_values = past_key_values
         if past_key_values is not None and not isinstance(past_key_values, Cache):
             past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.language_model.config, past_key_values)
 
@@ -786,6 +791,16 @@ class QEffGemma4DecoderWrapper(nn.Module):
             next_image_idx = (indices1.max() + 1).reshape(1, 1)
 
         attention_mask = None
+        is_first_mm_prefill_chunk = (
+            position_ids is not None and input_ids.shape[1] != 1 and position_ids.max() < input_ids.shape[1]
+        )
+        use_mm_prefill_cache_compat = (
+            mm_token_type_ids is not None
+            and input_ids.shape[1] != 1
+            and past_key_values is not None
+            and is_first_mm_prefill_chunk
+        )
+        model_past_key_values = None if use_mm_prefill_cache_compat else past_key_values
 
         global _DISABLE_EXPORT_FP16_CLAMP
         restore_disable_clamp = _DISABLE_EXPORT_FP16_CLAMP
@@ -796,12 +811,32 @@ class QEffGemma4DecoderWrapper(nn.Module):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                past_key_values=model_past_key_values,
                 use_cache=True,
                 mm_token_type_ids=mm_token_type_ids,
             )
         finally:
             _DISABLE_EXPORT_FP16_CLAMP = restore_disable_clamp
+
+        if use_mm_prefill_cache_compat and outputs.past_key_values is not None:
+            if isinstance(input_past_key_values, Cache):
+                full_cache = QEffGemma4DynamicCache.from_cache(self.language_model.config, input_past_key_values)
+            else:
+                full_cache = QEffGemma4DynamicCache.from_legacy_cache(self.language_model.config, input_past_key_values)
+
+            returned_past_key_values = outputs.past_key_values
+            if isinstance(returned_past_key_values, Cache):
+                returned_past_key_values = returned_past_key_values.to_legacy_cache()
+
+            for layer_idx, (key_states, value_states) in enumerate(returned_past_key_values):
+                full_cache.update(
+                    key_states,
+                    value_states,
+                    layer_idx,
+                    {"position_ids": position_ids},
+                )
+            outputs.past_key_values = full_cache.to_legacy_cache()
+
         logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
         hidden_states = outputs[0][torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
         logits = self.lm_head(hidden_states)

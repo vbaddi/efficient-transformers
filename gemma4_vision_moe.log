@@ -1,0 +1,30 @@
+Loading weights:   0%|          | 0/489 [00:00<?, ?it/s]Loading weights:   5%|▌         | 26/489 [00:00<00:03, 148.67it/s]Loading weights:  14%|█▍        | 70/489 [00:00<00:01, 229.43it/s]Loading weights:  62%|██████▏   | 301/489 [00:00<00:00, 947.14it/s]Loading weights: 100%|██████████| 489/489 [00:00<00:00, 1023.35it/s]
+[1mGemma4ForConditionalGeneration LOAD REPORT[0m from: google/gemma-4-26B-A4B-it
+Key                                                                      | Status     |  | 
+-------------------------------------------------------------------------+------------+--+-
+model.language_model.layers.{6...29}.post_feedforward_layernorm.weight   | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.router.scale                        | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.mlp.up_proj.weight                  | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.input_layernorm.weight              | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.layer_scalar                        | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.self_attn.o_proj.weight             | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.self_attn.q_proj.weight             | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.post_feedforward_layernorm_2.weight | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.router.per_expert_scale             | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.router.proj.weight                  | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.pre_feedforward_layernorm_2.weight  | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.mlp.down_proj.weight                | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.mlp.gate_proj.weight                | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.self_attn.q_norm.weight             | UNEXPECTED |  | 
+model.language_model.layers.{6...28}.self_attn.v_proj.weight             | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.experts.gate_up_proj                | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.pre_feedforward_layernorm.weight    | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.self_attn.k_norm.weight             | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.post_attention_layernorm.weight     | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.self_attn.k_proj.weight             | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.experts.down_proj                   | UNEXPECTED |  | 
+model.language_model.layers.{6...29}.post_feedforward_layernorm_1.weight | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+`use_return_dict` is deprecated! Use `return_dict` instead!
