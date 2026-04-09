@@ -9,6 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional, Type, Union
 
+import numpy as np
 import onnx
 import torch
 import torch.nn as nn
@@ -67,6 +68,14 @@ def _build_additive_attention_mask(
         sliding_window=sliding_window,
     )
     return causal_mask.to(dtype=dtype) * torch.finfo(dtype).min
+
+
+def _build_chunk_local_attention_mask(position_ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    query_indices = position_ids.unsqueeze(-1)
+    kv_indices = position_ids.unsqueeze(1)
+    attention_mask = kv_indices > query_indices
+    attention_mask = attention_mask | (kv_indices < 0)
+    return attention_mask.unsqueeze(1).to(dtype=dtype) * torch.finfo(dtype).min
 
 
 def _build_bidirectional_vision_attention_mask(
@@ -201,10 +210,6 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        is_prefill_with_cache = past_key_values is not None and hidden_states.shape[1] != 1
-        use_cached_prefill_context = (
-            is_prefill_with_cache and position_ids is not None and position_ids.max() >= hidden_states.shape[1]
-        )
 
         cos, sin = position_embeddings
 
@@ -213,39 +218,40 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
         query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2)
         query_states = query_states.transpose(1, 2)
 
-        if self.is_kv_shared_layer and past_key_values is not None and not is_prefill_with_cache:
-            key_states, value_states = past_key_values.shared_layers[self.kv_shared_layer_index]
-            key_states = key_states.to(query_states.device)
-            value_states = value_states.to(query_states.device)
-        else:
-            key_states = self.k_proj(hidden_states).view(hidden_shape)
-            value_states = self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        value_states = self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
 
-            key_states = self.k_norm(key_states)
-            key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2)
-            key_states = key_states.transpose(1, 2)
+        key_states = self.k_norm(key_states)
+        key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2)
+        key_states = key_states.transpose(1, 2)
 
-            value_states = self.v_norm(value_states)
-            value_states = value_states.transpose(1, 2)
+        value_states = self.v_norm(value_states)
+        value_states = value_states.transpose(1, 2)
 
         attn_key_states = key_states
         attn_value_states = value_states
 
         if past_key_values is not None:
             cached_key_states, cached_value_states = attn_key_states, attn_value_states
-            if is_prefill_with_cache or not self.is_kv_shared_layer:
-                cached_key_states, cached_value_states = past_key_values.update(
-                    attn_key_states,
-                    attn_value_states,
-                    self.layer_idx,
-                    {"position_ids": position_ids},
-                )
+            cache_kwargs = {"position_ids": position_ids}
+            cache_context_length = kwargs.get("cache_context_length")
+            if cache_context_length is not None:
+                cache_kwargs["CCL"] = cache_context_length
+            cached_key_states, cached_value_states = past_key_values.update(
+                attn_key_states,
+                attn_value_states,
+                self.layer_idx,
+                cache_kwargs,
+            )
             if self.store_full_length_kv:
                 if not hasattr(past_key_values, "shared_layers"):
                     past_key_values.shared_layers = {}
                 past_key_values.shared_layers[self.layer_idx] = cached_key_states, cached_value_states
-            if use_cached_prefill_context or not is_prefill_with_cache:
-                key_states, value_states = cached_key_states, cached_value_states
+            key_states, value_states = cached_key_states, cached_value_states
+
+        if attention_mask is not None and attention_mask.shape[-1] != key_states.shape[-2]:
+            effective_seq_len = key_states.shape[-2]
+            attention_mask = attention_mask[:, :, :, -effective_seq_len:]
 
         attn_output, attn_weights = eager_attention_forward(
             self,
@@ -330,6 +336,7 @@ class QEffGemma4TextModel(Gemma4TextModel):
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         per_layer_inputs: Optional[torch.Tensor] = None,
+        comp_ctx_lengths: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs,
@@ -370,6 +377,8 @@ class QEffGemma4TextModel(Gemma4TextModel):
             per_layer_input = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
             layer_type = self.config.layer_types[i]
             layer_attention_mask = attention_mask
+            target_length = None
+            cache_context_length = None
             use_mm_bidirectional_mask = (
                 kwargs.get("mm_token_type_ids") is not None
                 and inputs_embeds.shape[1] != 1
@@ -379,11 +388,16 @@ class QEffGemma4TextModel(Gemma4TextModel):
                 layer_attention_mask = attention_mask[layer_type]
             else:
                 sliding_window = self.config.sliding_window if layer_type == "sliding_attention" else None
-                target_length = inputs_embeds.shape[1]
-                if past_key_values is not None and len(past_key_values.layers) > i:
-                    layer_keys = past_key_values.layers[i].keys
-                    if layer_keys is not None and layer_keys.numel() > 0:
-                        target_length = layer_keys.shape[-2]
+                if (
+                    past_key_values is not None
+                    and hasattr(past_key_values, "layers")
+                    and i < len(past_key_values.layers)
+                ):
+                    layer_cache = getattr(past_key_values.layers[i], "keys", None)
+                    if layer_cache is not None:
+                        target_length = layer_cache.shape[2]
+                if target_length is None:
+                    target_length = int(inputs_embeds.shape[1])
                 if use_mm_bidirectional_mask and sliding_window is not None:
                     layer_attention_mask = _build_bidirectional_vision_attention_mask(
                         position_ids=position_ids,
@@ -399,6 +413,9 @@ class QEffGemma4TextModel(Gemma4TextModel):
                         dtype=hidden_states.dtype,
                         sliding_window=sliding_window,
                     )
+                if comp_ctx_lengths is not None:
+                    layer_attention_mask = layer_attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
+                    cache_context_length = layer_attention_mask.shape[-1]
 
             hidden_states = decoder_layer(
                 hidden_states,
@@ -407,6 +424,7 @@ class QEffGemma4TextModel(Gemma4TextModel):
                 attention_mask=layer_attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
+                cache_context_length=cache_context_length,
                 **kwargs,
             )
 
@@ -597,13 +615,18 @@ class QEffGemma4ForCausalLM(Gemma4ForCausalLM):
         prefill_seq_len = prefill_seq_len if prefill_seq_len else 32
         ctx_len = ctx_len if ctx_len else constants.INTERN_CTX_LEN
         kv_cache_batch_size = kv_cache_batch_size or full_batch_size or batch_size
+        effective_sliding_window = (
+            min(self.config.sliding_window, ctx_len)
+            if getattr(self.config, "sliding_window", None) is not None
+            else None
+        )
 
         def build_prefill_spec(comp_ctx_lengths: Optional[int] = None):
             spec = {
                 "batch_size": 1 if continuous_batching else batch_size,
                 "seq_len": prefill_seq_len,
                 "ctx_len": ctx_len,
-                "sliding_window": self.config.sliding_window,
+                "sliding_window": effective_sliding_window,
             }
             if comp_ctx_lengths is not None:
                 spec["comp_ctx_lengths"] = comp_ctx_lengths
@@ -620,7 +643,7 @@ class QEffGemma4ForCausalLM(Gemma4ForCausalLM):
                 "batch_size": full_batch_size if continuous_batching else batch_size,
                 "seq_len": "1",
                 "ctx_len": ctx_len,
-                "sliding_window": self.config.sliding_window,
+                "sliding_window": effective_sliding_window,
             }
             if comp_ctx_lengths is not None:
                 spec["comp_ctx_lengths"] = comp_ctx_lengths
@@ -631,10 +654,14 @@ class QEffGemma4ForCausalLM(Gemma4ForCausalLM):
             return spec
 
         if comp_ctx_lengths_prefill and comp_ctx_lengths_decode:
-            specializations = [build_prefill_spec(length) for length in comp_ctx_lengths_prefill]
-            specializations.extend(build_decode_spec(length) for length in comp_ctx_lengths_decode)
+            ccl_prefill_lengths = comp_ctx_lengths_decode if prefill_seq_len == 1 else comp_ctx_lengths_prefill
+            specializations = [build_prefill_spec(length) for length in ccl_prefill_lengths]
+            if prefill_seq_len != 1:
+                specializations.extend(build_decode_spec(length) for length in comp_ctx_lengths_decode)
             return specializations
 
+        if prefill_seq_len == 1:
+            return [build_prefill_spec()]
         return [build_prefill_spec(), build_decode_spec()]
 
     def get_pkv_dynamic_axes(
@@ -765,8 +792,7 @@ class QEffGemma4DecoderWrapper(nn.Module):
         comp_ctx_lengths: Optional[List[int]] = None,
         **kwargs,
     ):
-        del batch_index, comp_ctx_lengths, kwargs
-        input_past_key_values = past_key_values
+        del batch_index, kwargs
         if past_key_values is not None and not isinstance(past_key_values, Cache):
             past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.language_model.config, past_key_values)
 
@@ -774,9 +800,12 @@ class QEffGemma4DecoderWrapper(nn.Module):
         llm_input_ids = input_ids.clone()
         llm_input_ids[special_image_mask] = self.config.text_config.pad_token_id
         inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
+        per_layer_inputs = None
+        if getattr(self.config.text_config, "hidden_size_per_layer_input", None):
+            per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids, inputs_embeds)
 
         next_image_idx = image_idx
-        if vision_embeds is not None and input_ids.shape[1] != 1 and special_image_mask.any():
+        if vision_embeds is not None:
             if vision_embeds.dim() == 2:
                 vision_embeds = vision_embeds.unsqueeze(0)
             if next_image_idx is None:
@@ -788,19 +817,11 @@ class QEffGemma4DecoderWrapper(nn.Module):
             safe_indices1 = torch.where(indices1 < 0, torch.zeros_like(indices1), indices1)
             gathered_vision_embeds = vision_embeds[indices0, safe_indices1]
             inputs_embeds = torch.where(special_image_mask.unsqueeze(-1), gathered_vision_embeds, inputs_embeds)
-            next_image_idx = (indices1.max() + 1).reshape(1, 1)
+            next_image_idx = next_image_idx.to(indices1.device) + special_image_mask.to(torch.int64).sum(
+                dim=1, keepdim=True
+            )
 
         attention_mask = None
-        is_first_mm_prefill_chunk = (
-            position_ids is not None and input_ids.shape[1] != 1 and position_ids.max() < input_ids.shape[1]
-        )
-        use_mm_prefill_cache_compat = (
-            mm_token_type_ids is not None
-            and input_ids.shape[1] != 1
-            and past_key_values is not None
-            and is_first_mm_prefill_chunk
-        )
-        model_past_key_values = None if use_mm_prefill_cache_compat else past_key_values
 
         global _DISABLE_EXPORT_FP16_CLAMP
         restore_disable_clamp = _DISABLE_EXPORT_FP16_CLAMP
@@ -808,34 +829,17 @@ class QEffGemma4DecoderWrapper(nn.Module):
             _DISABLE_EXPORT_FP16_CLAMP = True
         try:
             outputs = self.language_model(
+                per_layer_inputs=per_layer_inputs,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=model_past_key_values,
+                past_key_values=past_key_values,
+                comp_ctx_lengths=comp_ctx_lengths,
                 use_cache=True,
                 mm_token_type_ids=mm_token_type_ids,
             )
         finally:
             _DISABLE_EXPORT_FP16_CLAMP = restore_disable_clamp
-
-        if use_mm_prefill_cache_compat and outputs.past_key_values is not None:
-            if isinstance(input_past_key_values, Cache):
-                full_cache = QEffGemma4DynamicCache.from_cache(self.language_model.config, input_past_key_values)
-            else:
-                full_cache = QEffGemma4DynamicCache.from_legacy_cache(self.language_model.config, input_past_key_values)
-
-            returned_past_key_values = outputs.past_key_values
-            if isinstance(returned_past_key_values, Cache):
-                returned_past_key_values = returned_past_key_values.to_legacy_cache()
-
-            for layer_idx, (key_states, value_states) in enumerate(returned_past_key_values):
-                full_cache.update(
-                    key_states,
-                    value_states,
-                    layer_idx,
-                    {"position_ids": position_ids},
-                )
-            outputs.past_key_values = full_cache.to_legacy_cache()
 
         logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
         hidden_states = outputs[0][torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
@@ -921,6 +925,67 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
     def _get_mm_tokens_per_image(self) -> int:
         return getattr(self.config, "mm_tokens_per_image", 256)
 
+    def _get_min_multimodal_prefill_seq_len(self) -> int:
+        # Allow a small text/template prefix ahead of the contiguous image placeholder block.
+        return self._get_mm_tokens_per_image() + 32
+
+    def get_prefill_seq_lens(self, prefill_seq_len: int, kv_offload: bool = False) -> List[int]:
+        seq_lens = [prefill_seq_len if prefill_seq_len else 32]
+        if kv_offload:
+            seq_lens.append(max(seq_lens[0], self._get_min_multimodal_prefill_seq_len()))
+        return sorted(set(int(x) for x in seq_lens))
+
+    def resolve_multimodal_prefill_chunk_lens(
+        self,
+        inputs: dict,
+        prefill_seq_len: int,
+        available_prefill_seq_lens: Optional[List[int]] = None,
+    ) -> List[int]:
+        input_ids = inputs["input_ids"]
+        total_len = int(input_ids.shape[1])
+
+        mm_token_type_ids = inputs.get("mm_token_type_ids")
+        if mm_token_type_ids is None:
+            num_chunks = -(total_len // -prefill_seq_len)
+            return [prefill_seq_len] * num_chunks
+
+        if isinstance(mm_token_type_ids, np.ndarray):
+            mm_token_type_ids = torch.from_numpy(mm_token_type_ids)
+        if mm_token_type_ids.ndim == 2:
+            mm_token_type_ids = mm_token_type_ids[0]
+
+        is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+        vision_positions = torch.nonzero(is_vision, as_tuple=False).flatten()
+        if vision_positions.numel() == 0:
+            num_chunks = -(total_len // -prefill_seq_len)
+            return [prefill_seq_len] * num_chunks
+
+        required_first_chunk_len = int(vision_positions[-1].item()) + 1
+        candidate_prefill_seq_lens = (
+            sorted({int(x) for x in available_prefill_seq_lens if int(x) > 1})
+            if available_prefill_seq_lens
+            else self.get_prefill_seq_lens(prefill_seq_len, kv_offload=True)
+        )
+        first_chunk_len = next(
+            (seq_len for seq_len in candidate_prefill_seq_lens if seq_len >= required_first_chunk_len),
+            None,
+        )
+        if first_chunk_len is None:
+            raise ValueError(
+                "No compiled multimodal prefill specialization is large enough for Gemma4's image block. "
+                f"Required >= {required_first_chunk_len}, available={candidate_prefill_seq_lens}."
+            )
+
+        base_chunk_len = prefill_seq_len
+        if available_prefill_seq_lens and base_chunk_len not in candidate_prefill_seq_lens:
+            base_chunk_len = min(candidate_prefill_seq_lens)
+
+        remaining_tokens = max(total_len - first_chunk_len, 0)
+        chunk_lens = [first_chunk_len]
+        if remaining_tokens > 0:
+            chunk_lens.extend([base_chunk_len] * (-(remaining_tokens // -base_chunk_len)))
+        return chunk_lens
+
     def get_qeff_vision_encoder(self):
         return QEffGemma4EncoderWrapper(self)
 
@@ -964,15 +1029,21 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
         ctx_len = ctx_len if ctx_len else constants.INTERN_CTX_LEN
         max_patches = self._get_vision_max_patches()
         mm_tokens_per_image = self._get_mm_tokens_per_image()
+        prefill_seq_lens = self.get_prefill_seq_lens(prefill_seq_len, kv_offload=kv_offload)
+        effective_sliding_window = (
+            min(self.model.language_model.config.sliding_window, ctx_len)
+            if getattr(self.model.language_model.config, "sliding_window", None) is not None
+            else None
+        )
 
         vision = [{"batch_size": batch_size, "max_patches": max_patches}]
 
-        def build_lang_prefill_spec(comp_ctx_lengths: Optional[int] = None):
+        def build_lang_prefill_spec(seq_len: int, comp_ctx_lengths: Optional[int] = None):
             spec = {
                 "batch_size": 1 if continuous_batching else batch_size,
-                "seq_len": prefill_seq_len,
+                "seq_len": seq_len,
                 "ctx_len": ctx_len,
-                "sliding_window": self.model.language_model.config.sliding_window,
+                "sliding_window": effective_sliding_window,
                 "vision_batch_size": batch_size,
                 "vision_tokens": mm_tokens_per_image,
             }
@@ -991,7 +1062,7 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
                 "batch_size": full_batch_size if continuous_batching else batch_size,
                 "seq_len": "1",
                 "ctx_len": ctx_len,
-                "sliding_window": self.model.language_model.config.sliding_window,
+                "sliding_window": effective_sliding_window,
                 "vision_batch_size": batch_size,
                 "vision_tokens": mm_tokens_per_image,
             }
@@ -1004,10 +1075,18 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
             return spec
 
         if comp_ctx_lengths_prefill and comp_ctx_lengths_decode:
-            lang = [build_lang_prefill_spec(length) for length in comp_ctx_lengths_prefill]
-            lang.extend(build_lang_decode_spec(length) for length in comp_ctx_lengths_decode)
+            ccl_prefill_lengths = comp_ctx_lengths_decode if prefill_seq_len == 1 else comp_ctx_lengths_prefill
+            lang = [
+                build_lang_prefill_spec(seq_len, length)
+                for seq_len in prefill_seq_lens
+                for length in ccl_prefill_lengths
+            ]
+            if prefill_seq_len != 1:
+                lang.extend(build_lang_decode_spec(length) for length in comp_ctx_lengths_decode)
         else:
-            lang = [build_lang_prefill_spec(), build_lang_decode_spec()]
+            lang = [build_lang_prefill_spec(seq_len) for seq_len in prefill_seq_lens]
+            if prefill_seq_len != 1:
+                lang.append(build_lang_decode_spec())
         if kv_offload:
             return {"vision": vision, "lang": lang}, compiler_options
         return lang, compiler_options

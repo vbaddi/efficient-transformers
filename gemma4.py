@@ -1,6 +1,8 @@
 import argparse
 import copy
 import json
+from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import onnxruntime as ort
@@ -9,9 +11,17 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageText
 
 from QEfficient import QEFFAutoModelForCausalLM, QEFFAutoModelForImageTextToText
 from QEfficient.base.onnx_transforms import FP16ClipTransform
+from QEfficient.utils.cache import QEFF_HOME
 from QEfficient.utils.run_utils import ApiRunner
 
 torch.manual_seed(42)
+
+
+def build_example_artifact_dir(model_name: str, kind: str) -> Path:
+    safe_model_name = model_name.replace("/", "--")
+    artifact_dir = QEFF_HOME / "example_runs" / safe_model_name / f"{kind}-{uuid4().hex[:12]}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    return artifact_dir
 
 
 def print_perf_stats(exec_info):
@@ -42,13 +52,43 @@ def parse_device_group(device_ids):
 
 
 def resolve_effective_ctx_len(requested_ctx_len: int, prompt_len: int, generation_len: int) -> int:
-    return max(requested_ctx_len, prompt_len + generation_len)
+    required_ctx_len = prompt_len + generation_len
+    if required_ctx_len > requested_ctx_len:
+        raise ValueError(
+            f"Requested ctx_len={requested_ctx_len} is too small for prompt_len={prompt_len} "
+            f"and generation_len={generation_len}. Need at least {required_ctx_len}."
+        )
+    return requested_ctx_len
 
 
-def resolve_effective_prefill_seq_len(requested_prefill_seq_len: int, prompt_len: int, use_image: bool) -> int:
-    if not use_image:
-        return requested_prefill_seq_len
-    return max(requested_prefill_seq_len, prompt_len)
+def resolve_effective_prefill_seq_len(requested_prefill_seq_len: int, inputs, use_image: bool) -> int:
+    del inputs, use_image
+    return requested_prefill_seq_len
+
+
+def resolve_subfunction_settings(args, use_image: bool, is_moe: bool):
+    if use_image:
+        effective_vision_subfunctions = bool(args.vision_use_onnx_subfunctions and not args.disable_vision_subfunctions)
+        effective_lang_subfunctions = not args.disable_lang_subfunctions and (
+            args.use_onnx_subfunctions or args.lang_use_onnx_subfunctions or not is_moe
+        )
+        effective_use_onnx_subfunctions = effective_vision_subfunctions or effective_lang_subfunctions
+    else:
+        effective_vision_subfunctions = None
+        effective_lang_subfunctions = not args.disable_lang_subfunctions and (
+            args.use_onnx_subfunctions or args.lang_use_onnx_subfunctions or not is_moe
+        )
+        effective_use_onnx_subfunctions = effective_lang_subfunctions
+
+    return effective_use_onnx_subfunctions, effective_vision_subfunctions, effective_lang_subfunctions
+
+
+def is_gemma4_moe_config(config) -> bool:
+    return bool(
+        getattr(config, "enable_moe_block", False)
+        or (getattr(config, "num_experts", 0) or 0) > 0
+        or (getattr(config, "moe_intermediate_size", 0) or 0) > 0
+    )
 
 
 def build_messages(system_prompt: str, user_prompt: str, use_image: bool):
@@ -153,18 +193,103 @@ def run_hf_verification(
     return outputs[:, prompt_len:].cpu()
 
 
-def build_text_ort_tokens(tokenizer, config, rendered_prompt: str, onnx_path: str, generation_len: int):
-    prompt_len = int(tokenizer(rendered_prompt, return_tensors="np")["input_ids"].shape[1])
-    api_runner = ApiRunner(
-        batch_size=1,
-        tokenizer=tokenizer,
-        config=config,
-        prompt=[rendered_prompt],
-        prompt_len=prompt_len,
-        ctx_len=prompt_len + generation_len,
-        full_batch_size=None,
-    )
-    return normalize_generated_ids(api_runner.run_kv_model_on_ort(str(onnx_path)))[:, :generation_len]
+def build_text_ort_tokens(
+    tokenizer,
+    config,
+    rendered_prompt: str,
+    onnx_path: str,
+    generation_len: int,
+    prefill_seq_len: int,
+    ctx_len: int,
+):
+    def retained(outputs: dict[str, np.ndarray], name: str):
+        retained_name = f"{name}_RetainedState"
+        if retained_name in outputs:
+            return outputs[retained_name]
+        return outputs[f"{name}_InternalRetainedState"]
+
+    encoded = tokenizer(rendered_prompt, return_tensors="np")
+    input_ids = encoded["input_ids"].astype(np.int64, copy=False)
+    attention_mask = encoded["attention_mask"].astype(np.int64, copy=False)
+    input_len = int(input_ids.shape[1])
+    padded_len = int(np.ceil(input_len / prefill_seq_len) * prefill_seq_len)
+    pad_len = padded_len - input_len
+    if pad_len:
+        input_ids = np.pad(input_ids, ((0, 0), (0, pad_len)), constant_values=tokenizer.pad_token_id)
+        attention_mask = np.pad(attention_mask, ((0, 0), (0, pad_len)), constant_values=0)
+    position_ids = np.where(attention_mask, np.arange(padded_len, dtype=np.int64), -1)
+
+    past_key_values = []
+    for layer_type in config.layer_types:
+        if layer_type == "sliding_attention":
+            n_heads = config.num_key_value_heads
+            d_head = config.head_dim
+            layer_seq_len = min(config.sliding_window, ctx_len)
+        else:
+            use_alternative_attention = getattr(config, "attention_k_eq_v", False)
+            n_heads = (
+                config.num_global_key_value_heads
+                if use_alternative_attention and getattr(config, "num_global_key_value_heads", None) is not None
+                else config.num_key_value_heads
+            )
+            d_head = config.global_head_dim if getattr(config, "global_head_dim", None) else config.head_dim
+            layer_seq_len = ctx_len
+        cache_shape = (1, n_heads, layer_seq_len, d_head)
+        past_key_values.append(
+            (
+                np.zeros(cache_shape, dtype=np.float32),
+                np.zeros(cache_shape, dtype=np.float32),
+            )
+        )
+
+    session = ort.InferenceSession(str(onnx_path))
+    inputs = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+    }
+    for i, (key, value) in enumerate(past_key_values):
+        inputs[f"past_key.{i}"] = key
+        inputs[f"past_value.{i}"] = value
+
+    num_layers = len(past_key_values)
+    outputs = None
+    for chunk_start in range(0, padded_len, prefill_seq_len):
+        chunk_end = chunk_start + prefill_seq_len
+        chunk_inputs = {
+            "input_ids": inputs["input_ids"][:, chunk_start:chunk_end],
+            "position_ids": inputs["position_ids"][:, chunk_start:chunk_end],
+        }
+        for i in range(num_layers):
+            chunk_inputs[f"past_key.{i}"] = inputs[f"past_key.{i}"]
+            chunk_inputs[f"past_value.{i}"] = inputs[f"past_value.{i}"]
+        outputs = run_ort_session(session, chunk_inputs)
+        for i in range(num_layers):
+            inputs[f"past_key.{i}"] = retained(outputs, f"past_key.{i}")
+            inputs[f"past_value.{i}"] = retained(outputs, f"past_value.{i}")
+
+    if outputs is None:
+        raise RuntimeError("No text prefill chunk was executed.")
+
+    generated = [outputs["logits"].argmax(-1).astype(np.int64).reshape(-1, 1)]
+    decode_inputs = {
+        "input_ids": generated[0],
+        "position_ids": np.max(position_ids, axis=1, keepdims=True) + 1,
+    }
+    for i in range(num_layers):
+        decode_inputs[f"past_key.{i}"] = inputs[f"past_key.{i}"]
+        decode_inputs[f"past_value.{i}"] = inputs[f"past_value.{i}"]
+
+    for _ in range(1, generation_len):
+        outputs = run_ort_session(session, decode_inputs)
+        next_token = outputs["logits"].argmax(-1).astype(np.int64)
+        generated.append(next_token.reshape(-1, 1))
+        decode_inputs["input_ids"] = next_token
+        decode_inputs["position_ids"] = decode_inputs["position_ids"] + 1
+        for i in range(num_layers):
+            decode_inputs[f"past_key.{i}"] = retained(outputs, f"past_key.{i}")
+            decode_inputs[f"past_value.{i}"] = retained(outputs, f"past_value.{i}")
+
+    return np.concatenate(generated, axis=1)
 
 
 def run_ort_session(session: ort.InferenceSession, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -175,21 +300,19 @@ def run_ort_session(session: ort.InferenceSession, inputs: dict[str, np.ndarray]
     return dict(zip(output_names, outputs))
 
 
-def pad_prefill_inputs(inputs, prefill_seq_len: int, pad_token_id: int):
+def pad_prefill_inputs(inputs, padded_len: int, pad_token_id: int):
     input_ids = inputs["input_ids"]
     _, input_len = input_ids.shape
-    num_chunks = -(input_len // -prefill_seq_len)
-    padded_len = num_chunks * prefill_seq_len
     pad_len = padded_len - input_len
 
     if pad_len == 0:
-        return inputs, num_chunks
+        return inputs
 
     padded = dict(inputs)
     padded["input_ids"] = torch.nn.functional.pad(input_ids, (0, pad_len), "constant", pad_token_id)
     padded["attention_mask"] = torch.nn.functional.pad(inputs["attention_mask"], (0, pad_len), "constant", 0)
     padded["mm_token_type_ids"] = torch.nn.functional.pad(inputs["mm_token_type_ids"], (0, pad_len), "constant", 0)
-    return padded, num_chunks
+    return padded
 
 
 def build_initial_decoder_inputs(model, inputs, vision_embeds, ctx_len: int):
@@ -217,7 +340,10 @@ def build_initial_decoder_inputs(model, inputs, vision_embeds, ctx_len: int):
 
 def update_decoder_inputs(inputs: dict[str, np.ndarray], outputs: dict[str, np.ndarray], num_layers: int):
     def retained(name: str):
-        return outputs.get(f"{name}_RetainedState", outputs[f"{name}_InternalRetainedState"])
+        retained_name = f"{name}_RetainedState"
+        if retained_name in outputs:
+            return outputs[retained_name]
+        return outputs[f"{name}_InternalRetainedState"]
 
     next_token = outputs["logits"].argmax(-1).astype(np.int64)
     next_inputs = {
@@ -240,7 +366,10 @@ def build_vlm_ort_tokens(
     model, onnx_paths, inputs, generation_len: int, ctx_len: int, prefill_seq_len: int, pad_token_id: int
 ):
     def retained(outputs: dict[str, np.ndarray], name: str):
-        return outputs.get(f"{name}_RetainedState", outputs[f"{name}_InternalRetainedState"])
+        retained_name = f"{name}_RetainedState"
+        if retained_name in outputs:
+            return outputs[retained_name]
+        return outputs[f"{name}_InternalRetainedState"]
 
     vision_session = ort.InferenceSession(str(onnx_paths[0]))
     decoder_session = ort.InferenceSession(str(onnx_paths[1]))
@@ -254,23 +383,29 @@ def build_vlm_ort_tokens(
     )
     vision_embeds = vision_outputs["vision_embeds"]
 
-    padded_inputs, num_chunks = pad_prefill_inputs(inputs, prefill_seq_len, pad_token_id)
-    decoder_state = build_initial_decoder_inputs(model, padded_inputs, vision_embeds, ctx_len=ctx_len)
+    chunk_seq_lens = model.model.resolve_multimodal_prefill_chunk_lens(inputs, prefill_seq_len)
+    actual_chunk_seq_lens = []
+    remaining_tokens = int(inputs["input_ids"].shape[1])
+    for chunk_seq_len in chunk_seq_lens:
+        if remaining_tokens <= 0:
+            break
+        actual_chunk_seq_lens.append(min(chunk_seq_len, remaining_tokens))
+        remaining_tokens -= actual_chunk_seq_lens[-1]
+
+    decoder_state = build_initial_decoder_inputs(model, inputs, vision_embeds, ctx_len=ctx_len)
     num_layers = model.model.model.language_model.config.num_hidden_layers
     chunk_image_idx = np.array([[0]], dtype=np.int64)
     outputs = None
 
-    for chunk_idx in range(num_chunks):
+    chunk_start = 0
+    for chunk_seq_len in actual_chunk_seq_lens:
+        chunk_end = chunk_start + chunk_seq_len
         chunk_inputs = {
-            "input_ids": decoder_state["input_ids"][:, chunk_idx * prefill_seq_len : (chunk_idx + 1) * prefill_seq_len],
-            "position_ids": decoder_state["position_ids"][
-                :, chunk_idx * prefill_seq_len : (chunk_idx + 1) * prefill_seq_len
-            ],
+            "input_ids": decoder_state["input_ids"][:, chunk_start:chunk_end],
+            "position_ids": decoder_state["position_ids"][:, chunk_start:chunk_end],
             "vision_embeds": decoder_state["vision_embeds"],
             "image_idx": chunk_image_idx,
-            "mm_token_type_ids": decoder_state["mm_token_type_ids"][
-                :, chunk_idx * prefill_seq_len : (chunk_idx + 1) * prefill_seq_len
-            ],
+            "mm_token_type_ids": decoder_state["mm_token_type_ids"][:, chunk_start:chunk_end],
         }
         for i in range(num_layers):
             chunk_inputs[f"past_key.{i}"] = decoder_state[f"past_key.{i}"]
@@ -278,13 +413,14 @@ def build_vlm_ort_tokens(
 
         outputs = run_ort_session(decoder_session, chunk_inputs)
         chunk_image_idx = outputs["image_idx_output"]
-        decoder_state["vision_embeds"] = outputs.get(
-            "vision_embeds_RetainedState",
-            outputs.get("vision_embeds_InternalRetainedState", decoder_state["vision_embeds"]),
-        )
+        if "vision_embeds_RetainedState" in outputs:
+            decoder_state["vision_embeds"] = outputs["vision_embeds_RetainedState"]
+        elif "vision_embeds_InternalRetainedState" in outputs:
+            decoder_state["vision_embeds"] = outputs["vision_embeds_InternalRetainedState"]
         for i in range(num_layers):
             decoder_state[f"past_key.{i}"] = retained(outputs, f"past_key.{i}")
             decoder_state[f"past_value.{i}"] = retained(outputs, f"past_value.{i}")
+        chunk_start = chunk_end
 
     if outputs is None:
         raise RuntimeError("No multimodal prefill chunk was executed.")
@@ -310,6 +446,87 @@ def build_vlm_ort_tokens(
     return np.concatenate(generated, axis=1)
 
 
+def build_skip_vision_text_ort_tokens(
+    model,
+    decoder_onnx_path,
+    inputs,
+    generation_len: int,
+    ctx_len: int,
+    prefill_seq_len: int,
+    pad_token_id: int,
+):
+    decoder_session = ort.InferenceSession(str(decoder_onnx_path))
+    lang_cfg = model.model.model.language_model.config
+    mm_tokens_per_image = getattr(model.model.config, "mm_tokens_per_image", 256)
+    hidden_size = lang_cfg.hidden_size
+
+    decoder_inputs = {
+        "input_ids": inputs["input_ids"].cpu().numpy(),
+        "vision_embeds": np.zeros((1, mm_tokens_per_image, hidden_size), dtype=np.float32),
+        "position_ids": torch.where(
+            inputs["attention_mask"].bool(),
+            inputs["attention_mask"].cumsum(1) - 1,
+            torch.full_like(inputs["attention_mask"], -1),
+        )
+        .cpu()
+        .numpy(),
+        "image_idx": np.zeros((1, 1), dtype=np.int64),
+        "mm_token_type_ids": np.zeros_like(inputs["input_ids"].cpu().numpy(), dtype=np.int64),
+    }
+    past_key_values = model.model.get_dummy_pkv_cache(lang_cfg, batch_size=1, seq_len=ctx_len)
+    for i, (key, value) in enumerate(past_key_values):
+        decoder_inputs[f"past_key.{i}"] = key.cpu().numpy()
+        decoder_inputs[f"past_value.{i}"] = value.cpu().numpy()
+
+    num_layers = lang_cfg.num_hidden_layers
+    input_len = int(inputs["input_ids"].shape[1])
+    padded_len = int(np.ceil(input_len / prefill_seq_len) * prefill_seq_len)
+    pad_len = padded_len - input_len
+    if pad_len:
+        decoder_inputs["input_ids"] = np.pad(
+            decoder_inputs["input_ids"],
+            ((0, 0), (0, pad_len)),
+            constant_values=pad_token_id,
+        )
+        decoder_inputs["position_ids"] = np.pad(
+            decoder_inputs["position_ids"],
+            ((0, 0), (0, pad_len)),
+            constant_values=-1,
+        )
+        decoder_inputs["mm_token_type_ids"] = np.pad(
+            decoder_inputs["mm_token_type_ids"],
+            ((0, 0), (0, pad_len)),
+            constant_values=0,
+        )
+
+    outputs = None
+    for chunk_start in range(0, padded_len, prefill_seq_len):
+        chunk_end = chunk_start + prefill_seq_len
+        chunk_inputs = {
+            "input_ids": decoder_inputs["input_ids"][:, chunk_start:chunk_end],
+            "position_ids": decoder_inputs["position_ids"][:, chunk_start:chunk_end],
+            "vision_embeds": decoder_inputs["vision_embeds"],
+            "image_idx": decoder_inputs["image_idx"],
+            "mm_token_type_ids": decoder_inputs["mm_token_type_ids"][:, chunk_start:chunk_end],
+        }
+        for i in range(num_layers):
+            chunk_inputs[f"past_key.{i}"] = decoder_inputs[f"past_key.{i}"]
+            chunk_inputs[f"past_value.{i}"] = decoder_inputs[f"past_value.{i}"]
+
+        outputs = run_ort_session(decoder_session, chunk_inputs)
+        decoder_inputs = update_decoder_inputs(chunk_inputs, outputs, num_layers)
+
+    if outputs is None:
+        raise RuntimeError("No text prefill chunk was executed for skip_vision Gemma4 decoder.")
+
+    generated = [decoder_inputs["input_ids"].reshape(-1, 1)]
+    for _ in range(1, generation_len):
+        outputs = run_ort_session(decoder_session, decoder_inputs)
+        generated.append(outputs["logits"].argmax(-1).astype(np.int64).reshape(-1, 1))
+        decoder_inputs = update_decoder_inputs(decoder_inputs, outputs, num_layers)
+    return np.concatenate(generated, axis=1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gemma4 text-only or image+text QAic example.")
     parser.add_argument("--model-name", type=str, default="tiny-random/gemma-4-dense")
@@ -324,6 +541,8 @@ def main():
     parser.add_argument("--use-onnx-subfunctions", action="store_true")
     parser.add_argument("--vision-use-onnx-subfunctions", action="store_true")
     parser.add_argument("--lang-use-onnx-subfunctions", action="store_true")
+    parser.add_argument("--disable-vision-subfunctions", action="store_true")
+    parser.add_argument("--disable-lang-subfunctions", action="store_true")
     parser.add_argument("--mxfp6-matmul", action="store_true")
     parser.add_argument("--mxint8-kv-cache", action="store_true")
     parser.add_argument("--aic-enable-depth-first", action="store_true")
@@ -342,7 +561,7 @@ def main():
     rendered_prompt, inputs = prepare_inputs(processor, args.system_prompt, args.prompt, args.image)
     prompt_len = int(inputs["input_ids"].shape[1])
     effective_ctx_len = resolve_effective_ctx_len(args.ctx_len, prompt_len, args.generation_len)
-    effective_prefill_seq_len = resolve_effective_prefill_seq_len(args.prefill_seq_len, prompt_len, use_image)
+    effective_prefill_seq_len = resolve_effective_prefill_seq_len(args.prefill_seq_len, inputs, use_image)
     effective_fp16clip = args.enable_fp16clip or use_image
     effective_convert_to_fp16 = True
     npi_mode = "enabled" if args.enable_npi else "disabled" if args.disable_npi else "auto"
@@ -350,6 +569,8 @@ def main():
     hf_ids = None
     ort_ids = None
     onnx_paths = None
+    export_dir = build_example_artifact_dir(args.model_name, "export")
+    compile_dir = build_example_artifact_dir(args.model_name, "compile")
 
     if use_image:
         model = QEFFAutoModelForImageTextToText.from_pretrained(
@@ -359,6 +580,13 @@ def main():
             skip_vision=False,
             dtype="float32",
         )
+        lang_config = getattr(getattr(model.model, "model", None), "language_model", None).config
+        is_moe = is_gemma4_moe_config(lang_config)
+        (
+            effective_use_onnx_subfunctions,
+            effective_vision_subfunctions,
+            effective_lang_subfunctions,
+        ) = resolve_subfunction_settings(args, use_image, is_moe)
         if not effective_fp16clip:
             model.lang_model._onnx_transforms = [
                 t for t in model.lang_model._onnx_transforms if t is not FP16ClipTransform
@@ -371,9 +599,10 @@ def main():
             hf_ids = run_hf_verification(args.model_name, hf_inputs, args.generation_len, args.reference_dtype, True)
 
         onnx_paths = model.export(
-            use_onnx_subfunctions=True,
-            vision_use_onnx_subfunctions=False,
-            lang_use_onnx_subfunctions=True,
+            export_dir=export_dir,
+            use_onnx_subfunctions=effective_use_onnx_subfunctions,
+            vision_use_onnx_subfunctions=effective_vision_subfunctions,
+            lang_use_onnx_subfunctions=effective_lang_subfunctions,
         )
         if args.verify_ort:
             ort_ids = build_vlm_ort_tokens(
@@ -395,9 +624,9 @@ def main():
             mxfp6_matmul=args.mxfp6_matmul,
             mxint8_kv_cache=args.mxint8_kv_cache,
             aic_enable_depth_first=args.aic_enable_depth_first,
-            use_onnx_subfunctions=True,
-            vision_use_onnx_subfunctions=False,
-            lang_use_onnx_subfunctions=True,
+            use_onnx_subfunctions=effective_use_onnx_subfunctions,
+            vision_use_onnx_subfunctions=effective_vision_subfunctions,
+            lang_use_onnx_subfunctions=effective_lang_subfunctions,
         )
         if npi_mode == "enabled":
             compile_kwargs["node_precision_info"] = True
@@ -407,19 +636,27 @@ def main():
         if args.mos is not None:
             compile_kwargs["mos"] = args.mos
 
-        qpc_path = model.compile(**compile_kwargs)
+        qpc_path = model.compile(compile_dir=compile_dir, **compile_kwargs)
         exec_info = model.generate(inputs=inputs, device_ids=args.device_group, generation_len=args.generation_len)
         print_perf_stats(exec_info)
-        effective_use_onnx_subfunctions = True
-        effective_vision_subfunctions = False
-        effective_lang_subfunctions = True
     else:
         tokenizer, hf_text_model = load_gemma4_text_model(args.model_name)
-        model = QEFFAutoModelForCausalLM(copy.deepcopy(hf_text_model), pretrained_model_name_or_path=args.model_name)
-        model.model = model.model.to(torch.float32)
+        model = QEFFAutoModelForImageTextToText.from_pretrained(
+            args.model_name,
+            trust_remote_code=True,
+            kv_offload=True,
+            skip_vision=True,
+            dtype="float32",
+        )
         if not effective_fp16clip:
-            model._onnx_transforms = [t for t in model._onnx_transforms if t is not FP16ClipTransform]
-        effective_text_subfunctions = True
+            model.lang_model._onnx_transforms = [
+                t for t in model.lang_model._onnx_transforms if t is not FP16ClipTransform
+            ]
+        (
+            effective_text_subfunctions,
+            effective_vision_subfunctions,
+            effective_lang_subfunctions,
+        ) = resolve_subfunction_settings(args, use_image, False)
         if args.verify_runtime:
             hf_ids = run_hf_verification(
                 args.model_name,
@@ -430,20 +667,26 @@ def main():
                 hf_model=hf_text_model,
             )
 
-        onnx_path = model.export(
+        onnx_paths = model.export(
+            export_dir=export_dir,
+            skip_vision=True,
             use_onnx_subfunctions=effective_text_subfunctions,
-            offload_pt_weights=False,
+            lang_use_onnx_subfunctions=effective_text_subfunctions,
         )
+        onnx_path = onnx_paths[1] if isinstance(onnx_paths, (list, tuple)) else onnx_paths
         if args.verify_ort:
-            ort_ids = build_text_ort_tokens(
-                tokenizer=tokenizer,
-                config=hf_text_model.config,
-                rendered_prompt=rendered_prompt,
-                onnx_path=str(onnx_path),
+            ort_ids = build_skip_vision_text_ort_tokens(
+                model=model,
+                decoder_onnx_path=str(onnx_path),
+                inputs=inputs,
                 generation_len=args.generation_len,
+                prefill_seq_len=effective_prefill_seq_len,
+                ctx_len=effective_ctx_len,
+                pad_token_id=tokenizer.pad_token_id,
             )
         compile_kwargs = dict(
-            onnx_path=str(onnx_path),
+            skip_vision=True,
+            lang_onnx_path=str(onnx_path),
             prefill_seq_len=effective_prefill_seq_len,
             ctx_len=effective_ctx_len,
             num_devices=(1 if args.device_group is None else len(args.device_group)),
@@ -452,7 +695,7 @@ def main():
             mxint8_kv_cache=args.mxint8_kv_cache,
             aic_enable_depth_first=args.aic_enable_depth_first,
             use_onnx_subfunctions=effective_text_subfunctions,
-            convert_to_fp16=effective_convert_to_fp16,
+            lang_use_onnx_subfunctions=effective_text_subfunctions,
         )
         if npi_mode == "enabled":
             compile_kwargs["node_precision_info"] = True
@@ -461,16 +704,15 @@ def main():
         if args.mos is not None:
             compile_kwargs["mos"] = args.mos
 
-        qpc_path = model.compile(**compile_kwargs)
+        qpc_path = model.compile(compile_dir=compile_dir, **compile_kwargs)
         exec_info = model.generate(
-            tokenizer=tokenizer,
             prompts=[rendered_prompt],
-            device_id=args.device_group,
+            tokenizer=tokenizer,
+            device_ids=args.device_group,
             generation_len=args.generation_len,
         )
         onnx_paths = [str(onnx_path)]
         effective_use_onnx_subfunctions = effective_text_subfunctions
-        effective_vision_subfunctions = None
         effective_lang_subfunctions = effective_use_onnx_subfunctions
 
     qeff_ids = normalize_generated_ids(exec_info.generated_ids)[:, : args.generation_len]
@@ -484,7 +726,7 @@ def main():
             {
                 "image_mode": use_image,
                 "skip_vision": not use_image,
-                "kv_offload": use_image,
+                "kv_offload": True,
                 "use_onnx_subfunctions": effective_use_onnx_subfunctions,
                 "vision_use_onnx_subfunctions": effective_vision_subfunctions,
                 "lang_use_onnx_subfunctions": effective_lang_subfunctions,

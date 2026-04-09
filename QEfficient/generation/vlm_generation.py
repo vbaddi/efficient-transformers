@@ -286,7 +286,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
     def _execute_chunked_prefill(
         self,
         lang_inputs: Dict[str, np.ndarray],
-        num_chunks: int,
+        chunk_seq_lens: List[int],
         decode_batch_id: Optional[np.ndarray] = None,
         prefill_logit_bs: int = 1,
     ) -> Dict[str, np.ndarray]:
@@ -295,7 +295,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
 
         Args:
             lang_inputs: Pre-processed language inputs with input_ids, position_ids, etc.
-            num_chunks: Number of chunks to process
+            chunk_seq_lens: Sequence lengths to process for each prefill chunk
             decode_batch_id: Batch ID for continuous batching (optional)
             prefill_logit_bs: Batch size for prefill logits
 
@@ -326,11 +326,11 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
                 else:
                     lang_inputs[op] = self.sampling_params[op]
 
-        for i in range(num_chunks):
-            input_ids_slice = lang_inputs["input_ids"][:, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len]
-            position_ids_slice = lang_inputs["position_ids"][
-                ..., i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
-            ]
+        chunk_start = 0
+        for i, chunk_seq_len in enumerate(chunk_seq_lens):
+            chunk_end = chunk_start + chunk_seq_len
+            input_ids_slice = lang_inputs["input_ids"][:, chunk_start:chunk_end]
+            position_ids_slice = lang_inputs["position_ids"][..., chunk_start:chunk_end]
 
             chunk_inputs = {
                 "input_ids": input_ids_slice,
@@ -338,9 +338,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
                 "image_idx": chunk_image_idx if chunk_image_idx is not None else np.array([[0]], dtype=np.int64),
             }
             if "mm_token_type_ids" in lang_inputs:
-                chunk_inputs["mm_token_type_ids"] = lang_inputs["mm_token_type_ids"][
-                    :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
-                ]
+                chunk_inputs["mm_token_type_ids"] = lang_inputs["mm_token_type_ids"][:, chunk_start:chunk_end]
 
             if decode_batch_id is not None:
                 chunk_inputs["batch_index"] = decode_batch_id
@@ -349,7 +347,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
                 chunk_inputs["cross_attention_mask"] = lang_inputs["cross_attention_mask"]
 
             if self.comp_ctx_lengths_prefill is not None:
-                if (i + 1) * self._prefill_seq_len > self.comp_ctx_lengths_prefill[prefill_ccl_id]:
+                if chunk_end > self.comp_ctx_lengths_prefill[prefill_ccl_id]:
                     prefill_ccl_id = min(prefill_ccl_id + 1, len(self.comp_ctx_lengths_prefill) - 1)
                     lang_inputs["comp_ctx_lengths"] = self.list_of_comp_ctx_lengths_prefill[prefill_ccl_id]
 
@@ -367,6 +365,8 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
 
             if self._write_io_dir is not None:
                 write_io_files(lang_inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
+
+            chunk_start = chunk_end
 
         # Prepare decode-time cross_attention_mask
         if "cross_attention_mask" in lang_inputs:
@@ -412,15 +412,15 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
             # Check cache for vision outputs
             cache_key = image_path if isinstance(image_path, str) else str(image_path)
             if cache_key in self._vision_cache:
-                lang_inputs, vision_outputs, num_chunks = self._vision_cache[cache_key]
+                lang_inputs, vision_outputs, chunk_seq_lens = self._vision_cache[cache_key]
                 logger.debug(f"Using cached vision outputs for {cache_key}")
             else:
                 # Build language inputs with processor-aware vision/text integration
-                lang_inputs, vision_outputs, num_chunks = self._vision_handler.get_processed_inputs(
+                lang_inputs, vision_outputs, chunk_seq_lens = self._vision_handler.get_processed_inputs(
                     image_url=image_path, query=text_prompt, prefill_seq_len=self._prefill_seq_len
                 )
                 # Cache for future use
-                self._vision_cache[cache_key] = (lang_inputs, vision_outputs, num_chunks)
+                self._vision_cache[cache_key] = (lang_inputs, vision_outputs, chunk_seq_lens)
                 logger.debug(f"Cached vision outputs for {cache_key}")
 
             # Set vision buffers in language session
@@ -434,7 +434,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
             generation_len = self._fetch_generation_len(generation_len, max_gen_len)
 
             # Execute chunked prefill
-            outputs = self._execute_chunked_prefill(lang_inputs, num_chunks, decode_batch_id, prefill_logit_bs)
+            outputs = self._execute_chunked_prefill(lang_inputs, chunk_seq_lens, decode_batch_id, prefill_logit_bs)
 
             self._session.skip_buffers(vision_outputs)
 
@@ -605,7 +605,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
             img, prompt = vision_prompts[batch_id]
 
             # Process vision for this slot
-            lang_inputs, vision_outputs, num_chunks = self._vision_handler.get_processed_inputs(
+            lang_inputs, vision_outputs, chunk_seq_lens = self._vision_handler.get_processed_inputs(
                 image_url=img, query=prompt, prefill_seq_len=self._prefill_seq_len
             )
 
@@ -613,7 +613,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
             self._vision_outputs_cache[batch_id] = {
                 "vision_outputs": vision_outputs,
                 "lang_inputs": lang_inputs,
-                "num_chunks": num_chunks,
+                "chunk_seq_lens": chunk_seq_lens,
             }
 
             logger.debug(f"Cached vision outputs for batch_id {batch_id}")
@@ -676,7 +676,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
             if cached:
                 vision_outputs = cached["vision_outputs"]
                 lang_inputs = cached["lang_inputs"]
-                num_chunks = cached["num_chunks"]
+                chunk_seq_lens = cached["chunk_seq_lens"]
 
                 # Set vision buffers for THIS prefill
                 self._session.set_buffers(vision_outputs)
@@ -685,7 +685,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
                 # Run prefill with cached inputs
                 outputs = self._execute_chunked_prefill(
                     lang_inputs,
-                    num_chunks,
+                    chunk_seq_lens,
                     decode_batch_id=np.array(decode_batch_id, dtype=np.int64).reshape(1, 1),
                     prefill_logit_bs=1,
                 )

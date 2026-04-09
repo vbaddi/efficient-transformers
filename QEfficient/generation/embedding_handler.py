@@ -26,6 +26,14 @@ from QEfficient.utils import constants
 from QEfficient.utils.logging_utils import logger
 
 
+def _resolve_prefill_chunk_lens(model, lang_inputs: Dict[str, torch.Tensor], prefill_seq_len: int) -> List[int]:
+    if hasattr(model, "resolve_multimodal_prefill_chunk_lens"):
+        return model.resolve_multimodal_prefill_chunk_lens(lang_inputs, prefill_seq_len)
+    input_ids_length = int(lang_inputs["input_ids"].shape[1])
+    num_chunks = -(input_ids_length // -prefill_seq_len)
+    return [prefill_seq_len] * num_chunks
+
+
 class VisionHandler:
     """
     Handles all vision model operations for vision-language models.
@@ -270,10 +278,7 @@ class VisionHandler:
             # Process image and text
             inputs = self._processor(images=image, text=prompt, return_tensors="pt")
 
-            if (
-                hasattr(self._qeff_model.model.config, "model_type")
-                and self._qeff_model.model.config.model_type == "qwen2_5_vl"
-            ):
+            if hasattr(self._qeff_model.model, "prepare_inputs_for_generation"):
                 inputs = self._qeff_model.model.prepare_inputs_for_generation(
                     inputs=inputs, prefill_seq_len=prefill_seq_len, batch_size=inputs["input_ids"].shape[0]
                 )
@@ -449,7 +454,7 @@ class VisionHandler:
 
     def prepare_complete_vision_language_inputs(
         self, image_url: str, query: str
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], List[int]]:
         """
         Complete pipeline: prepare inputs and run vision inference
 
@@ -506,8 +511,8 @@ class VisionHandler:
             # Handle padding for language model
             pad_token_id = 1
             input_ids_length = lang_inputs["input_ids"].shape[1]
-            num_chunks = -(input_ids_length // -prefill_seq_len)
-            padded_len = num_chunks * prefill_seq_len
+            chunk_seq_lens = _resolve_prefill_chunk_lens(self._qeff_model.model, lang_inputs, prefill_seq_len)
+            padded_len = sum(chunk_seq_lens)
 
             lang_inputs["input_ids"] = torch.nn.functional.pad(
                 lang_inputs["input_ids"],
@@ -543,7 +548,7 @@ class VisionHandler:
 
             lang_inputs["image_idx"] = np.array([[0]])
 
-            return lang_inputs, vision_outputs, num_chunks
+            return lang_inputs, vision_outputs, chunk_seq_lens
 
         except Exception as e:
             raise RuntimeError(f"Failed to process vision-language inputs: {str(e)}")

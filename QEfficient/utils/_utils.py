@@ -795,7 +795,7 @@ def create_and_dump_qconfigs(
                 "specializations": make_serializable(specializations),
                 "mdp_ts_num_devices": mdp_ts_num_devices,
                 "num_speculative_tokens": num_speculative_tokens,
-                **compiler_options,
+                **make_serializable(compiler_options),
             },
             "aic_sdk_config": {
                 "qaic_apps_version": get_qaic_sdk_version(Constants.SDK_APPS_XML),

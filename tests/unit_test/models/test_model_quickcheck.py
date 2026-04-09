@@ -14,12 +14,13 @@ import pytest
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
-from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
+from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM, QEFFAutoModelForImageTextToText
 from QEfficient.utils.run_utils import ApiRunner
 
 MODEL_KWARGS = {"attn_implementation": "eager"}
 GEMMA4_TEXT_MODEL_IDS = {
     "gemma4_dense": "tiny-random/gemma-4-dense",
+    "gemma4_moe": "tiny-random/gemma-4-moe",
 }
 PARITY_PROMPT = ["hello world"]
 PARITY_PROMPT_LEN = 4
@@ -129,23 +130,32 @@ def test_gemma4_text_compile_and_generate_smoke_with_subfunctions(model_type, mo
         GENERATE_PROMPT_LEN,
         GENERATE_CTX_LEN,
     )
-    qeff_model = QEFFAutoModelForCausalLM(copy.deepcopy(model_hf), pretrained_model_name_or_path=model_id)
-
-    onnx_path = _exported_onnx_path(
-        qeff_model.export(
-            tmp_path / "with-subfunctions",
-            use_onnx_subfunctions=True,
-            offload_pt_weights=False,
-        )
+    qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        kv_offload=True,
+        skip_vision=True,
+        dtype="float32",
     )
+
+    export_result = qeff_model.export(
+        tmp_path / "with-subfunctions",
+        skip_vision=True,
+        use_onnx_subfunctions=True,
+        lang_use_onnx_subfunctions=True,
+    )
+    onnx_path = _exported_onnx_path(export_result)
 
     try:
         qpc_path = qeff_model.compile(
-            onnx_path=str(onnx_path),
             compile_dir=tmp_path / "compile-with-subfunctions",
+            skip_vision=True,
+            lang_onnx_path=str(onnx_path),
             prefill_seq_len=GENERATE_PROMPT_LEN,
             ctx_len=GENERATE_CTX_LEN,
             use_onnx_subfunctions=True,
+            lang_use_onnx_subfunctions=True,
+            node_precision_info=True,
         )
     except Exception as exc:
         pytest.skip(
@@ -158,8 +168,8 @@ def test_gemma4_text_compile_and_generate_smoke_with_subfunctions(model_type, mo
 
     try:
         exec_info = qeff_model.generate(
-            tokenizer,
             prompts=GENERATE_PROMPT,
+            tokenizer=tokenizer,
             generation_len=api_runner.gen_len,
         )
     except Exception as exc:
@@ -168,6 +178,8 @@ def test_gemma4_text_compile_and_generate_smoke_with_subfunctions(model_type, mo
             f"({type(exc).__name__}: {exc})"
         )
 
-    cloud_ai_100_tokens = exec_info.generated_ids[0]
+    cloud_ai_100_tokens = np.asarray(exec_info.generated_ids)
+    if cloud_ai_100_tokens.ndim == 1:
+        cloud_ai_100_tokens = cloud_ai_100_tokens.reshape(1, -1)
     assert cloud_ai_100_tokens.shape[0] == 1
     assert cloud_ai_100_tokens.shape[-1] >= api_runner.gen_len

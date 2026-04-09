@@ -12,6 +12,7 @@ from time import perf_counter
 from typing import List, Optional, Union
 
 import numpy as np
+import onnx
 import torch
 import torch.nn as nn
 from transformers import (
@@ -94,6 +95,67 @@ def _compiled_retained_output_name(name: str, use_onnx_subfunctions: bool) -> st
     if use_onnx_subfunctions and name.endswith("_RetainedState") and ("key" in name or "value" in name):
         return name[: -len("_RetainedState")] + "_InternalRetainedState"
     return name
+
+
+def _resolve_compiled_retained_output_name(
+    name: str, use_onnx_subfunctions: bool, available_output_names: Optional[set[str]] = None
+) -> str:
+    preferred_name = _compiled_retained_output_name(name, use_onnx_subfunctions)
+    if available_output_names is None:
+        return preferred_name
+    if preferred_name in available_output_names:
+        return preferred_name
+    if name in available_output_names:
+        return name
+    return preferred_name
+
+
+def _build_initial_past_buffers(session: QAICInferenceSession) -> dict[str, np.ndarray]:
+    initial_past_buffers = {}
+    for input_name in session.input_names:
+        if not input_name.startswith("past_"):
+            continue
+        binding = session.bindings[session.binding_index_map[input_name]]
+        initial_past_buffers[input_name] = np.zeros(
+            list(binding.dims),
+            dtype=session.aic_to_np_dtype_mapping[binding.type],
+        )
+    return initial_past_buffers
+
+
+def _get_retained_state_input_updates(outputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return {
+        _strip_retained_state_suffix(output_name): output_buffer
+        for output_name, output_buffer in outputs.items()
+        if _is_retained_state_name(output_name)
+    }
+
+
+def _get_available_prefill_seq_lens(session: QAICInferenceSession) -> List[int]:
+    input_ids_binding_idx = session.binding_index_map["input_ids"]
+    seq_lens = {
+        int(allowed_shape[input_ids_binding_idx][1][1])
+        for allowed_shape in session.allowed_shapes
+        if int(allowed_shape[input_ids_binding_idx][1][1]) > 1
+    }
+    binding_seq_len = int(session.bindings[input_ids_binding_idx].dims[1])
+    if binding_seq_len > 1:
+        seq_lens.add(binding_seq_len)
+    return sorted(seq_lens)
+
+
+def _resolve_multimodal_prefill_chunk_lens(
+    model: nn.Module,
+    inputs: dict,
+    default_prefill_seq_len: int,
+    available_prefill_seq_lens: List[int],
+) -> List[int]:
+    if hasattr(model, "resolve_multimodal_prefill_chunk_lens"):
+        return model.resolve_multimodal_prefill_chunk_lens(inputs, default_prefill_seq_len, available_prefill_seq_lens)
+
+    input_ids_length = int(inputs["input_ids"].shape[1])
+    num_chunks = -(input_ids_length // -default_prefill_seq_len)
+    return [default_prefill_seq_len] * num_chunks
 
 
 class QEFFTransformersBase(QEFFBaseModel):
@@ -1259,10 +1321,26 @@ class _QEffAutoModelForImageTextToTextLanguageOnlyCompat:
         skip_lang = kwargs.pop("skip_lang", False)
         if skip_lang:
             raise ValueError("Language-only Gemma4 wrapper cannot compile with skip_lang=True.")
+        lang_onnx_path = kwargs.pop("lang_onnx_path", None)
+        kwargs.pop("vision_onnx_path", None)
+        if onnx_path is None and lang_onnx_path is not None:
+            onnx_path = lang_onnx_path
         lang_use_onnx_subfunctions = kwargs.pop("lang_use_onnx_subfunctions", None)
         kwargs.pop("vision_use_onnx_subfunctions", None)
         if lang_use_onnx_subfunctions is not None:
             kwargs["use_onnx_subfunctions"] = lang_use_onnx_subfunctions
+        npi_generator = self.lang_model.model if hasattr(self.lang_model.model, "generate_npi_file") else self.model
+        if kwargs.get("node_precision_info") is True and hasattr(npi_generator, "generate_npi_file"):
+            effective_onnx_path = onnx_path or self.lang_model.onnx_path
+            if effective_onnx_path is None:
+                export_kwargs = dict(kwargs)
+                export_kwargs.setdefault("offload_pt_weights", False)
+                effective_onnx_path = self.lang_model.export(export_dir=compile_dir, **export_kwargs)
+                onnx_path = effective_onnx_path
+            kwargs["node_precision_info"] = npi_generator.generate_npi_file(
+                onnx_path=effective_onnx_path,
+                model_name=getattr(npi_generator, "name_or_path", getattr(self.model, "name_or_path", None)),
+            )
         if onnx_path is None:
             export_kwargs = dict(kwargs)
             export_kwargs.setdefault("offload_pt_weights", False)
@@ -1698,6 +1776,10 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             if self.lang_model.onnx_path is None:
                 raise ValueError("Language ONNX path is required to generate a language NPI file.")
             compiler_options["node_precision_info"] = self.model.generate_npi_file(self.lang_model.onnx_path)
+        elif "node_precision_info" not in compiler_options and hasattr(self.model, "generate_npi_file"):
+            if self.lang_model.onnx_path is None:
+                raise ValueError("Language ONNX path is required to generate a language NPI file.")
+            compiler_options["node_precision_info"] = self.model.generate_npi_file(self.lang_model.onnx_path)
 
         # TODO this hould be removed once the continous batching is supported for all the models.
         compiler_options.pop("continuous_batching", None)
@@ -1728,6 +1810,10 @@ class _QEffAutoModelForImageTextToTextDualQPC:
 
         if not skip_lang:
             custom_io_lang = {}
+            lang_output_name_set = None
+            if self.lang_model.onnx_path is not None:
+                lang_onnx = onnx.load(str(self.lang_model.onnx_path), load_external_data=False)
+                lang_output_name_set = {output.name for output in lang_onnx.graph.output}
             # Inputs
             for output_name in output_names["lang"]:
                 if _is_retained_state_name(output_name):
@@ -1738,7 +1824,10 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             # outputs
             for output_name in output_names["lang"]:
                 if _is_retained_state_name(output_name):
-                    custom_io_lang[_compiled_retained_output_name(output_name, lang_use_onnx_subfunctions)] = (
+                    compiled_output_name = _resolve_compiled_retained_output_name(
+                        output_name, lang_use_onnx_subfunctions, lang_output_name_set
+                    )
+                    custom_io_lang[compiled_output_name] = (
                         "float16" if "vision_embeds" in output_name else kv_cache_dtype
                     )
             self.lang_model._compile(
@@ -1816,6 +1905,20 @@ class _QEffAutoModelForImageTextToTextDualQPC:
 
         write_io = kwargs.pop("write_io", False)
         self._write_io_dir = os.path.join(os.path.dirname(self.onnx_path[1]), "io_dir") if write_io else None
+
+        if prompts is not None and not images:
+            active_tokenizer = tokenizer or (processor.tokenizer if processor is not None else None)
+            if active_tokenizer is None:
+                raise ValueError("Tokenizer or processor is required for text-only generation.")
+            inputs = active_tokenizer(prompts, return_tensors="pt", padding=True)
+            if "mm_token_type_ids" not in inputs:
+                inputs["mm_token_type_ids"] = torch.zeros_like(inputs["input_ids"], dtype=torch.int64)
+            return self.kv_offload_generate(
+                inputs=inputs,
+                streamer=streamer,
+                device_ids=device_ids,
+                generation_len=generation_len,
+            )
 
         # Use VisionLanguageGeneration for image-prompt pairs
         if (processor and images) or (tokenizer and prompts):
@@ -1901,25 +2004,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         pad_token_id = 1
 
         # Skip inputs/outputs
-        if internal_retained_kv:
-            initial_past_buffers = {}
-            for input_name in lang_session.input_names:
-                if not input_name.startswith("past_"):
-                    continue
-                binding = lang_session.bindings[lang_session.binding_index_map[input_name]]
-                initial_past_buffers[input_name] = np.zeros(
-                    list(binding.dims),
-                    dtype=lang_session.aic_to_np_dtype_mapping[binding.type],
-                )
-            lang_session.set_buffers(initial_past_buffers)
-        else:
-            lang_session.skip_buffers(
-                [
-                    x
-                    for x in lang_session.input_names + lang_session.output_names
-                    if x.startswith("past_") or _is_retained_state_name(x)
-                ]
-            )
+        lang_session.set_buffers(_build_initial_past_buffers(lang_session))
 
         # Read prompt and ctx len from session
         batch_size = max(
@@ -1927,15 +2012,15 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             + [lang_session.bindings[lang_session.binding_index_map["input_ids"]].dims[0]]
         )
 
-        prefill_seq_len = max(
-            [x[lang_session.binding_index_map["input_ids"]][1][1] for x in lang_session.allowed_shapes]
-            + [lang_session.bindings[lang_session.binding_index_map["input_ids"]].dims[1]]
-        )
+        available_prefill_seq_lens = _get_available_prefill_seq_lens(lang_session)
+        prefill_seq_len = min(available_prefill_seq_lens)
 
         input_len = inputs["attention_mask"].sum(1, keepdims=True)
         input_ids_length = inputs["input_ids"].shape[1]
-        num_chunks = -(input_ids_length // -prefill_seq_len)  # ceil divide without float
-        padded_len = num_chunks * prefill_seq_len  # Convert to a multiple of prompt_len
+        chunk_seq_lens = _resolve_multimodal_prefill_chunk_lens(
+            self.model, inputs, prefill_seq_len, available_prefill_seq_lens
+        )
+        padded_len = sum(chunk_seq_lens)
 
         if generation_len is None:
             generation_len = ctx_len - input_len.max()
@@ -1955,6 +2040,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             inputs["mm_token_type_ids"] = torch.nn.functional.pad(
                 inputs["mm_token_type_ids"], (0, padded_len - input_ids_length), "constant", 0
             )
+        elif "mm_token_type_ids" in lang_session.binding_index_map:
+            inputs["mm_token_type_ids"] = torch.zeros_like(inputs["input_ids"], dtype=torch.int64)
         if "cross_attention_mask" in inputs:
             inputs["cross_attention_mask"] = torch.nn.functional.pad(
                 inputs["cross_attention_mask"], (0, 0, 0, 0, 0, padded_len - input_ids_length)
@@ -1986,6 +2073,12 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         vision_outputs = {}
         if vision_inputs:
             vision_outputs = vision_session.run(vision_inputs)
+        elif "vision_embeds" in lang_session.binding_index_map:
+            vision_binding = lang_session.bindings[lang_session.binding_index_map["vision_embeds"]]
+            vision_outputs["vision_embeds"] = np.zeros(
+                list(vision_binding.dims),
+                dtype=lang_session.aic_to_np_dtype_mapping[vision_binding.type],
+            )
         vision_end = perf_counter()
 
         lang_inputs = {k: v for k, v in inputs.items() if k not in vision_inputs}
@@ -2019,39 +2112,28 @@ class _QEffAutoModelForImageTextToTextDualQPC:
 
         # Run prefill
         chunk_inputs = lang_inputs.copy()
-        for i in range(num_chunks):
-            if (
-                self.comp_ctx_lengths_prefill is not None
-                and (i + 1) * prefill_seq_len > self.comp_ctx_lengths_prefill[prefill_ccl_id]
-            ):
+        chunk_start = 0
+        for i, chunk_seq_len in enumerate(chunk_seq_lens):
+            chunk_end = chunk_start + chunk_seq_len
+            if self.comp_ctx_lengths_prefill is not None and chunk_end > self.comp_ctx_lengths_prefill[prefill_ccl_id]:
                 prefill_ccl_id = min(prefill_ccl_id + 1, len(self.comp_ctx_lengths_prefill) - 1)
                 chunk_inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths_prefill[prefill_ccl_id]
 
-            chunk_inputs["input_ids"] = lang_inputs["input_ids"][:, i * prefill_seq_len : (i + 1) * prefill_seq_len]
-            chunk_inputs["position_ids"] = lang_inputs["position_ids"][
-                ..., i * prefill_seq_len : (i + 1) * prefill_seq_len
-            ]
+            chunk_inputs["input_ids"] = lang_inputs["input_ids"][:, chunk_start:chunk_end]
+            chunk_inputs["position_ids"] = lang_inputs["position_ids"][..., chunk_start:chunk_end]
             if "mm_token_type_ids" in lang_inputs:
-                chunk_inputs["mm_token_type_ids"] = lang_inputs["mm_token_type_ids"][
-                    :, i * prefill_seq_len : (i + 1) * prefill_seq_len
-                ]
+                chunk_inputs["mm_token_type_ids"] = lang_inputs["mm_token_type_ids"][:, chunk_start:chunk_end]
             outputs = lang_session.run(chunk_inputs)
+            if not internal_retained_kv:
+                lang_session.set_buffers(_get_retained_state_input_updates(outputs))
             chunk_inputs["image_idx"] = outputs["image_idx_output"]
+            chunk_start = chunk_end
 
             if self._write_io_dir is not None:
                 write_io_files(lang_inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
 
         prefill_time = perf_counter() - lang_start + vision_end - vision_start
-        # Skip inputs/outputs again
-        if not internal_retained_kv:
-            lang_session.skip_buffers(
-                [
-                    x
-                    for x in lang_session.input_names + lang_session.output_names
-                    if x.startswith("past_") or _is_retained_state_name(x)
-                ]
-            )
-        if not_mllama:
+        if not_mllama and internal_retained_kv:
             lang_session.skip_buffers(vision_outputs.keys())
 
         # Get first token
@@ -2092,6 +2174,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                     lang_inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths_decode[ccl_id]
 
             outputs = lang_session.run(lang_inputs)
+            if not internal_retained_kv:
+                lang_session.set_buffers(_get_retained_state_input_updates(outputs))
             if self._write_io_dir is not None:
                 write_io_files(lang_inputs, outputs, self._write_io_dir, "decode", "aic_batch_io", True, False)
                 self._write_io_dir = None
@@ -2759,9 +2843,8 @@ class QEFFAutoModelForImageTextToText:
 
     @staticmethod
     def _should_use_language_only_compat(model: nn.Module, skip_vision: bool = False) -> bool:
-        if not skip_vision:
-            return False
-        return model.__class__.__name__ == "Gemma4ForConditionalGeneration"
+        del model, skip_vision
+        return False
 
     def __new__(
         cls,
@@ -3476,11 +3559,14 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             of the prefill specialization (e.g., if prefill_seq_len is 1 and not continuous batching).
         """
         if hasattr(self.model, "get_specializations"):
-            spec = self.model.get_specializations(
+            specializations = self.model.get_specializations(
                 batch_size=full_batch_size if self.continuous_batching else batch_size,
                 prefill_seq_len=(num_speculative_tokens + 1) if self.is_tlm else 1,
                 ctx_len=ctx_len,
-            )[1]
+            )
+            if len(specializations) < 2:
+                return None
+            spec = specializations[1]
         else:
             spec = {
                 "batch_size": full_batch_size if self.continuous_batching else batch_size,
@@ -3724,14 +3810,19 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         if kw_spec := compiler_options.pop("specializations", None):
             specializations = kw_spec
         # --- Compilation ---
-        kv_cache_dtype = "mxint8" if mxint8_kv_cache else "float16"
+        convert_to_fp16 = compiler_options.pop("convert_to_fp16", True)
+        kv_cache_dtype = compiler_options.pop(
+            "kv_cache_dtype",
+            "mxint8" if mxint8_kv_cache else ("float16" if convert_to_fp16 else "float"),
+        )
         custom_io = {}
         effective_onnx_path = onnx_path or self.onnx_path
+        requested_node_precision_info = compiler_options.get("node_precision_info", None)
 
         if (
             effective_onnx_path is None
             and hasattr(self.model, "generate_npi_file")
-            and "node_precision_info" not in compiler_options
+            and requested_node_precision_info is not False
         ):
             effective_onnx_path = self.export(
                 prefill_only=prefill_only,
@@ -3743,7 +3834,12 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             )
             onnx_path = effective_onnx_path
 
-        if hasattr(self.model, "generate_npi_file") and "node_precision_info" not in compiler_options:
+        if hasattr(self.model, "generate_npi_file") and requested_node_precision_info is True:
+            compiler_options["node_precision_info"] = self.model.generate_npi_file(
+                onnx_path=effective_onnx_path,
+                model_name=self.model.name_or_path,
+            )
+        elif hasattr(self.model, "generate_npi_file") and "node_precision_info" not in compiler_options:
             compiler_options["node_precision_info"] = self.model.generate_npi_file(
                 onnx_path=effective_onnx_path,
                 model_name=self.model.name_or_path,
@@ -3751,11 +3847,19 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         elif hasattr(self.model, "get_npi_file") and "node_precision_info" not in compiler_options:
             compiler_options["node_precision_info"] = self.model.get_npi_file(self.model.name_or_path)
 
-        for suffix in ["", "_RetainedState"]:
-            for i in range(self.num_layers):
-                for kv in ["key", "value"]:
-                    custom_io[f"past_{kv}.{i}{suffix}"] = kv_cache_dtype
-        convert_to_fp16 = compiler_options.pop("convert_to_fp16", True)
+        output_name_set = None
+        if effective_onnx_path is not None:
+            exported_onnx = onnx.load(str(effective_onnx_path), load_external_data=False)
+            output_name_set = {output.name for output in exported_onnx.graph.output}
+
+        for i in range(self.num_layers):
+            for kv in ["key", "value"]:
+                base_name = f"past_{kv}.{i}"
+                custom_io[base_name] = kv_cache_dtype
+                retained_name = _resolve_compiled_retained_output_name(
+                    f"{base_name}_RetainedState", use_onnx_subfunctions, output_name_set
+                )
+                custom_io[retained_name] = kv_cache_dtype
 
         qpc_path = self._compile(
             onnx_path=onnx_path,
