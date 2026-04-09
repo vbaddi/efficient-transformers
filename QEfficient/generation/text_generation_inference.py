@@ -81,6 +81,47 @@ class CloudAI100ExecInfoNew:
 io_files = []
 
 
+def normalize_terminal_token_ids(
+    tokenizer: Optional[Union[PreTrainedTokenizer, PreTrainedTokenizerFast]] = None,
+    eos_token_ids: Optional[Union[int, List[int], Tuple[int, ...]]] = None,
+) -> Tuple[int, ...]:
+    token_ids: List[int] = []
+
+    def add_ids(value):
+        if value is None:
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add_ids(item)
+            return
+        if isinstance(value, np.ndarray):
+            for item in value.reshape(-1).tolist():
+                add_ids(item)
+            return
+        try:
+            token_id = int(value)
+        except (TypeError, ValueError):
+            return
+        if token_id >= 0 and token_id not in token_ids:
+            token_ids.append(token_id)
+
+    add_ids(eos_token_ids)
+
+    if tokenizer is not None:
+        add_ids(getattr(tokenizer, "eos_token_id", None))
+        special_tokens_map = getattr(tokenizer, "special_tokens_map", {}) or {}
+        for key in ("eot_token", "end_of_turn_token"):
+            special_token = special_tokens_map.get(key)
+            if special_token is None:
+                continue
+            add_ids(tokenizer.convert_tokens_to_ids(special_token))
+
+    if not token_ids:
+        raise TypeError("Failed to resolve at least one terminal token id for generation.")
+
+    return tuple(token_ids)
+
+
 def write_io_files(
     inputs: Dict[str, np.ndarray],
     outputs: Dict[str, np.ndarray],
@@ -148,7 +189,8 @@ def latency_stats_bertstyle(
     print(prompt, end=" ", flush=True)
     init_len = cur_len
     start = perf_counter()
-    while next_token_id != tokenizer.eos_token_id and cur_len <= seq_len:
+    terminal_token_ids = normalize_terminal_token_ids(tokenizer=tokenizer)
+    while next_token_id not in terminal_token_ids and cur_len <= seq_len:
         outputs = session.run(inputs)
         logits = outputs["logits"]
         next_token_id = logits[0, -1].argmax().item()
@@ -448,6 +490,7 @@ class QEffTextGenerationBase:
         return_pdfs: bool = False,
         include_guided_decoding: bool = False,
         sampling_params: Optional[Dict[str, Any]] = None,
+        eos_token_ids: Optional[Union[int, List[int], Tuple[int, ...]]] = None,
         activate: bool = True,
     ) -> None:
         self._ctx_len = ctx_len
@@ -494,21 +537,25 @@ class QEffTextGenerationBase:
         self.generation_len = None
 
         self.tokenizer = tokenizer
-        self._set_tokenizer_params()  # set tokenizer params
+        self._set_tokenizer_params(eos_token_ids=eos_token_ids)  # set tokenizer params
         # Skip inputs/outputs
         self._session.skip_buffers(
             [x for x in self._session.input_names + self._session.output_names if x.startswith("past_")]
         )
 
-    def _set_tokenizer_params(self):
+    def _set_tokenizer_params(self, eos_token_ids: Optional[Union[int, List[int], Tuple[int, ...]]] = None):
         """
         Sets the tokenizer parameters for the model.
         """
         if self.tokenizer.padding_side != "right":
             logger.warning("Please use padding_side='right' while initializing the tokenizer")
             self.tokenizer.padding_side = "right"
+        self.terminal_token_ids = normalize_terminal_token_ids(self.tokenizer, eos_token_ids=eos_token_ids)
         if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            self.tokenizer.pad_token_id = self.terminal_token_ids[0]
+
+    def _is_terminal_token_ids(self, token_ids: np.ndarray) -> np.ndarray:
+        return np.isin(token_ids, self.terminal_token_ids)
 
     def _fetch_full_batch_size(
         self,
@@ -908,7 +955,7 @@ class QEffTextGenerationBase:
 
             for decode_batch_id in range(self.full_batch_size):
                 if (
-                    next_token_id[decode_batch_id, -1] == self.tokenizer.eos_token_id
+                    self._is_terminal_token_ids(next_token_id[decode_batch_id, -1])
                     or generated_id_current_index[decode_batch_id] >= self.generation_len[decode_batch_id]
                 ):
                     if prompt_queue:
@@ -996,7 +1043,7 @@ class QEffTextGenerationBase:
                 (self.batch_size, self._decode_seq_len, self._vocab_size), dtype=np.float32
             )
             self._session.set_buffers({"logits": logits_out_placeholder})
-        finished_sequences = decode_inputs["input_ids"] == self.tokenizer.eos_token_id
+        finished_sequences = self._is_terminal_token_ids(decode_inputs["input_ids"])
         num_token = 0
 
         if self.comp_ctx_lengths_decode is not None:
@@ -1023,7 +1070,7 @@ class QEffTextGenerationBase:
             decode_inputs["position_ids"][:, -1] += 1
             cache_index += 1
             self.generated_ids[:, num_token] = decode_inputs["input_ids"][:, -1]
-            finished_sequences |= decode_inputs["input_ids"] == self.tokenizer.eos_token_id
+            finished_sequences |= self._is_terminal_token_ids(decode_inputs["input_ids"])
             if self.include_sampler:
                 decode_inputs["last_accepted_output_tokens"] = decode_inputs["input_ids"]
 
@@ -1044,7 +1091,7 @@ class QEffTextGenerationBase:
         Yields:
             token_id (int): The token generated in the decoding process.
         """
-        finished_sequences = decode_inputs["input_ids"] == self.tokenizer.eos_token_id
+        finished_sequences = self._is_terminal_token_ids(decode_inputs["input_ids"])
         for num_token in range(1, generation_len):
             yield decode_inputs["input_ids"]
             outputs = self._session.run(decode_inputs)
@@ -1057,7 +1104,7 @@ class QEffTextGenerationBase:
             decode_inputs["input_ids"] = outputs["logits"].argmax(2)
             decode_inputs["position_ids"] += 1
             self.generated_ids[:, num_token] = decode_inputs["input_ids"].squeeze(1)
-            finished_sequences |= decode_inputs["input_ids"] == self.tokenizer.eos_token_id
+            finished_sequences |= self._is_terminal_token_ids(decode_inputs["input_ids"])
 
             if finished_sequences.all() and not automation:
                 break
@@ -1081,6 +1128,7 @@ class TextGeneration:
         return_pdfs: bool = False,
         include_guided_decoding: bool = False,
         sampling_params: Optional[Dict[str, Any]] = None,
+        eos_token_ids: Optional[Union[int, List[int], Tuple[int, ...]]] = None,
     ) -> None:
         self._qaic_model = QEffTextGenerationBase(
             tokenizer=tokenizer,
@@ -1097,6 +1145,7 @@ class TextGeneration:
             return_pdfs=return_pdfs,
             include_guided_decoding=include_guided_decoding,
             sampling_params=sampling_params,
+            eos_token_ids=eos_token_ids,
         )
         self._full_batch_size = self._qaic_model.full_batch_size
         self._tokenizer = self._qaic_model.tokenizer

@@ -14,7 +14,7 @@ import onnxruntime
 import torch
 from transformers import TextStreamer
 
-from QEfficient.generation.text_generation_inference import TextGeneration
+from QEfficient.generation.text_generation_inference import TextGeneration, normalize_terminal_token_ids
 from QEfficient.utils.generate_inputs import InputHandler, InputHandlerInternVL, InputHandlerVLM
 
 
@@ -234,6 +234,7 @@ class ApiRunner:
             device_id=device_group,
             ctx_len=self.input_handler.ctx_len,
             full_batch_size=self.input_handler.full_batch_size,
+            eos_token_ids=getattr(self.input_handler.config, "eos_token_id", None),
         ).generate(prompt=self.input_handler.prompt, generation_len=self.gen_len, stream=False)
 
         predicted_string = self.input_handler.tokenizer.batch_decode(execinfo.generated_ids, skip_special_tokens=True)
@@ -349,7 +350,10 @@ class ApiRunnerVlm:
             inputs["cross_attention_mask"] = torch.ones((bs, 1, num_images, img_tiles), dtype=torch.int64)
 
         generated_ids[:, 0] = inputs["input_ids"].squeeze(1)
-        finished_sequences = inputs["input_ids"] == self.processor.tokenizer.eos_token_id
+        terminal_token_ids = normalize_terminal_token_ids(
+            tokenizer=self.processor.tokenizer, eos_token_ids=getattr(self.config, "eos_token_id", None)
+        )
+        finished_sequences = np.isin(inputs["input_ids"], terminal_token_ids)
         inputs["position_ids"] = inputs["position_ids"].max(1, keepdim=True).values + 1
 
         print("QEFF Model Outputs (Torch CPU):")
@@ -362,7 +366,7 @@ class ApiRunnerVlm:
             inputs["position_ids"] += 1
             streamer.put(inputs["input_ids"])
             generated_ids[:, num_token] = inputs["input_ids"].squeeze(1)
-            finished_sequences |= inputs["input_ids"] == self.processor.tokenizer.eos_token_id
+            finished_sequences |= np.isin(inputs["input_ids"], terminal_token_ids)
             if finished_sequences.all():
                 break
         streamer.end()
@@ -414,7 +418,10 @@ class ApiRunnerVlm:
 
             added_initializers, decoder_session = self.setup_ort_session(decoder_path)
             generated_ids = []
-            finished_sequences = lang_inputs["input_ids"] == self.processor.tokenizer.eos_token_id
+            terminal_token_ids = normalize_terminal_token_ids(
+                tokenizer=self.processor.tokenizer, eos_token_ids=getattr(self.config, "eos_token_id", None)
+            )
+            finished_sequences = np.isin(lang_inputs["input_ids"], terminal_token_ids)
 
             ort_outputs = self.run_ort_session(lang_inputs, session=decoder_session)
             ort_outputs = self.input_handler_vlm.update_vlm_ort_outputs(ort_outputs)
@@ -422,7 +429,7 @@ class ApiRunnerVlm:
             lang_inputs = self.input_handler_vlm.update_vlm_ort_inputs(lang_inputs, ort_outputs)
 
             for _ in range(1, self.gen_len):
-                finished_sequences |= lang_inputs["input_ids"] == self.processor.tokenizer.eos_token_id
+                finished_sequences |= np.isin(lang_inputs["input_ids"], terminal_token_ids)
                 if finished_sequences.all():
                     break
 
@@ -442,7 +449,10 @@ class ApiRunnerVlm:
             added_initializers, session = self.setup_ort_session(model_path)
             generated_ids = []
             inputs = {**vision_inputs, **lang_inputs}
-            finished_sequences = inputs["input_ids"] == self.processor.tokenizer.eos_token_id
+            terminal_token_ids = normalize_terminal_token_ids(
+                tokenizer=self.processor.tokenizer, eos_token_ids=getattr(self.config, "eos_token_id", None)
+            )
+            finished_sequences = np.isin(inputs["input_ids"], terminal_token_ids)
 
             ort_outputs = self.run_ort_session(inputs, session=session)
             ort_outputs = self.input_handler_vlm.update_vlm_ort_outputs(ort_outputs)
@@ -450,7 +460,7 @@ class ApiRunnerVlm:
             inputs = self.input_handler_vlm.update_vlm_ort_inputs(inputs, ort_outputs)
 
             for _ in range(1, self.gen_len):
-                finished_sequences |= inputs["input_ids"] == self.processor.tokenizer.eos_token_id
+                finished_sequences |= np.isin(inputs["input_ids"], terminal_token_ids)
                 if finished_sequences.all():
                     break
                 ort_outputs = self.run_ort_session(inputs, session)

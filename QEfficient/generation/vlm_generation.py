@@ -20,7 +20,7 @@ Key enhancements:
 
 from collections import deque
 from time import perf_counter
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from transformers import AutoImageProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -83,6 +83,8 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
         lang_qpc_path: str,
         vision_qpc_path: str,
         device_id: Optional[List[int]] = None,
+        vision_device_id: Optional[List[int]] = None,
+        lang_device_id: Optional[List[int]] = None,
         ctx_len: Optional[int] = None,
         comp_ctx_lengths_prefill: Optional[List[int]] = None,
         comp_ctx_lengths_decode: Optional[List[int]] = None,
@@ -96,6 +98,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
         return_pdfs: bool = False,
         include_guided_decoding: bool = False,
         sampling_params: Optional[Dict[str, Any]] = None,
+        eos_token_ids: Optional[Union[int, List[int], Tuple[int, ...]]] = None,
     ):
         """
         Initialize vision-language generation with enhanced capabilities
@@ -127,6 +130,13 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
 
         # Initialize base class with language QPC
         # Pass activate=False to prevent premature activation before vision components are ready
+        resolved_vision_device_id, resolved_lang_device_id = self._resolve_runtime_device_groups(
+            device_id=device_id,
+            vision_device_id=vision_device_id,
+            lang_device_id=lang_device_id,
+            qeff_model=qeff_model,
+        )
+
         super().__init__(
             tokenizer=tokenizer,
             qpc_path=lang_qpc_path,
@@ -134,7 +144,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
             ctx_len=ctx_len,
             comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
             comp_ctx_lengths_decode=comp_ctx_lengths_decode,
-            device_id=device_id,
+            device_id=resolved_lang_device_id,
             enable_debug_logs=enable_debug_logs,
             write_io_dir=write_io_dir,
             is_tlm=is_tlm,
@@ -142,6 +152,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
             return_pdfs=return_pdfs,
             include_guided_decoding=include_guided_decoding,
             sampling_params=sampling_params,
+            eos_token_ids=eos_token_ids,
             activate=False,  # vision components need to be initialized first
         )
 
@@ -155,7 +166,8 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
         self.image_height = image_height
         self.image_width = image_width
         self._vision_qpc_path = vision_qpc_path
-        self.device_id = device_id  # Store device_id for vision components
+        self.device_id = resolved_lang_device_id
+        self._vision_device_id = resolved_vision_device_id
         self.enable_debug_logs = enable_debug_logs  # Store for vision components
         self._vision_outputs_cache = LRUCache(max_size=100)  # LRU cache for vision outputs
         self._vision_cache = {}  # Cache for vision outputs across batches
@@ -171,11 +183,36 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
             f"sampling={'enabled' if include_sampler else 'disabled'}"
         )
 
+    @staticmethod
+    def _resolve_runtime_device_groups(
+        device_id: Optional[List[int]],
+        vision_device_id: Optional[List[int]],
+        lang_device_id: Optional[List[int]],
+        qeff_model,
+    ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
+        if vision_device_id is not None or lang_device_id is not None:
+            return vision_device_id if vision_device_id is not None else device_id, (
+                lang_device_id if lang_device_id is not None else device_id
+            )
+
+        compiled_vision_num_devices = getattr(qeff_model, "_compiled_vision_num_devices", None)
+        compiled_lang_num_devices = getattr(qeff_model, "_compiled_lang_num_devices", None)
+        if device_id is None or compiled_vision_num_devices is None or compiled_lang_num_devices is None:
+            return device_id, device_id
+
+        if len(device_id) >= compiled_vision_num_devices + compiled_lang_num_devices:
+            return (
+                device_id[:compiled_vision_num_devices],
+                device_id[compiled_vision_num_devices : compiled_vision_num_devices + compiled_lang_num_devices],
+            )
+
+        return device_id[:compiled_vision_num_devices], device_id[:compiled_lang_num_devices]
+
     def _init_vision_components(self):
         """Initialize vision-specific components"""
         # Vision session (separate from base class language session)
         self._vision_session = QAICInferenceSession(
-            self._vision_qpc_path, self.device_id, activate=False, enable_debug_logs=self.enable_debug_logs
+            self._vision_qpc_path, self._vision_device_id, activate=False, enable_debug_logs=self.enable_debug_logs
         )
 
         # Vision handler with language session coordination
@@ -823,6 +860,7 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
             return_pdfs=self.return_pdfs,
             include_guided_decoding=self.include_guided_decoding,
             sampling_params=self.sampling_params,
+            eos_token_ids=self.terminal_token_ids,
         )
 
         text_gen._qaic_model = self

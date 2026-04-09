@@ -9,7 +9,7 @@ import argparse
 
 import numpy as np
 import torch
-from transformers import AutoProcessor
+from transformers import AutoProcessor, TextStreamer
 
 from QEfficient import QEFFAutoModelForImageTextToText
 
@@ -23,6 +23,15 @@ def normalize_generated_ids(generated_ids):
     elif array.ndim > 2:
         array = array.reshape(array.shape[0], -1)
     return array.astype(np.int64, copy=False)
+
+
+def parse_device_group(device_ids: str | None):
+    if device_ids is None:
+        return None
+    device_ids = device_ids.strip()
+    if not device_ids:
+        return None
+    return [int(x) for x in device_ids.strip("[]").split(",") if x.strip()]
 
 
 def build_inputs(processor, prompt: str, image_url: str | None):
@@ -65,7 +74,8 @@ def run_model(
     ctx_len: int,
     generation_len: int,
     num_cores: int,
-    num_devices: int,
+    vision_device_ids: list[int] | None,
+    lang_device_ids: list[int] | None,
     mos: int,
     aic_enable_depth_first: bool,
     enable_npi: bool,
@@ -80,32 +90,51 @@ def run_model(
         dtype="float32",
     )
 
+    runtime_vision_device_ids = None if skip_vision else (vision_device_ids or [0])
+    runtime_lang_device_ids = lang_device_ids or ([0] if skip_vision else [1, 2, 3])
+
     model.compile(
         prefill_seq_len=prefill_seq_len,
         ctx_len=ctx_len,
         num_cores=num_cores,
-        num_devices=num_devices,
+        num_devices=len(runtime_lang_device_ids),
+        vision_num_devices=(None if skip_vision else len(runtime_vision_device_ids)),
+        lang_num_devices=len(runtime_lang_device_ids),
         skip_vision=skip_vision,
         use_onnx_subfunctions=True,
-        lang_use_onnx_subfunctions=True,
-        vision_use_onnx_subfunctions=False,
         node_precision_info=enable_npi,
-        vision_node_precision_info=False,
-        mxfp6_matmul=False,
-        mxint8_kv_cache=False,
+        mxfp6_matmul=True,
+        mxint8_kv_cache=True,
         mos=mos,
         aic_enable_depth_first=aic_enable_depth_first,
     )
 
     inputs = build_inputs(processor, prompt, None if skip_vision else image_url)
-    output = model.generate(inputs=inputs, processor=processor, generation_len=generation_len)
-    generated_ids = normalize_generated_ids(output.generated_ids)[:, :generation_len]
+    streamer = TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+    exec_info = model.generate(
+        inputs=inputs,
+        processor=processor,
+        generation_len=None,
+        streamer=streamer,
+        vision_device_ids=runtime_vision_device_ids,
+        lang_device_ids=runtime_lang_device_ids,
+    )
+    print()
+    print(exec_info)
+    # output = model.generate(
+    #     inputs=inputs,
+    #     processor=processor,
+    #     generation_len=generation_len,
+    #     vision_device_ids=runtime_vision_device_ids,
+    #     lang_device_ids=runtime_lang_device_ids,
+    # )
+    # generated_ids = normalize_generated_ids(output.generated_ids)[:, :generation_len]
 
-    print("Generated IDs:")
-    print(generated_ids.tolist())
-    print("Generated Text:")
-    print(processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True))
-    print(output)
+    # print("Generated IDs:")
+    # print(generated_ids.tolist())
+    # print("Generated Text:")
+    # print(processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True))
+    # print(output)
 
 
 def main():
@@ -122,7 +151,8 @@ def main():
     parser.add_argument("--ctx-len", type=int, default=512)
     parser.add_argument("--generation-len", type=int, default=32)
     parser.add_argument("--num-cores", type=int, default=16)
-    parser.add_argument("--num-devices", type=int, default=1)
+    parser.add_argument("--vision-num-devices", type=parse_device_group, default=None)
+    parser.add_argument("--lang-num-devices", type=parse_device_group, default=None)
     parser.add_argument("--mos", type=int, default=1)
     parser.add_argument("--aic-enable-depth-first", action="store_true")
     parser.add_argument("--disable-npi", action="store_true")
@@ -137,7 +167,8 @@ def main():
         ctx_len=args.ctx_len,
         generation_len=args.generation_len,
         num_cores=args.num_cores,
-        num_devices=args.num_devices,
+        vision_device_ids=args.vision_num_devices,
+        lang_device_ids=args.lang_num_devices,
         mos=args.mos,
         aic_enable_depth_first=args.aic_enable_depth_first,
         enable_npi=not args.disable_npi,

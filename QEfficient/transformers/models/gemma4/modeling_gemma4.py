@@ -776,6 +776,7 @@ class QEffGemma4DecoderWrapper(nn.Module):
         self.language_model = self.model.model.language_model
         self.config = self.model.config
         self.lm_head = self.model.lm_head
+        self.mm_tokens_per_image = getattr(self.config, "mm_tokens_per_image", 256)
 
     def get_submodules_for_export(self) -> Type[nn.Module]:
         return {QEffGemma4TextDecoderLayer}
@@ -796,15 +797,12 @@ class QEffGemma4DecoderWrapper(nn.Module):
         if past_key_values is not None and not isinstance(past_key_values, Cache):
             past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.language_model.config, past_key_values)
 
+        next_image_idx = image_idx
         special_image_mask = input_ids == self.config.image_token_id
         llm_input_ids = input_ids.clone()
         llm_input_ids[special_image_mask] = self.config.text_config.pad_token_id
         inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
-        per_layer_inputs = None
-        if getattr(self.config.text_config, "hidden_size_per_layer_input", None):
-            per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids, inputs_embeds)
 
-        next_image_idx = image_idx
         if vision_embeds is not None:
             if vision_embeds.dim() == 2:
                 vision_embeds = vision_embeds.unsqueeze(0)
@@ -820,6 +818,10 @@ class QEffGemma4DecoderWrapper(nn.Module):
             next_image_idx = next_image_idx.to(indices1.device) + special_image_mask.to(torch.int64).sum(
                 dim=1, keepdim=True
             )
+
+        per_layer_inputs = None
+        if getattr(self.config.text_config, "hidden_size_per_layer_input", None):
+            per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids, inputs_embeds)
 
         attention_mask = None
 
@@ -925,15 +927,47 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
     def _get_mm_tokens_per_image(self) -> int:
         return getattr(self.config, "mm_tokens_per_image", 256)
 
+    def resolve_vlm_subfunction_settings(
+        self,
+        *,
+        use_onnx_subfunctions: bool,
+        vision_use_onnx_subfunctions: Optional[bool],
+        lang_use_onnx_subfunctions: Optional[bool],
+        skip_vision: bool,
+    ) -> tuple[bool, bool]:
+        if vision_use_onnx_subfunctions is None:
+            vision_use_onnx_subfunctions = False
+        if lang_use_onnx_subfunctions is None:
+            lang_use_onnx_subfunctions = use_onnx_subfunctions
+        if skip_vision:
+            vision_use_onnx_subfunctions = False
+        return vision_use_onnx_subfunctions, lang_use_onnx_subfunctions
+
+    def resolve_vlm_compile_device_counts(
+        self,
+        *,
+        num_devices: int,
+        vision_num_devices: Optional[int],
+        lang_num_devices: Optional[int],
+        skip_vision: bool,
+        skip_lang: bool,
+    ) -> tuple[Optional[int], Optional[int]]:
+        if vision_num_devices is None:
+            vision_num_devices = None if skip_vision else 1
+        if lang_num_devices is None:
+            lang_num_devices = None if skip_lang else num_devices
+        return vision_num_devices, lang_num_devices
+
     def _get_min_multimodal_prefill_seq_len(self) -> int:
-        # Allow a small text/template prefix ahead of the contiguous image placeholder block.
-        return self._get_mm_tokens_per_image() + 32
+        # Keep Gemma4 multimodal aligned to a single large prefill bucket so the
+        # contiguous 256-token image block fits in the first prefill pass.
+        return max(self._get_mm_tokens_per_image() + 32, 512)
 
     def get_prefill_seq_lens(self, prefill_seq_len: int, kv_offload: bool = False) -> List[int]:
-        seq_lens = [prefill_seq_len if prefill_seq_len else 32]
+        seq_len = int(prefill_seq_len if prefill_seq_len else 32)
         if kv_offload:
-            seq_lens.append(max(seq_lens[0], self._get_min_multimodal_prefill_seq_len()))
-        return sorted(set(int(x) for x in seq_lens))
+            seq_len = max(seq_len, self._get_min_multimodal_prefill_seq_len())
+        return [seq_len]
 
     def resolve_multimodal_prefill_chunk_lens(
         self,

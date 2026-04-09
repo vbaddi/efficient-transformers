@@ -538,6 +538,10 @@ def main():
     parser.add_argument("--generation-len", type=int, default=16)
     parser.add_argument("--num-cores", type=int, default=16)
     parser.add_argument("--device-group", type=parse_device_group, default=None)
+    parser.add_argument("--vision-device-group", type=parse_device_group, default=None)
+    parser.add_argument("--lang-device-group", type=parse_device_group, default=None)
+    parser.add_argument("--vision-num-devices", type=int, default=None)
+    parser.add_argument("--lang-num-devices", type=int, default=None)
     parser.add_argument("--use-onnx-subfunctions", action="store_true")
     parser.add_argument("--vision-use-onnx-subfunctions", action="store_true")
     parser.add_argument("--lang-use-onnx-subfunctions", action="store_true")
@@ -565,6 +569,16 @@ def main():
     effective_fp16clip = args.enable_fp16clip or use_image
     effective_convert_to_fp16 = True
     npi_mode = "enabled" if args.enable_npi else "disabled" if args.disable_npi else "auto"
+    runtime_lang_device_group = args.lang_device_group or args.device_group
+    runtime_vision_device_group = args.vision_device_group or args.device_group
+    if runtime_lang_device_group is None and args.lang_num_devices is not None:
+        if use_image:
+            vision_count = args.vision_num_devices or 1
+            runtime_lang_device_group = list(range(vision_count, vision_count + args.lang_num_devices))
+        else:
+            runtime_lang_device_group = list(range(args.lang_num_devices))
+    if use_image and runtime_vision_device_group is None and args.vision_num_devices is not None:
+        runtime_vision_device_group = list(range(args.vision_num_devices))
     hf_inputs = {k: v.clone() if hasattr(v, "clone") else v for k, v in inputs.items()}
     hf_ids = None
     ort_ids = None
@@ -619,7 +633,18 @@ def main():
             lang_onnx_path=str(onnx_paths[1]),
             prefill_seq_len=effective_prefill_seq_len,
             ctx_len=effective_ctx_len,
-            num_devices=(1 if args.device_group is None else len(args.device_group)),
+            num_devices=(
+                args.lang_num_devices
+                or (len(runtime_lang_device_group) if runtime_lang_device_group is not None else 1)
+            ),
+            vision_num_devices=(
+                args.vision_num_devices
+                or (len(runtime_vision_device_group) if runtime_vision_device_group is not None else 1)
+            ),
+            lang_num_devices=(
+                args.lang_num_devices
+                or (len(runtime_lang_device_group) if runtime_lang_device_group is not None else 1)
+            ),
             num_cores=args.num_cores,
             mxfp6_matmul=args.mxfp6_matmul,
             mxint8_kv_cache=args.mxint8_kv_cache,
@@ -637,7 +662,13 @@ def main():
             compile_kwargs["mos"] = args.mos
 
         qpc_path = model.compile(compile_dir=compile_dir, **compile_kwargs)
-        exec_info = model.generate(inputs=inputs, device_ids=args.device_group, generation_len=args.generation_len)
+        exec_info = model.generate(
+            inputs=inputs,
+            device_ids=args.device_group,
+            vision_device_ids=runtime_vision_device_group,
+            lang_device_ids=runtime_lang_device_group,
+            generation_len=args.generation_len,
+        )
         print_perf_stats(exec_info)
     else:
         tokenizer, hf_text_model = load_gemma4_text_model(args.model_name)
@@ -689,7 +720,14 @@ def main():
             lang_onnx_path=str(onnx_path),
             prefill_seq_len=effective_prefill_seq_len,
             ctx_len=effective_ctx_len,
-            num_devices=(1 if args.device_group is None else len(args.device_group)),
+            num_devices=(
+                args.lang_num_devices
+                or (len(runtime_lang_device_group) if runtime_lang_device_group is not None else 1)
+            ),
+            lang_num_devices=(
+                args.lang_num_devices
+                or (len(runtime_lang_device_group) if runtime_lang_device_group is not None else 1)
+            ),
             num_cores=args.num_cores,
             mxfp6_matmul=args.mxfp6_matmul,
             mxint8_kv_cache=args.mxint8_kv_cache,
@@ -709,6 +747,7 @@ def main():
             prompts=[rendered_prompt],
             tokenizer=tokenizer,
             device_ids=args.device_group,
+            lang_device_ids=runtime_lang_device_group,
             generation_len=args.generation_len,
         )
         onnx_paths = [str(onnx_path)]
@@ -730,6 +769,14 @@ def main():
                 "use_onnx_subfunctions": effective_use_onnx_subfunctions,
                 "vision_use_onnx_subfunctions": effective_vision_subfunctions,
                 "lang_use_onnx_subfunctions": effective_lang_subfunctions,
+                "vision_num_devices": (
+                    args.vision_num_devices
+                    or (len(runtime_vision_device_group) if runtime_vision_device_group is not None else None)
+                ),
+                "lang_num_devices": (
+                    args.lang_num_devices
+                    or (len(runtime_lang_device_group) if runtime_lang_device_group is not None else None)
+                ),
                 "mxfp6_matmul": args.mxfp6_matmul,
                 "mxint8_kv_cache": args.mxint8_kv_cache,
                 "npi_mode": npi_mode,

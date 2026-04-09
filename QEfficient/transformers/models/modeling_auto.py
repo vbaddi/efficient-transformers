@@ -9,7 +9,7 @@ import os
 import warnings
 from pathlib import Path
 from time import perf_counter
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import onnx
@@ -39,6 +39,7 @@ from QEfficient.generation.text_generation_inference import (
     PerfMetrics,
     calculate_latency,
     get_compilation_dims,
+    normalize_terminal_token_ids,
     write_io_files,
 )
 from QEfficient.generation.vlm_generation import VisionLanguageGeneration
@@ -156,6 +157,83 @@ def _resolve_multimodal_prefill_chunk_lens(
     input_ids_length = int(inputs["input_ids"].shape[1])
     num_chunks = -(input_ids_length // -default_prefill_seq_len)
     return [default_prefill_seq_len] * num_chunks
+
+
+def _resolve_vlm_subfunction_settings(
+    model: nn.Module,
+    use_onnx_subfunctions: bool,
+    vision_use_onnx_subfunctions: Optional[bool],
+    lang_use_onnx_subfunctions: Optional[bool],
+    skip_vision: bool,
+) -> tuple[bool, bool]:
+    if hasattr(model, "resolve_vlm_subfunction_settings"):
+        return model.resolve_vlm_subfunction_settings(
+            use_onnx_subfunctions=use_onnx_subfunctions,
+            vision_use_onnx_subfunctions=vision_use_onnx_subfunctions,
+            lang_use_onnx_subfunctions=lang_use_onnx_subfunctions,
+            skip_vision=skip_vision,
+        )
+
+    if vision_use_onnx_subfunctions is None:
+        vision_use_onnx_subfunctions = use_onnx_subfunctions
+    if lang_use_onnx_subfunctions is None:
+        lang_use_onnx_subfunctions = use_onnx_subfunctions
+    return vision_use_onnx_subfunctions, lang_use_onnx_subfunctions
+
+
+def _resolve_vlm_compile_device_counts(
+    model: nn.Module,
+    num_devices: int,
+    vision_num_devices: Optional[int],
+    lang_num_devices: Optional[int],
+    skip_vision: bool,
+    skip_lang: bool,
+) -> tuple[Optional[int], Optional[int]]:
+    if hasattr(model, "resolve_vlm_compile_device_counts"):
+        return model.resolve_vlm_compile_device_counts(
+            num_devices=num_devices,
+            vision_num_devices=vision_num_devices,
+            lang_num_devices=lang_num_devices,
+            skip_vision=skip_vision,
+            skip_lang=skip_lang,
+        )
+
+    if vision_num_devices is None:
+        vision_num_devices = None if skip_vision else num_devices
+    if lang_num_devices is None:
+        lang_num_devices = None if skip_lang else num_devices
+    return vision_num_devices, lang_num_devices
+
+
+def _resolve_dual_qpc_runtime_device_groups(
+    device_ids: Optional[List[int]],
+    vision_device_ids: Optional[List[int]],
+    lang_device_ids: Optional[List[int]],
+    compiled_vision_num_devices: Optional[int],
+    compiled_lang_num_devices: Optional[int],
+) -> tuple[Optional[List[int]], Optional[List[int]]]:
+    if vision_device_ids is not None or lang_device_ids is not None:
+        return (
+            vision_device_ids if vision_device_ids is not None else device_ids,
+            lang_device_ids if lang_device_ids is not None else device_ids,
+        )
+
+    if device_ids is None:
+        return None, None
+
+    if compiled_vision_num_devices is None or compiled_lang_num_devices is None:
+        return device_ids, device_ids
+
+    if len(device_ids) >= compiled_vision_num_devices + compiled_lang_num_devices:
+        return (
+            device_ids[:compiled_vision_num_devices],
+            device_ids[compiled_vision_num_devices : compiled_vision_num_devices + compiled_lang_num_devices],
+        )
+
+    return (
+        device_ids[:compiled_vision_num_devices],
+        device_ids[:compiled_lang_num_devices],
+    )
 
 
 class QEFFTransformersBase(QEFFBaseModel):
@@ -1566,10 +1644,13 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 qaic_config=self.lang_model.model.qaic_config,
             )
 
-        if vision_use_onnx_subfunctions is None:
-            vision_use_onnx_subfunctions = use_onnx_subfunctions
-        if lang_use_onnx_subfunctions is None:
-            lang_use_onnx_subfunctions = use_onnx_subfunctions
+        vision_use_onnx_subfunctions, lang_use_onnx_subfunctions = _resolve_vlm_subfunction_settings(
+            self.model,
+            use_onnx_subfunctions=use_onnx_subfunctions,
+            vision_use_onnx_subfunctions=vision_use_onnx_subfunctions,
+            lang_use_onnx_subfunctions=lang_use_onnx_subfunctions,
+            skip_vision=skip_vision,
+        )
 
         if not skip_vision:
             if self.vision_model is None:
@@ -1610,6 +1691,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         full_batch_size: Optional[int] = None,
         kv_cache_batch_size: Optional[int] = None,
         num_devices: int = 1,
+        vision_num_devices: Optional[int] = None,
+        lang_num_devices: Optional[int] = None,
         num_cores: int = 16,  # FIXME: Make this mandatory arg
         mxfp6_matmul: bool = False,
         mxint8_kv_cache: bool = False,
@@ -1644,7 +1727,12 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         kv_cache_batch_size : int, optional
             Not supported for this model; must be None.
         num_devices : int, optional
-            Number of devices to compile for. Default is 1.
+            Default number of devices to compile for. Used for the language decoder unless overridden.
+            Default is 1.
+        vision_num_devices : int, optional
+            Number of devices to compile the vision encoder for.
+        lang_num_devices : int, optional
+            Number of devices to compile the language decoder for.
         num_cores : int, optional
             Number of cores to use for compilation.
         mxfp6_matmul : bool, optional
@@ -1677,10 +1765,23 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         if skip_lang and skip_vision:
             raise ValueError("Expected at least one of 'skip_lang' or 'skip_vision' to be False")
 
-        if vision_use_onnx_subfunctions is None:
-            vision_use_onnx_subfunctions = use_onnx_subfunctions
-        if lang_use_onnx_subfunctions is None:
-            lang_use_onnx_subfunctions = use_onnx_subfunctions
+        vision_use_onnx_subfunctions, lang_use_onnx_subfunctions = _resolve_vlm_subfunction_settings(
+            self.model,
+            use_onnx_subfunctions=use_onnx_subfunctions,
+            vision_use_onnx_subfunctions=vision_use_onnx_subfunctions,
+            lang_use_onnx_subfunctions=lang_use_onnx_subfunctions,
+            skip_vision=skip_vision,
+        )
+        vision_num_devices, lang_num_devices = _resolve_vlm_compile_device_counts(
+            self.model,
+            num_devices=num_devices,
+            vision_num_devices=vision_num_devices,
+            lang_num_devices=lang_num_devices,
+            skip_vision=skip_vision,
+            skip_lang=skip_lang,
+        )
+        self._compiled_vision_num_devices = vision_num_devices
+        self._compiled_lang_num_devices = lang_num_devices
 
         vision_node_precision_info = compiler_options.pop("vision_node_precision_info", None)
         lang_node_precision_info = compiler_options.get("node_precision_info", None)
@@ -1796,7 +1897,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 specializations=specializations["vision"],
                 convert_to_fp16=True,
                 mxfp6_matmul=constants.VISION_MXFP6_MATMUL,
-                mdp_ts_num_devices=num_devices,
+                mdp_ts_num_devices=vision_num_devices,
                 aic_num_cores=num_cores,
                 custom_io=custom_io_vision,
                 mxint8_kv_cache=mxint8_kv_cache,
@@ -1837,7 +1938,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 specializations=specializations["lang"],
                 convert_to_fp16=True,
                 mxfp6_matmul=mxfp6_matmul,
-                mdp_ts_num_devices=num_devices,
+                mdp_ts_num_devices=lang_num_devices,
                 aic_num_cores=num_cores,
                 custom_io=custom_io_lang,
                 mxint8_kv_cache=mxint8_kv_cache,
@@ -1855,6 +1956,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         prompts: List[str] = None,
         streamer: Optional[TextStreamer] = None,
         device_ids: List[int] = None,
+        vision_device_ids: List[int] = None,
+        lang_device_ids: List[int] = None,
         runtime_ai100: bool = True,
         generation_len: Optional[int] = None,
         image_height: Optional[int] = None,
@@ -1884,6 +1987,10 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         device_ids : List[int], optional
             IDs of devices for running the QPC. E.g., `[0]` for a single device or
             `[0, 1, 2, 3]` for tensor slicing. Defaults to `[0]` if not specified.
+        vision_device_ids : List[int], optional
+            Explicit device IDs for the vision QPC.
+        lang_device_ids : List[int], optional
+            Explicit device IDs for the language QPC.
         runtime_ai100 : bool, optional
             If True, uses the AI 100 runtime. PyTorch runtime is not supported for this model.
             Default is True.
@@ -1917,6 +2024,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 inputs=inputs,
                 streamer=streamer,
                 device_ids=device_ids,
+                vision_device_ids=vision_device_ids,
+                lang_device_ids=lang_device_ids,
                 generation_len=generation_len,
             )
 
@@ -1931,6 +2040,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 tokenizer=tokenizer,
                 processor=processor,
                 device_id=device_ids,  # if device_ids is not None else [0],
+                vision_device_id=vision_device_ids,
+                lang_device_id=lang_device_ids,
                 ctx_len=ctx_len_comp,
                 full_batch_size=fbs,
                 comp_ctx_lengths_prefill=self.comp_ctx_lengths_prefill,
@@ -1938,6 +2049,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 image_height=image_height,
                 image_width=image_width,
                 write_io_dir=self._write_io_dir,
+                eos_token_ids=getattr(self.model.config, "eos_token_id", None),
                 **kwargs,
             )
 
@@ -1951,7 +2063,12 @@ class _QEffAutoModelForImageTextToTextDualQPC:
 
         # Fallback to kv_offload_generate for direct inputs (backward compatibility)
         return self.kv_offload_generate(
-            inputs=inputs, device_ids=device_ids, streamer=streamer, generation_len=generation_len
+            inputs=inputs,
+            device_ids=device_ids,
+            vision_device_ids=vision_device_ids,
+            lang_device_ids=lang_device_ids,
+            streamer=streamer,
+            generation_len=generation_len,
         )
 
     def kv_offload_generate(
@@ -1959,6 +2076,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         inputs: List[str] = None,
         streamer: Optional[TextStreamer] = None,
         device_ids: List[int] = None,
+        vision_device_ids: List[int] = None,
+        lang_device_ids: List[int] = None,
         generation_len: int = None,
     ):
         """
@@ -1993,11 +2112,19 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         if not self.lang_model.qpc_path:
             raise TypeError("Please run compile API for language model first!")
 
-        lang_session = QAICInferenceSession(self.lang_model.qpc_path, device_ids, activate=False)
+        resolved_vision_device_ids, resolved_lang_device_ids = _resolve_dual_qpc_runtime_device_groups(
+            device_ids=device_ids,
+            vision_device_ids=vision_device_ids,
+            lang_device_ids=lang_device_ids,
+            compiled_vision_num_devices=getattr(self, "_compiled_vision_num_devices", None),
+            compiled_lang_num_devices=getattr(self, "_compiled_lang_num_devices", None),
+        )
+
+        lang_session = QAICInferenceSession(self.lang_model.qpc_path, resolved_lang_device_ids, activate=False)
         internal_retained_kv = any(name.endswith("_InternalRetainedState") for name in lang_session.output_names)
 
         if self.vision_model is not None and self.vision_model.qpc_path:
-            vision_session = QAICInferenceSession(self.vision_model.qpc_path, device_ids)
+            vision_session = QAICInferenceSession(self.vision_model.qpc_path, resolved_vision_device_ids)
 
         batch_size, ctx_len, fbs = get_compilation_dims(self.lang_model.qpc_path)
 
@@ -2026,6 +2153,9 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             generation_len = ctx_len - input_len.max()
         assert generation_len > 0, "generation length should be greater than zero"
         generated_ids = np.full((batch_size, generation_len + 1), pad_token_id)
+        terminal_token_ids = normalize_terminal_token_ids(
+            eos_token_ids=getattr(self.model.config, "eos_token_id", None)
+        )
 
         inputs["input_ids"] = torch.nn.functional.pad(
             inputs["input_ids"],
@@ -2147,6 +2277,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             bs, _, num_images, img_tiles = lang_inputs["cross_attention_mask"].shape
             lang_inputs["cross_attention_mask"] = torch.ones((bs, 1, num_images, img_tiles), dtype=torch.int64).numpy()
         generated_ids[:, 0] = lang_inputs["input_ids"].squeeze(1)
+        finished_sequences = np.isin(lang_inputs["input_ids"], terminal_token_ids)
 
         if streamer:
             streamer.put(lang_inputs["input_ids"][0])
@@ -2168,6 +2299,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
 
         decode_start = perf_counter()
         for num_token in range(1, generation_len):
+            if finished_sequences.all():
+                break
             if self.comp_ctx_lengths_decode is not None:
                 if max_position_id >= self.comp_ctx_lengths_decode[ccl_id] - 1:
                     ccl_id = min(ccl_id + 1, max_ccl_id)
@@ -2190,6 +2323,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             generated_ids[:, num_token] = lang_inputs["input_ids"].squeeze(1)
             if streamer:
                 streamer.put(lang_inputs["input_ids"][0])
+            finished_sequences |= np.isin(lang_inputs["input_ids"], terminal_token_ids)
 
         decode_end = perf_counter()
         if streamer:
