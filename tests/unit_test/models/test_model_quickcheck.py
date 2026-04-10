@@ -30,6 +30,16 @@ GENERATE_PROMPT_LEN = 4
 GENERATE_CTX_LEN = 8
 
 
+def _chunk_boundaries(chunk_lens):
+    start = 0
+    boundaries = []
+    for length in chunk_lens:
+        end = start + length
+        boundaries.append((start, end))
+        start = end
+    return boundaries
+
+
 def _skip_on_model_fetch_error(exc: Exception, model_id: str) -> None:
     pytest.skip(
         f"Skipping {model_id}: model unavailable or unsupported in this environment ({type(exc).__name__}: {exc})"
@@ -183,3 +193,41 @@ def test_gemma4_text_compile_and_generate_smoke_with_subfunctions(model_type, mo
         cloud_ai_100_tokens = cloud_ai_100_tokens.reshape(1, -1)
     assert cloud_ai_100_tokens.shape[0] == 1
     assert cloud_ai_100_tokens.shape[-1] >= api_runner.gen_len
+
+
+@pytest.mark.llm_model
+def test_gemma4_multimodal_chunk_scheduler_handles_deep_image_prefix():
+    model_id = GEMMA4_TEXT_MODEL_IDS["gemma4_dense"]
+    try:
+        qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            kv_offload=True,
+            dtype="float32",
+        )
+    except Exception as exc:
+        _skip_on_model_fetch_error(exc, model_id)
+
+    total_len = 1200
+    image_start = 700
+    image_end = image_start + 256
+    prefill_seq_len = 128
+    inputs = {
+        "input_ids": torch.zeros((1, total_len), dtype=torch.int64),
+        "mm_token_type_ids": torch.zeros((1, total_len), dtype=torch.int64),
+    }
+    inputs["mm_token_type_ids"][:, image_start:image_end] = 1
+
+    chunk_lens = qeff_model.model.resolve_multimodal_prefill_chunk_lens(
+        inputs,
+        prefill_seq_len=prefill_seq_len,
+        available_prefill_seq_lens=[512],
+    )
+
+    assert sum(chunk_lens) == total_len
+    assert 512 in chunk_lens
+
+    chunk_ranges = _chunk_boundaries(chunk_lens)
+    covering_chunks = [(start, end) for start, end in chunk_ranges if start <= image_start and end >= image_end]
+    assert len(covering_chunks) == 1
+    assert all(length <= 512 for length in chunk_lens)

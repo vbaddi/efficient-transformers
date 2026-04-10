@@ -975,13 +975,21 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
         prefill_seq_len: int,
         available_prefill_seq_lens: Optional[List[int]] = None,
     ) -> List[int]:
+        def split_into_contiguous_chunks(total_len: int, chunk_len: int) -> List[int]:
+            if total_len <= 0:
+                return []
+            num_full_chunks, remainder = divmod(total_len, chunk_len)
+            chunk_lens = [chunk_len] * num_full_chunks
+            if remainder:
+                chunk_lens.append(remainder)
+            return chunk_lens
+
         input_ids = inputs["input_ids"]
         total_len = int(input_ids.shape[1])
 
         mm_token_type_ids = inputs.get("mm_token_type_ids")
         if mm_token_type_ids is None:
-            num_chunks = -(total_len // -prefill_seq_len)
-            return [prefill_seq_len] * num_chunks
+            return split_into_contiguous_chunks(total_len, prefill_seq_len)
 
         if isinstance(mm_token_type_ids, np.ndarray):
             mm_token_type_ids = torch.from_numpy(mm_token_type_ids)
@@ -991,33 +999,43 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
         is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
         vision_positions = torch.nonzero(is_vision, as_tuple=False).flatten()
         if vision_positions.numel() == 0:
-            num_chunks = -(total_len // -prefill_seq_len)
-            return [prefill_seq_len] * num_chunks
+            return split_into_contiguous_chunks(total_len, prefill_seq_len)
 
-        required_first_chunk_len = int(vision_positions[-1].item()) + 1
+        image_start = int(vision_positions[0].item())
+        image_end = int(vision_positions[-1].item())
+        image_block_len = image_end - image_start + 1
         candidate_prefill_seq_lens = (
             sorted({int(x) for x in available_prefill_seq_lens if int(x) > 1})
             if available_prefill_seq_lens
             else self.get_prefill_seq_lens(prefill_seq_len, kv_offload=True)
         )
-        first_chunk_len = next(
-            (seq_len for seq_len in candidate_prefill_seq_lens if seq_len >= required_first_chunk_len),
+        image_chunk_bucket_len = next(
+            (seq_len for seq_len in candidate_prefill_seq_lens if seq_len >= image_block_len),
             None,
         )
-        if first_chunk_len is None:
+        if image_chunk_bucket_len is None:
             raise ValueError(
-                "No compiled multimodal prefill specialization is large enough for Gemma4's image block. "
-                f"Required >= {required_first_chunk_len}, available={candidate_prefill_seq_lens}."
+                "No compiled multimodal prefill specialization is large enough for Gemma4's image block length. "
+                f"Required >= {image_block_len}, available={candidate_prefill_seq_lens}."
             )
 
+        # Keep the user-requested logical chunk size for text-prefill scheduling.
+        # Runtime pads shorter logical chunks back to a compiled prefill bucket.
         base_chunk_len = prefill_seq_len
-        if available_prefill_seq_lens and base_chunk_len not in candidate_prefill_seq_lens:
-            base_chunk_len = min(candidate_prefill_seq_lens)
 
-        remaining_tokens = max(total_len - first_chunk_len, 0)
-        chunk_lens = [first_chunk_len]
-        if remaining_tokens > 0:
-            chunk_lens.extend([base_chunk_len] * (-(remaining_tokens // -base_chunk_len)))
+        # Place one chunk so that it fully contains the contiguous image block
+        # while keeping as much preceding text as possible in regular prefix chunks.
+        image_chunk_start = max(0, image_end - image_chunk_bucket_len + 1)
+        prefix_len = image_chunk_start
+        chunk_lens = split_into_contiguous_chunks(prefix_len, base_chunk_len)
+
+        image_chunk_logical_len = min(total_len - image_chunk_start, image_chunk_bucket_len)
+        chunk_lens.append(image_chunk_logical_len)
+
+        suffix_start = image_chunk_start + image_chunk_logical_len
+        suffix_len = max(total_len - suffix_start, 0)
+        if suffix_len > 0:
+            chunk_lens.extend(split_into_contiguous_chunks(suffix_len, base_chunk_len))
         return chunk_lens
 
     def get_qeff_vision_encoder(self):
@@ -1027,6 +1045,18 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
         return QEffGemma4DecoderWrapper(self)
 
     def generate_npi_file(self, onnx_path: Union[str, Path], model_name: Optional[str] = None) -> str:
+        text_config = getattr(self.config, "text_config", None)
+        is_moe_config = bool(
+            getattr(text_config, "enable_moe_block", False)
+            or (getattr(text_config, "num_experts", 0) or 0) > 0
+            or (getattr(text_config, "moe_intermediate_size", 0) or 0) > 0
+        )
+        if is_moe_config and not getattr(self, "_qeff_skip_vision_for_compile", False):
+            onnx_path = Path(onnx_path)
+            npi_path = onnx_path.with_name(f"{onnx_path.stem}_gemma4_npi.yaml")
+            with open(npi_path, "w") as fp:
+                yaml.safe_dump({"FP32NodeInstanceNames": []}, fp, sort_keys=False)
+            return str(npi_path)
         return QEffGemma4ForCausalLM.generate_npi_file(self, onnx_path, model_name)
 
     def generate_vision_npi_file(self, onnx_path: Union[str, Path], model_name: Optional[str] = None) -> str:

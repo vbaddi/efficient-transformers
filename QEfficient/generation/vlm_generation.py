@@ -40,6 +40,28 @@ from QEfficient.utils.constants import Constants
 from QEfficient.utils.logging_utils import logger
 
 
+def _get_available_prefill_seq_lens(session: QAICInferenceSession) -> List[int]:
+    input_ids_binding_idx = session.binding_index_map["input_ids"]
+    seq_lens = {
+        int(allowed_shape[input_ids_binding_idx][1][1])
+        for allowed_shape in (session.allowed_shapes or [])
+        if int(allowed_shape[input_ids_binding_idx][1][1]) > 1
+    }
+    binding_seq_len = int(session.bindings[input_ids_binding_idx].dims[1])
+    if binding_seq_len > 1:
+        seq_lens.add(binding_seq_len)
+    return sorted(seq_lens)
+
+
+def _pad_last_dim(array: np.ndarray, target_seq_len: int, pad_value: int) -> np.ndarray:
+    pad_len = target_seq_len - array.shape[-1]
+    if pad_len <= 0:
+        return array
+    pad_width = [(0, 0)] * array.ndim
+    pad_width[-1] = (0, pad_len)
+    return np.pad(array, pad_width, mode="constant", constant_values=pad_value)
+
+
 class VisionLanguageGeneration(QEffTextGenerationBase):
     """
     Enhanced vision-language generation class inheriting from QEffTextGenerationBase.
@@ -364,10 +386,22 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
                     lang_inputs[op] = self.sampling_params[op]
 
         chunk_start = 0
+        available_prefill_seq_lens = _get_available_prefill_seq_lens(self._session)
         for i, chunk_seq_len in enumerate(chunk_seq_lens):
             chunk_end = chunk_start + chunk_seq_len
+            target_seq_len = next(
+                (seq_len for seq_len in available_prefill_seq_lens if seq_len >= chunk_seq_len),
+                None,
+            )
+            if target_seq_len is None:
+                raise ValueError(
+                    f"No compiled prefill specialization can serve logical chunk length {chunk_seq_len}; "
+                    f"available={available_prefill_seq_lens}"
+                )
             input_ids_slice = lang_inputs["input_ids"][:, chunk_start:chunk_end]
             position_ids_slice = lang_inputs["position_ids"][..., chunk_start:chunk_end]
+            input_ids_slice = _pad_last_dim(input_ids_slice, target_seq_len, self.tokenizer.pad_token_id)
+            position_ids_slice = _pad_last_dim(position_ids_slice, target_seq_len, -1)
 
             chunk_inputs = {
                 "input_ids": input_ids_slice,
@@ -375,7 +409,8 @@ class VisionLanguageGeneration(QEffTextGenerationBase):
                 "image_idx": chunk_image_idx if chunk_image_idx is not None else np.array([[0]], dtype=np.int64),
             }
             if "mm_token_type_ids" in lang_inputs:
-                chunk_inputs["mm_token_type_ids"] = lang_inputs["mm_token_type_ids"][:, chunk_start:chunk_end]
+                mm_token_type_ids_slice = lang_inputs["mm_token_type_ids"][:, chunk_start:chunk_end]
+                chunk_inputs["mm_token_type_ids"] = _pad_last_dim(mm_token_type_ids_slice, target_seq_len, 0)
 
             if decode_batch_id is not None:
                 chunk_inputs["batch_index"] = decode_batch_id

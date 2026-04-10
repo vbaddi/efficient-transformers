@@ -159,6 +159,15 @@ def _resolve_multimodal_prefill_chunk_lens(
     return [default_prefill_seq_len] * num_chunks
 
 
+def _pad_prefill_input_last_dim(array: np.ndarray, target_seq_len: int, pad_value: int) -> np.ndarray:
+    pad_len = target_seq_len - array.shape[-1]
+    if pad_len <= 0:
+        return array
+    pad_width = [(0, 0)] * array.ndim
+    pad_width[-1] = (0, pad_len)
+    return np.pad(array, pad_width, mode="constant", constant_values=pad_value)
+
+
 def _resolve_vlm_subfunction_settings(
     model: nn.Module,
     use_onnx_subfunctions: bool,
@@ -1785,6 +1794,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
 
         vision_node_precision_info = compiler_options.pop("vision_node_precision_info", None)
         lang_node_precision_info = compiler_options.get("node_precision_info", None)
+        setattr(self.model, "_qeff_skip_vision_for_compile", skip_vision)
 
         if self.continuous_batching and full_batch_size is None:
             raise TypeError("`full_batch_size` is required when `continuous_batching=True`.")
@@ -2249,10 +2259,26 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 prefill_ccl_id = min(prefill_ccl_id + 1, len(self.comp_ctx_lengths_prefill) - 1)
                 chunk_inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths_prefill[prefill_ccl_id]
 
-            chunk_inputs["input_ids"] = lang_inputs["input_ids"][:, chunk_start:chunk_end]
-            chunk_inputs["position_ids"] = lang_inputs["position_ids"][..., chunk_start:chunk_end]
+            target_seq_len = next(
+                (seq_len for seq_len in available_prefill_seq_lens if seq_len >= chunk_seq_len),
+                None,
+            )
+            if target_seq_len is None:
+                raise ValueError(
+                    f"No compiled prefill specialization can serve logical chunk length {chunk_seq_len}; "
+                    f"available={available_prefill_seq_lens}"
+                )
+
+            chunk_inputs["input_ids"] = _pad_prefill_input_last_dim(
+                lang_inputs["input_ids"][:, chunk_start:chunk_end], target_seq_len, pad_token_id
+            )
+            chunk_inputs["position_ids"] = _pad_prefill_input_last_dim(
+                lang_inputs["position_ids"][..., chunk_start:chunk_end], target_seq_len, -1
+            )
             if "mm_token_type_ids" in lang_inputs:
-                chunk_inputs["mm_token_type_ids"] = lang_inputs["mm_token_type_ids"][:, chunk_start:chunk_end]
+                chunk_inputs["mm_token_type_ids"] = _pad_prefill_input_last_dim(
+                    lang_inputs["mm_token_type_ids"][:, chunk_start:chunk_end], target_seq_len, 0
+                )
             outputs = lang_session.run(chunk_inputs)
             if not internal_retained_kv:
                 lang_session.set_buffers(_get_retained_state_input_updates(outputs))

@@ -1,12 +1,15 @@
 import argparse
 import copy
 import json
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
 import onnxruntime as ort
+import requests
 import torch
+from PIL import Image
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor
 
 from QEfficient import QEFFAutoModelForCausalLM, QEFFAutoModelForImageTextToText
@@ -93,7 +96,7 @@ def is_gemma4_moe_config(config) -> bool:
 
 def build_messages(system_prompt: str, user_prompt: str, use_image: bool):
     messages = []
-    if system_prompt and not use_image:
+    if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     if use_image:
         messages.append(
@@ -110,19 +113,24 @@ def build_messages(system_prompt: str, user_prompt: str, use_image: bool):
     return messages
 
 
+def load_image(image_source: str):
+    if image_source.startswith(("http://", "https://")):
+        response = requests.get(image_source, stream=True, timeout=30)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert("RGB")
+    return Image.open(image_source).convert("RGB")
+
+
 def prepare_inputs(processor, system_prompt: str, user_prompt: str, image_source: str | None):
     use_image = image_source is not None
     messages = build_messages(system_prompt, user_prompt, use_image)
     if use_image:
-        messages[-1]["content"][0]["url"] = image_source
-        inputs = processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            add_generation_prompt=True,
+        rendered_messages = copy.deepcopy(messages)
+        rendered_messages[-1]["content"][0]["url"] = image_source
+        rendered_prompt = processor.tokenizer.apply_chat_template(
+            rendered_messages, tokenize=False, add_generation_prompt=True
         )
-        rendered_prompt = processor.decode(inputs["input_ids"][0], skip_special_tokens=False)
+        inputs = processor(text=rendered_prompt, images=load_image(image_source), return_tensors="pt")
     else:
         rendered_prompt = processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor.tokenizer.apply_chat_template(
@@ -362,6 +370,15 @@ def update_decoder_inputs(inputs: dict[str, np.ndarray], outputs: dict[str, np.n
     return next_inputs
 
 
+def pad_prefill_input_last_dim(array: np.ndarray, target_seq_len: int, pad_value: int) -> np.ndarray:
+    pad_amount = target_seq_len - array.shape[-1]
+    if pad_amount <= 0:
+        return array
+    pad_width = [(0, 0)] * array.ndim
+    pad_width[-1] = (0, pad_amount)
+    return np.pad(array, pad_width, mode="constant", constant_values=pad_value)
+
+
 def build_vlm_ort_tokens(
     model, onnx_paths, inputs, generation_len: int, ctx_len: int, prefill_seq_len: int, pad_token_id: int
 ):
@@ -383,7 +400,10 @@ def build_vlm_ort_tokens(
     )
     vision_embeds = vision_outputs["vision_embeds"]
 
-    chunk_seq_lens = model.model.resolve_multimodal_prefill_chunk_lens(inputs, prefill_seq_len)
+    available_prefill_seq_lens = sorted(model.model.get_prefill_seq_lens(prefill_seq_len, kv_offload=True))
+    chunk_seq_lens = model.model.resolve_multimodal_prefill_chunk_lens(
+        inputs, prefill_seq_len, available_prefill_seq_lens
+    )
     actual_chunk_seq_lens = []
     remaining_tokens = int(inputs["input_ids"].shape[1])
     for chunk_seq_len in chunk_seq_lens:
@@ -400,12 +420,24 @@ def build_vlm_ort_tokens(
     chunk_start = 0
     for chunk_seq_len in actual_chunk_seq_lens:
         chunk_end = chunk_start + chunk_seq_len
+        target_seq_len = next((seq_len for seq_len in available_prefill_seq_lens if seq_len >= chunk_seq_len), None)
+        if target_seq_len is None:
+            raise ValueError(
+                f"No prefill bucket can serve logical multimodal chunk length {chunk_seq_len}; "
+                f"available={available_prefill_seq_lens}"
+            )
         chunk_inputs = {
-            "input_ids": decoder_state["input_ids"][:, chunk_start:chunk_end],
-            "position_ids": decoder_state["position_ids"][:, chunk_start:chunk_end],
+            "input_ids": pad_prefill_input_last_dim(
+                decoder_state["input_ids"][:, chunk_start:chunk_end], target_seq_len, pad_token_id
+            ),
+            "position_ids": pad_prefill_input_last_dim(
+                decoder_state["position_ids"][:, chunk_start:chunk_end], target_seq_len, -1
+            ),
             "vision_embeds": decoder_state["vision_embeds"],
             "image_idx": chunk_image_idx,
-            "mm_token_type_ids": decoder_state["mm_token_type_ids"][:, chunk_start:chunk_end],
+            "mm_token_type_ids": pad_prefill_input_last_dim(
+                decoder_state["mm_token_type_ids"][:, chunk_start:chunk_end], target_seq_len, 0
+            ),
         }
         for i in range(num_layers):
             chunk_inputs[f"past_key.{i}"] = decoder_state[f"past_key.{i}"]

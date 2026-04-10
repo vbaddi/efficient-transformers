@@ -6,9 +6,13 @@
 # -----------------------------------------------------------------------------
 
 import argparse
+import copy
+from io import BytesIO
 
 import numpy as np
+import requests
 import torch
+from PIL import Image
 from transformers import AutoProcessor, TextStreamer
 
 from QEfficient import QEFFAutoModelForImageTextToText
@@ -34,32 +38,47 @@ def parse_device_group(device_ids: str | None):
     return [int(x) for x in device_ids.strip("[]").split(",") if x.strip()]
 
 
-def build_inputs(processor, prompt: str, image_url: str | None):
+def build_messages(prompt: str, image_url: str | None):
     if image_url is None:
-        messages = [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": prompt}],
-            }
-        ]
-    else:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "url": image_url},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        return [{"role": "user", "content": prompt}]
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
 
-    inputs = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    )
+
+def load_image(image_url: str):
+    if image_url.startswith(("http://", "https://")):
+        response = requests.get(image_url, stream=True, timeout=30)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert("RGB")
+    return Image.open(image_url).convert("RGB")
+
+
+def build_inputs(processor, prompt: str, image_url: str | None):
+    messages = build_messages(prompt, image_url)
+    if image_url is None:
+        inputs = processor.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+    else:
+        rendered_messages = copy.deepcopy(messages)
+        rendered_messages[0]["content"][0]["url"] = image_url
+        rendered_prompt = processor.tokenizer.apply_chat_template(
+            rendered_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = processor(text=rendered_prompt, images=load_image(image_url), return_tensors="pt")
     if "pixel_values" in inputs:
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.float32)
     return inputs
