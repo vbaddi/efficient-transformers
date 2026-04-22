@@ -6,6 +6,7 @@
 # -----------------------------------------------------------------------------
 
 import warnings
+from functools import partial
 from types import MethodType
 from typing import Callable, Optional, Tuple, Union
 
@@ -193,29 +194,59 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeRotaryEmbedding,
     Qwen3MoeSparseMoeBlock,
 )
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLForConditionalGeneration,
-    Qwen3VLModel,
-    Qwen3VLTextAttention,
-    Qwen3VLTextDecoderLayer,
-    Qwen3VLTextModel,
-    Qwen3VLTextRMSNorm,
-    Qwen3VLTextRotaryEmbedding,
-    Qwen3VLVisionAttention,
-    Qwen3VLVisionModel,
-)
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-    Qwen3VLMoeForConditionalGeneration,
-    Qwen3VLMoeModel,
-    Qwen3VLMoeTextAttention,
-    Qwen3VLMoeTextDecoderLayer,
-    Qwen3VLMoeTextModel,
-    Qwen3VLMoeTextRMSNorm,
-    Qwen3VLMoeTextRotaryEmbedding,
-    Qwen3VLMoeTextSparseMoeBlock,
-    Qwen3VLMoeVisionAttention,
-    Qwen3VLMoeVisionModel,
-)
+try:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLModel,
+        Qwen3VLTextAttention,
+        Qwen3VLTextDecoderLayer,
+        Qwen3VLTextModel,
+        Qwen3VLTextRMSNorm,
+        Qwen3VLTextRotaryEmbedding,
+        Qwen3VLVisionAttention,
+        Qwen3VLVisionModel,
+    )
+except ModuleNotFoundError:
+    class _UnavailableQwen3VLModule(nn.Module):
+        pass
+
+    Qwen3VLForConditionalGeneration = _UnavailableQwen3VLModule
+    Qwen3VLModel = _UnavailableQwen3VLModule
+    Qwen3VLTextAttention = _UnavailableQwen3VLModule
+    Qwen3VLTextDecoderLayer = _UnavailableQwen3VLModule
+    Qwen3VLTextModel = _UnavailableQwen3VLModule
+    Qwen3VLTextRMSNorm = _UnavailableQwen3VLModule
+    Qwen3VLTextRotaryEmbedding = _UnavailableQwen3VLModule
+    Qwen3VLVisionAttention = _UnavailableQwen3VLModule
+    Qwen3VLVisionModel = _UnavailableQwen3VLModule
+
+try:
+    from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+        Qwen3VLMoeForConditionalGeneration,
+        Qwen3VLMoeModel,
+        Qwen3VLMoeTextAttention,
+        Qwen3VLMoeTextDecoderLayer,
+        Qwen3VLMoeTextModel,
+        Qwen3VLMoeTextRMSNorm,
+        Qwen3VLMoeTextRotaryEmbedding,
+        Qwen3VLMoeTextSparseMoeBlock,
+        Qwen3VLMoeVisionAttention,
+        Qwen3VLMoeVisionModel,
+    )
+except ModuleNotFoundError:
+    class _UnavailableQwen3VLMoeModule(nn.Module):
+        pass
+
+    Qwen3VLMoeForConditionalGeneration = _UnavailableQwen3VLMoeModule
+    Qwen3VLMoeModel = _UnavailableQwen3VLMoeModule
+    Qwen3VLMoeTextAttention = _UnavailableQwen3VLMoeModule
+    Qwen3VLMoeTextDecoderLayer = _UnavailableQwen3VLMoeModule
+    Qwen3VLMoeTextModel = _UnavailableQwen3VLMoeModule
+    Qwen3VLMoeTextRMSNorm = _UnavailableQwen3VLMoeModule
+    Qwen3VLMoeTextRotaryEmbedding = _UnavailableQwen3VLMoeModule
+    Qwen3VLMoeTextSparseMoeBlock = _UnavailableQwen3VLMoeModule
+    Qwen3VLMoeVisionAttention = _UnavailableQwen3VLMoeModule
+    Qwen3VLMoeVisionModel = _UnavailableQwen3VLMoeModule
 from transformers.models.starcoder2.modeling_starcoder2 import (
     Starcoder2Attention,
     Starcoder2DecoderLayer,
@@ -455,28 +486,57 @@ from QEfficient.transformers.models.qwen3_moe.modeling_qwen3_moe import (
     QEffQwen3MoeRotaryEmbedding,
     QEffQwen3MoeSparseMoeBlock,
 )
-from QEfficient.transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    QEffQwen3VLForConditionalGeneration,
-    QEffQwen3VLModel,
-    QEffQwen3VLTextAttention,
-    QEffQwen3VLTextDecoderLayer,
-    QEffQwen3VLTextModel,
-    QEffQwen3VLTextRotaryEmbedding,
-    QEffQwen3VLVisionAttention,
-    QEffQwen3VLVisionModel,
-)
-from QEfficient.transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-    QEffPrefillChunkedQwen3VLMoeTextSparseMoeBlock,
-    QEffQwen3VLMoeForConditionalGeneration,
-    QEffQwen3VLMoeModel,
-    QEffQwen3VLMoeTextAttention,
-    QEffQwen3VLMoeTextDecoderLayer,
-    QEffQwen3VLMoeTextModel,
-    QEffQwen3VLMoeTextRotaryEmbedding,
-    QEffQwen3VLMoeTextSparseMoeBlock,
-    QEffQwen3VLMoeVisionAttention,
-    QEffQwen3VLMoeVisionModel,
-)
+try:
+    from QEfficient.transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        QEffQwen3VLForConditionalGeneration,
+        QEffQwen3VLModel,
+        QEffQwen3VLTextAttention,
+        QEffQwen3VLTextDecoderLayer,
+        QEffQwen3VLTextModel,
+        QEffQwen3VLTextRotaryEmbedding,
+        QEffQwen3VLVisionAttention,
+        QEffQwen3VLVisionModel,
+    )
+except ModuleNotFoundError:
+    class _UnavailableQEffQwen3VLModule(nn.Module):
+        pass
+
+    QEffQwen3VLForConditionalGeneration = _UnavailableQEffQwen3VLModule
+    QEffQwen3VLModel = _UnavailableQEffQwen3VLModule
+    QEffQwen3VLTextAttention = _UnavailableQEffQwen3VLModule
+    QEffQwen3VLTextDecoderLayer = _UnavailableQEffQwen3VLModule
+    QEffQwen3VLTextModel = _UnavailableQEffQwen3VLModule
+    QEffQwen3VLTextRotaryEmbedding = _UnavailableQEffQwen3VLModule
+    QEffQwen3VLVisionAttention = _UnavailableQEffQwen3VLModule
+    QEffQwen3VLVisionModel = _UnavailableQEffQwen3VLModule
+
+try:
+    from QEfficient.transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+        QEffPrefillChunkedQwen3VLMoeTextSparseMoeBlock,
+        QEffQwen3VLMoeForConditionalGeneration,
+        QEffQwen3VLMoeModel,
+        QEffQwen3VLMoeTextAttention,
+        QEffQwen3VLMoeTextDecoderLayer,
+        QEffQwen3VLMoeTextModel,
+        QEffQwen3VLMoeTextRotaryEmbedding,
+        QEffQwen3VLMoeTextSparseMoeBlock,
+        QEffQwen3VLMoeVisionAttention,
+        QEffQwen3VLMoeVisionModel,
+    )
+except ModuleNotFoundError:
+    class _UnavailableQEffQwen3VLMoeModule(nn.Module):
+        pass
+
+    QEffPrefillChunkedQwen3VLMoeTextSparseMoeBlock = _UnavailableQEffQwen3VLMoeModule
+    QEffQwen3VLMoeForConditionalGeneration = _UnavailableQEffQwen3VLMoeModule
+    QEffQwen3VLMoeModel = _UnavailableQEffQwen3VLMoeModule
+    QEffQwen3VLMoeTextAttention = _UnavailableQEffQwen3VLMoeModule
+    QEffQwen3VLMoeTextDecoderLayer = _UnavailableQEffQwen3VLMoeModule
+    QEffQwen3VLMoeTextModel = _UnavailableQEffQwen3VLMoeModule
+    QEffQwen3VLMoeTextRotaryEmbedding = _UnavailableQEffQwen3VLMoeModule
+    QEffQwen3VLMoeTextSparseMoeBlock = _UnavailableQEffQwen3VLMoeModule
+    QEffQwen3VLMoeVisionAttention = _UnavailableQEffQwen3VLMoeModule
+    QEffQwen3VLMoeVisionModel = _UnavailableQEffQwen3VLMoeModule
 from QEfficient.transformers.models.starcoder2.modeling_starcoder2 import (
     QEffStarcoder2Attention,
     QEFFStarcoder2DecoderLayer,
@@ -1027,4 +1087,24 @@ class BlockingAttentionTransform:
                 transformed = True
             elif module.__class__.__name__.endswith("Attention") and type(module) not in supported_attention_classes:
                 warnings.warn(f"Blocking is not yet supported for {type(module)}.")
+        return model, transformed
+
+
+class BlockedKVAttentionTransform:
+    _module_mapping = {
+        QEffLlamaAttention,
+        QEffQwen2_5_VLAttention,
+    }
+
+    @classmethod
+    def apply(cls, model: nn.Module, num_kv_blocks) -> Tuple[nn.Module, bool]:
+        transformed = False
+        for module in model.modules():
+            if type(module) in cls._module_mapping:
+                repl_module = type(module)
+                module.__class__ = repl_module
+                module.forward = MethodType(partial(repl_module.forward, num_kv_blocks=num_kv_blocks), module)
+                transformed = True
+            elif module.__class__.__name__.endswith("Attention") and type(module) not in cls._module_mapping:
+                warnings.warn(f"KV blocking is not yet supported for {type(module)}.")
         return model, transformed

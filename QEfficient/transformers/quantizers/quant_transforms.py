@@ -9,7 +9,12 @@ import torch
 from torch import nn
 from transformers import AutoConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextExperts
+
+try:
+    from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextExperts
+except ModuleNotFoundError:
+    class Qwen3VLMoeTextExperts(nn.Module):
+        pass
 
 from QEfficient.base.pytorch_transforms import ModuleMutatorTransform
 from QEfficient.customop.matmulnbits import QuantLinearORT

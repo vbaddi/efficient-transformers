@@ -18,24 +18,28 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 # Placeholder for all non-transformer models registered in QEfficient
 import warnings  # noqa: I001
 
-import QEfficient.utils.model_registery  # noqa: F401
-from QEfficient.base import (
-    QEFFAutoModel,
-    QEFFAutoModelForCausalLM,
-    QEFFAutoModelForCTC,
-    QEFFAutoModelForImageTextToText,
-    QEFFAutoModelForSequenceClassification,
-    QEFFAutoModelForSpeechSeq2Seq,
-    QEFFCommonLoader,
-)
-from QEfficient.compile.compile_helper import compile
-from QEfficient.diffusers.pipelines.flux.pipeline_flux import QEffFluxPipeline
-from QEfficient.diffusers.pipelines.wan.pipeline_wan import QEffWanPipeline
-from QEfficient.diffusers.pipelines.wan.pipeline_wan_i2v import QEffWanImageToVideoPipeline
-from QEfficient.exporter.export_hf_to_cloud_ai_100 import qualcomm_efficient_converter
-from QEfficient.generation.text_generation_inference import cloud_ai_100_exec_kv
-from QEfficient.peft import QEffAutoPeftModelForCausalLM
-from QEfficient.transformers.transform import transform
+try:
+    import QEfficient.utils.model_registery  # noqa: F401
+    from QEfficient.base import (
+        QEFFAutoModel,
+        QEFFAutoModelForCausalLM,
+        QEFFAutoModelForCTC,
+        QEFFAutoModelForImageTextToText,
+        QEFFAutoModelForSequenceClassification,
+        QEFFAutoModelForSpeechSeq2Seq,
+        QEFFCommonLoader,
+    )
+    from QEfficient.compile.compile_helper import compile
+    from QEfficient.diffusers.pipelines.flux.pipeline_flux import QEffFluxPipeline
+    from QEfficient.diffusers.pipelines.wan.pipeline_wan import QEffWanPipeline
+    from QEfficient.diffusers.pipelines.wan.pipeline_wan_i2v import QEffWanImageToVideoPipeline
+    from QEfficient.exporter.export_hf_to_cloud_ai_100 import qualcomm_efficient_converter
+    from QEfficient.generation.text_generation_inference import cloud_ai_100_exec_kv
+    from QEfficient.peft import QEffAutoPeftModelForCausalLM
+    from QEfficient.transformers.transform import transform
+except ModuleNotFoundError as exc:
+    warnings.warn(f"Skipping optional QEfficient top-level imports: {exc}")
+    qualcomm_efficient_converter = None
 from QEfficient.utils import custom_format_warning
 from QEfficient.utils.logging_utils import logger
 

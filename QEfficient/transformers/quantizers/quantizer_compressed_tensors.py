@@ -10,12 +10,16 @@ from enum import Enum
 from typing import List
 
 import torch
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextExperts
 from transformers.quantizers.quantizer_compressed_tensors import CompressedTensorsHfQuantizer
 from transformers.utils.quantization_config import CompressedTensorsConfig, QuantizationConfigMixin, QuantizationMethod
 
 from QEfficient.transformers.quantizers.quantizer_utils import blockwise_dequantize, get_keys_to_not_convert
 from QEfficient.utils.logging_utils import logger
+
+try:
+    from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextExperts
+except ModuleNotFoundError:
+    Qwen3VLMoeTextExperts = None
 
 FP8_DTYPE = torch.float8_e4m3fn
 
@@ -294,7 +298,9 @@ def _replace_with_fp8_dequant_linear_and_experts_if_qwen(
                 )
                 has_been_replaced = True
 
-        if isinstance(child_module, Qwen3VLMoeTextExperts) and name not in (modules_to_not_convert or []):
+        if Qwen3VLMoeTextExperts is not None and isinstance(child_module, Qwen3VLMoeTextExperts) and name not in (
+            modules_to_not_convert or []
+        ):
             # Replace the MoE experts
             current_key_name_str = ".".join(current_key_name)
             if not any(key in current_key_name_str for key in (modules_to_not_convert or [])):
