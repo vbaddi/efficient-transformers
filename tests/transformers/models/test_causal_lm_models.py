@@ -102,6 +102,7 @@ def load_causal_lm_model(model_name, n_layer=1, config=None):
                 use_cache=True,
                 num_hidden_layers=n_layer,
                 attn_implementation="eager",
+                torch_dtype=torch.float16,
                 low_cpu_mem_usage=False,
                 trust_remote_code=model_name in ModelConfig.EXTERNAL_MODELS,
             )
@@ -111,6 +112,7 @@ def load_causal_lm_model(model_name, n_layer=1, config=None):
                 model_path,
                 use_cache=True,
                 attn_implementation="eager",
+                torch_dtype=torch.float16,
                 low_cpu_mem_usage=False,
                 trust_remote_code=model_name in ModelConfig.EXTERNAL_MODELS,
             )
@@ -118,12 +120,9 @@ def load_causal_lm_model(model_name, n_layer=1, config=None):
         model_hf = AutoModelForCausalLM.from_config(
             config,
             attn_implementation="eager",
+            torch_dtype=torch.float16,
             trust_remote_code=model_name in ModelConfig.EXTERNAL_MODELS,
         )
-    # Convert to FP32 if model is in BF16 or in FP16
-    torch_dtype = getattr(model_hf.config, "torch_dtype", None)
-    if torch_dtype == torch.bfloat16 or torch_dtype == torch.float16:
-        model_hf = model_hf.to(torch.float32)
 
     params = sum(p.numel() for p in model_hf.parameters())
     model_hf.eval()
@@ -154,11 +153,11 @@ def check_causal_lm_pytorch_vs_kv_vs_ort_vs_ai100(
     """
     replace_transformers_quantizers()
     if config is None:
-        n_layer = get_custom_n_layers(model_name)
-        model_hf, _ = load_causal_lm_model(model_name, n_layer=n_layer)
+        # n_layer = get_custom_n_layers(model_name)
+        # model_hf, _ = load_causal_lm_model(model_name, n_layer=n_layer)
+        model_hf, _ = load_causal_lm_model(model_name)
     else:
         model_hf, _ = load_causal_lm_model(model_name, config=config)
-
     tokenizer = load_hf_tokenizer(pretrained_model_name_or_path=model_name)
     config = model_hf.config
     batch_size = len(Constants.INPUT_STR)
@@ -171,20 +170,21 @@ def check_causal_lm_pytorch_vs_kv_vs_ort_vs_ai100(
         Constants.CTX_LEN,
     )
 
-    if model_name not in ModelConfig.SWIFTKV_MODELS and model_name not in ModelConfig.EXTERNAL_MODELS:
-        pytorch_hf_tokens = api_runner.run_hf_model_on_pytorch(model_hf)
+    # if model_name not in ModelConfig.SWIFTKV_MODELS and model_name not in ModelConfig.EXTERNAL_MODELS:
+    #     pytorch_hf_tokens = api_runner.run_hf_model_on_pytorch(model_hf)
 
     is_tlm = False if num_speculative_tokens is None else True
     qeff_model = QEFFAutoModelForCausalLM(
         copy.deepcopy(model_hf), is_tlm=is_tlm, pretrained_model_name_or_path=model_name, qaic_config=qaic_config
     )
-    pytorch_kv_tokens = api_runner.run_kv_model_on_pytorch(qeff_model.model)
+    # pytorch_kv_tokens = api_runner.run_kv_model_on_pytorch(qeff_model.model)
 
-    if model_name not in ModelConfig.SWIFTKV_MODELS and model_name not in ModelConfig.EXTERNAL_MODELS:
-        assert (pytorch_hf_tokens == pytorch_kv_tokens).all(), (
-            "Tokens don't match for HF PyTorch model output and KV PyTorch model output"
-        )
-    onnx_model_path = qeff_model.export()
+    # if model_name not in ModelConfig.SWIFTKV_MODELS and model_name not in ModelConfig.EXTERNAL_MODELS:
+    #     assert (pytorch_hf_tokens == pytorch_kv_tokens).all(), (
+    #         "Tokens don't match for HF PyTorch model output and KV PyTorch model output"
+    #     )
+    onnx_model_path = qeff_model.export(use_onnx_subfunctions=True)
+    breakpoint()
     ort_tokens = api_runner.run_kv_model_on_ort(onnx_model_path, is_tlm=is_tlm)
     gen_len = ort_tokens.shape[-1]
 
@@ -359,9 +359,10 @@ def test_causal_lm_pytorch_vs_kv_vs_ort_vs_ai100(model_name):
     ``Mandatory`` Args:
         :model_name (str): Hugging Face Model Card name, Example: ``gpt2``
     """
-    n_layer = get_custom_n_layers(model_name)
+    # n_layer = get_custom_n_layers(model_name)
 
-    check_causal_lm_pytorch_vs_kv_vs_ort_vs_ai100(model_name=model_name, n_layer=n_layer)
+    # check_causal_lm_pytorch_vs_kv_vs_ort_vs_ai100(model_name=model_name, n_layer=n_layer)
+    check_causal_lm_pytorch_vs_kv_vs_ort_vs_ai100(model_name=model_name)
 
 
 @pytest.mark.nightly

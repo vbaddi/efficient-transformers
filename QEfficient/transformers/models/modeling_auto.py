@@ -66,9 +66,7 @@ from QEfficient.transformers.models.pytorch_transforms import (
 from QEfficient.transformers.quantizers.auto import QEFF_AUTO_QUANTIZATION_CONFIG_MAPPING, with_replaced_quantizers
 from QEfficient.transformers.quantizers.quant_transforms import (
     AwqToMatmulNbitsTransform,
-    FP8DeQuantLinearToLinearTransform,
     GPTQToMatmulNbitsTransform,
-    Mxfp4GptOssExpertDequantizeTransform,
 )
 from QEfficient.utils import (
     constants,
@@ -2725,10 +2723,10 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
 
     _hf_auto_class = AutoModelForCausalLM
     _pytorch_transforms = [
-        AwqToMatmulNbitsTransform,
-        GPTQToMatmulNbitsTransform,
-        FP8DeQuantLinearToLinearTransform,
-        Mxfp4GptOssExpertDequantizeTransform,
+        # AwqToMatmulNbitsTransform,
+        # GPTQToMatmulNbitsTransform,
+        # FP8DeQuantLinearToLinearTransform,
+        # Mxfp4GptOssExpertDequantizeTransform,
         CustomOpsTransform,
         KVCacheTransform,
         SplitGateUpWeightsTransform,
@@ -2846,7 +2844,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         return self.__class__.__name__ + "\n" + self.model.__repr__()
 
     @classmethod
-    @with_replaced_quantizers
+    # @with_replaced_quantizers
     def from_pretrained(
         cls,
         pretrained_model_name_or_path,
@@ -3184,7 +3182,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 self.hash_params.pop("ENABLE_OPT_SWA", None)
                 self.hash_params.pop("chunking", None)
                 if kwargs.get("retain_full_kv", False):
-                    sliding_window = self.model.config.sliding_window if self.model.config.sliding_window is not None else 0
+                    sliding_window = (
+                        self.model.config.sliding_window if self.model.config.sliding_window is not None else 0
+                    )
                     kv_cache_shape[2] = seq_len + sliding_window
                     self.hash_params["retain_full_kv"] = True
 
@@ -3229,7 +3229,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             )
             for i in range(self.num_layers):
                 for kv in ["key", "value"]:
-                    example_inputs["past_key_values"][i].append(torch.zeros(pkv_cache[0][0].shape, dtype=torch.float32))
+                    example_inputs["past_key_values"][i].append(
+                        torch.zeros(pkv_cache[0][0].shape, dtype=self.model.config.torch_dtype)
+                    )
                     dynamic_axes[f"past_{kv}.{i}"] = pkv_dynamic_axes
                     output_names.append(f"past_{kv}.{i}_RetainedState")
 
@@ -3252,7 +3254,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
 
             for i in range(self.num_layers):
                 for kv in ["key", "value"]:
-                    example_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=torch.float32))
+                    example_inputs["past_key_values"][i].append(
+                        torch.zeros(kv_cache_shape, dtype=self.model.config.torch_dtype)
+                    )
                     dynamic_axes[f"past_{kv}.{i}"] = pkv_dynamic_axes[i]
                     output_names.append(f"past_{kv}.{i}_RetainedState")
 

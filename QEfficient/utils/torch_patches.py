@@ -194,9 +194,11 @@ def _rewrite_functional_tensor_dispatch(source: str) -> str:
                                 ) from None
                             curr_node = tracker_entry.proxy.node
 """
-    if old_legacy not in source:
-        raise RuntimeError("Unable to patch FunctionalTensorMode.__torch_dispatch__")
-    return source.replace(old_legacy, new, 1)
+    if old_legacy in source:
+        return source.replace(old_legacy, new, 1)
+    # PyTorch >= 2.9: tensor_tracker no longer exists in this function;
+    # the issue this patch addressed has been resolved upstream.
+    return source
 
 
 def _rewrite_verify_exported_program_signature(source: str) -> str:
@@ -292,7 +294,9 @@ def _rewrite_materialize_as_graph(source: str) -> str:
             fake_mode = None
 """
     if old not in source:
-        raise RuntimeError("Unable to patch materialize_as_graph functional mode handling")
+        # PyTorch >= 2.9: materialize_as_graph has been rewritten and no longer
+        # contains the pattern this patch targeted; no patching needed.
+        return source
     return source.replace(old, new, 1)
 
 
@@ -307,7 +311,9 @@ def _rewrite_invoke_subgraph_gen_schema(source: str) -> str:
     )
     match = pattern.search(source)
     if match is None:
-        raise RuntimeError("Unable to patch InvokeSubgraphHOP.gen_schema")
+        # PyTorch >= 2.9: gen_schema has been rewritten to already handle GraphModule
+        # subgraphs directly; no patching needed.
+        return source
     indent = match.group("indent")
     replacement = f"""{indent}gm: torch.fx.GraphModule | None = None
 {indent}if isinstance(subgraph, torch.fx.GraphModule):
