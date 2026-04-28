@@ -31,6 +31,7 @@ from QEfficient.blocking.blocking_configurator import build_transformer_blocking
 from QEfficient.compile.qnn_compiler import compile as qnn_compile
 from QEfficient.customop.ctx_scatter_gather import CtxGather, CtxScatter
 from QEfficient.customop.rms_norm import CustomRMSNorm
+from QEfficient.exporter.weight_spec import resolve_weight_spec_path
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 from QEfficient.transformers.models.pytorch_transforms import (
     BlockingAttentionTransform,
@@ -88,6 +89,7 @@ class QEFFBaseModel(ABC):
         self.config = model.config
         self.hash_params = create_model_params(self, **kwargs)
         self.onnx_path: Optional[str] = None
+        self.weight_spec_path: Optional[str] = None
         self.qpc_path: Optional[str] = None
         self.qpc_session: Optional[QAICInferenceSession] = None
         self.model_architecture = (
@@ -307,17 +309,29 @@ class QEFFBaseModel(ABC):
         # TODO: Hack for retain_full_kv, handle this outside
         export_kwargs.pop("retain_full_kv", None)
         export_kwargs.pop("mla_absorption", None)
+        use_weight_free_export = export_kwargs.pop("use_weight_free_export", False)
         onnx_path = export_dir / f"{self.model_name}.onnx"
+        weight_spec_path = resolve_weight_spec_path(onnx_path)
 
         # Return early if ONNX already exists
         if onnx_path.is_file():
             self.onnx_path = onnx_path
+            if weight_spec_path.is_file():
+                self.weight_spec_path = weight_spec_path
             return onnx_path
 
-        # check if the model is in meta state or weights are offloaded
-        self._model_offloaded_check()
+        if use_weight_free_export and not use_dynamo:
+            raise NotImplementedError("Weight-free export currently requires `use_dynamo=True`.")
 
-        export_dir.mkdir(parents=True, exist_ok=True)
+        if not use_weight_free_export:
+            # check if the model is in meta state or weights are offloaded
+            self._model_offloaded_check()
+
+        # Setup temporary paths
+        tmp_onnx_dir = export_dir / "onnx_tmp"
+        tmp_onnx_path = tmp_onnx_dir / f"{self.model_name}.onnx"
+        tmp_weight_spec_path = resolve_weight_spec_path(tmp_onnx_path)
+        tmp_onnx_dir.mkdir(parents=True, exist_ok=True)
 
         # Create input_names from example_inputs
         input_names = []
@@ -384,8 +398,41 @@ class QEFFBaseModel(ABC):
 
         try:
             export_kwargs = {} if export_kwargs is None else export_kwargs
+            effective_transform_owner = self
+            effective_onnx_transform_kwargs = onnx_transform_kwargs
+            cleanup_weight_free_export = None
 
-            if use_dynamo:
+            if use_weight_free_export:
+                from QEfficient.exporter.weight_free import export_weight_free_onnx, log_weight_free_export
+
+                dynamic_axes = None
+                export_kwargs = dict(export_kwargs)
+                export_kwargs.setdefault("report", False)
+                export_kwargs.setdefault("optimize", False)
+                export_kwargs["dynamo"] = True
+                export_kwargs["custom_translation_table"] = {
+                    **(export_kwargs.pop("custom_translation_table", None) or {}),
+                    torch.ops.qefficient.rms_norm.default: CustomRMSNorm,
+                    torch.ops.qefficient.ctx_gather.default: CtxGather,
+                    torch.ops.qefficient.ctx_scatter.default: CtxScatter,
+                }
+
+                (
+                    effective_transform_owner,
+                    effective_onnx_transform_kwargs,
+                    cleanup_weight_free_export,
+                ) = export_weight_free_onnx(
+                    qeff_model=self,
+                    tmp_onnx_path=tmp_onnx_path,
+                    example_inputs=example_inputs,
+                    input_names=input_names,
+                    output_names=output_names,
+                    dynamic_shapes=dynamic_shapes,
+                    export_kwargs=export_kwargs,
+                    onnx_transform_kwargs=onnx_transform_kwargs or {},
+                )
+                log_weight_free_export(tmp_onnx_path)
+            elif use_dynamo:
                 dynamic_axes = None
                 export_kwargs = dict(export_kwargs)
                 export_kwargs.setdefault("report", False)
@@ -446,15 +493,17 @@ class QEFFBaseModel(ABC):
                 "model_name": self.model_name,
                 "dynamic_axes": dynamic_axes,
             }
-            if onnx_transform_kwargs is not None:
-                transform_kwargs.update(onnx_transform_kwargs)
+            if effective_onnx_transform_kwargs is not None:
+                transform_kwargs.update(effective_onnx_transform_kwargs)
 
-            onnx_transforms = OnnxTransformPipeline(transforms=self._onnx_transforms)
+            onnx_transforms = OnnxTransformPipeline(transforms=effective_transform_owner._onnx_transforms)
             model, transformed = onnx_transforms.apply(model, **transform_kwargs)
 
             # Add metadata to the model
             model.metadata_props.append(
-                onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(self._transform_names()))
+                onnx.StringStringEntryProto(
+                    key="qeff_transforms", value=",".join(effective_transform_owner._transform_names())
+                )
             )
             logger.info("ONNX transforms applied")
 
@@ -464,10 +513,18 @@ class QEFFBaseModel(ABC):
             del model
             gc.collect()
             logger.info("Transformed ONNX saved")
+            if tmp_weight_spec_path.is_file():
+                shutil.copy2(tmp_weight_spec_path, weight_spec_path)
+                self.weight_spec_path = weight_spec_path
 
         except Exception as e:
             logger.error(f"ONNX export or transforms failed: {e}")
             raise e
+
+        finally:
+            shutil.rmtree(tmp_onnx_dir, ignore_errors=True)
+            if cleanup_weight_free_export is not None:
+                cleanup_weight_free_export()
 
         self.onnx_path = onnx_path
         return onnx_path
@@ -483,6 +540,7 @@ class QEFFBaseModel(ABC):
         retain_full_kv: Optional[bool] = False,
         mla_absorption: Optional[Dict[str, bool]] = None,
         qaic_config: Optional[dict] = None,
+        use_weight_free_export: Optional[bool] = False,
         **compiler_options,
     ):
         kwargs = {
@@ -491,6 +549,7 @@ class QEFFBaseModel(ABC):
             "use_dynamo": use_dynamo,
             "retain_full_kv": retain_full_kv,
             "mla_absorption": mla_absorption,
+            "use_weight_free_export": use_weight_free_export,
         }
 
         if prefill_only:
@@ -592,6 +651,7 @@ class QEFFBaseModel(ABC):
         qaic_config: Optional[dict] = None,
         specialization_module_name: Optional[str] = None,
         use_dynamo: Optional[bool] = False,
+        use_weight_free_export: Optional[bool] = False,
         **compiler_options,
     ) -> str:
         """
@@ -618,6 +678,11 @@ class QEFFBaseModel(ABC):
                 For QNN Compilation path, when enable_qnn is set to True, any parameter passed in compiler_options will be ignored.
         """
 
+        if use_weight_free_export:
+            raise NotImplementedError(
+                "Weight-free export is wired for Torch-to-ONNX verification, but AI100 compile integration is not implemented yet."
+            )
+
         onnx_path = Path(
             onnx_path
             if onnx_path
@@ -634,6 +699,7 @@ class QEFFBaseModel(ABC):
                 mla_absorption,
                 num_devices=mdp_ts_num_devices,
                 qaic_config=qaic_config,
+                use_weight_free_export=use_weight_free_export,
                 **compiler_options,
             )
         )

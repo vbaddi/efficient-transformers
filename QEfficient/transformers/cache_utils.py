@@ -123,7 +123,7 @@ class QEffDynamicLayer(CacheLayerMixin):
         batch_index = cache_kwargs.get("batch_index", None)
         ctx_len = cache_kwargs.get("CCL", k_out.shape[2])
 
-        ctx_indices = torch.arange(ctx_len)[None, None, ...]
+        ctx_indices = torch.arange(ctx_len, device=position_ids.device)[None, None, ...]
         gather_limit = position_ids.max(1, keepdim=True).values.unsqueeze(1)
         invalid_mask = ctx_indices > gather_limit
 
@@ -173,7 +173,7 @@ class QEffDynamicLayer(CacheLayerMixin):
         position_ids = cache_kwargs.get("position_ids")
         batch_index = cache_kwargs.get("batch_index", None)
         batch, num_kv_heads, _, _ = k_out.shape
-        ctx_indices = torch.arange(start=start_index, end=end_index)[None, None, ...]
+        ctx_indices = torch.arange(start=start_index, end=end_index, device=position_ids.device)[None, None, ...]
         gather_limit = position_ids.max(1, keepdim=True).values.unsqueeze(1)
         invalid_mask = ctx_indices > gather_limit
 
@@ -290,7 +290,7 @@ class QEffDynamicLayer(CacheLayerMixin):
 
             # Gather
             ctx_len = cache_kwargs.get("CCL", k_out.shape[2])
-            ctx_indices = torch.arange(ctx_len)[None, None, ...]
+            ctx_indices = torch.arange(ctx_len, device=position_ids.device)[None, None, ...]
             gather_limit = position_ids.max(1, keepdim=True).values.unsqueeze(1)
             invalid_mask = ctx_indices > gather_limit
 
@@ -372,7 +372,7 @@ class QEffDynamicLayer(CacheLayerMixin):
 
             # Gather
             ctx_len = k_out.shape[1]
-            ctx_indices = torch.arange(ctx_len)[None, ...]
+            ctx_indices = torch.arange(ctx_len, device=position_ids.device)[None, ...]
             gather_limit = position_ids.max(1, keepdim=True).values
             invalid_mask = ctx_indices > gather_limit
             if torch.onnx.is_in_onnx_export():

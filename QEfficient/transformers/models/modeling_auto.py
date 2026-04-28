@@ -3296,7 +3296,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 self.hash_params.pop("ENABLE_OPT_SWA", None)
                 self.hash_params.pop("chunking", None)
                 if kwargs.get("retain_full_kv", False):
-                    sliding_window = self.model.config.sliding_window if self.model.config.sliding_window is not None else 0
+                    sliding_window = (
+                        self.model.config.sliding_window if self.model.config.sliding_window is not None else 0
+                    )
                     kv_cache_shape[2] = seq_len + sliding_window
                     self.hash_params["retain_full_kv"] = True
 
@@ -3440,6 +3442,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             dynamic_shapes=dynamic_shapes,
             offload_pt_weights=kwargs.get("offload_pt_weights", True),
             prefill_only=prefill_only,
+            use_weight_free_export=kwargs.get("use_weight_free_export", False),
         )
 
     def build_prefill_specialization(
@@ -3590,6 +3593,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         enable_chunking: Optional[bool] = False,
         retain_full_kv: Optional[bool] = None,
         use_dynamo: bool = False,
+        use_weight_free_export: bool = False,
         **compiler_options,
     ) -> str:
         """
@@ -3841,6 +3845,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             enable_chunking=enable_chunking,
             retain_full_kv=retain_full_kv,
             use_dynamo=use_dynamo,
+            use_weight_free_export=use_weight_free_export,
             **compiler_options,
         )
 
