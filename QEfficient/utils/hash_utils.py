@@ -7,12 +7,15 @@
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Dict
 
 from QEfficient.utils.constants import HASH_HEXDIGEST_STR_LEN
 
 
 def json_serializable(obj):
+    if isinstance(obj, Path):
+        return str(obj)
     if isinstance(obj, set):
         # Convert set to a sorted list of strings for consistent hashing
         return sorted([cls.__name__ if isinstance(cls, type) else str(cls) for cls in obj])
