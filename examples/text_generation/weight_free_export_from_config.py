@@ -18,7 +18,7 @@ from QEfficient.exporter.weight_spec import resolve_weight_spec_path
 from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
 from QEfficient.utils.run_utils import ApiRunner
 
-# model_name = "meta-llama/Llama-3.2-1B"
+# model_name = "meta-llama/Llama-3.3-70B-Instruct"
 # model_name = "gpt2"
 model_name = "hf-internal-testing/tiny-random-LlamaForCausalLM"
 
