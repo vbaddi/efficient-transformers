@@ -105,8 +105,10 @@ def _build_meta_qeff_model(qeff_model):
         raise NotImplementedError("Weight-free export is not implemented yet for quantized causal LM checkpoints.")
 
     config = copy.deepcopy(qeff_model.model.config)
+    config.torch_dtype = torch.float32
     with init_empty_weights():
         meta_model = qeff_model._hf_auto_class.from_config(config, attn_implementation="eager")
+    meta_model = meta_model.to(dtype=torch.float32)
 
     meta_qeff_model = qeff_model.__class__(
         meta_model,
