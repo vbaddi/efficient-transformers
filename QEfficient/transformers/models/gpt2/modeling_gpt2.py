@@ -34,13 +34,13 @@ def eager_attention_forward(module, query, key, value, attention_mask, head_mask
         causal_mask = module.bias[:, :, key_length - query_length : key_length, :key_length]
         # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
         # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-        mask_value = torch.full([], MIN_MASKED_ATTENTION_VALUE, dtype=attn_weights.dtype, device=attn_weights.device)
+        mask_value = torch.full_like(attn_weights, MIN_MASKED_ATTENTION_VALUE)
         attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
 
     if attention_mask is not None:
         # Apply the attention mask
         attn_weights = torch.where(
-            attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=module.config.torch_dtype), attn_weights
+            attention_mask, torch.full_like(attn_weights, MIN_MASKED_ATTENTION_VALUE), attn_weights
         )
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
@@ -157,6 +157,7 @@ class QEffGPT2Block(GPT2Block):
     - add new args cache idx for the kv retention
     """
 
+    @torch.compiler.nested_compile_region
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],

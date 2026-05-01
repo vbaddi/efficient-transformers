@@ -8,15 +8,17 @@
 import gc
 import inspect
 import logging
+import os
 import shutil
 import subprocess
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, OrderedDict
 
 import onnx
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 from QEfficient.base.onnx_transforms import (
     BaseOnnxTransform,
@@ -27,6 +29,8 @@ from QEfficient.base.onnx_transforms import (
 from QEfficient.base.pytorch_transforms import PytorchTransform
 from QEfficient.blocking.blocking_configurator import build_transformer_blocking_config_for_transform
 from QEfficient.compile.qnn_compiler import compile as qnn_compile
+from QEfficient.customop.ctx_scatter_gather import CtxGather, CtxScatter
+from QEfficient.customop.rms_norm import CustomRMSNorm
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 from QEfficient.transformers.models.pytorch_transforms import (
     BlockingAttentionTransform,
@@ -45,6 +49,19 @@ from QEfficient.utils import (
     to_named_specializations,
 )
 from QEfficient.utils.export_utils import export_wrapper
+
+
+def _prune_unused_fake_initializers(onnx_program) -> None:
+    initializers = onnx_program.model.graph.initializers
+    used_names = {name for node in onnx_program.model.graph for name in node.inputs}
+    used_names.update(output.name for output in onnx_program.model.graph.outputs)
+
+    for name in list(initializers):
+        const_value = getattr(initializers[name], "const_value", None)
+        raw_value = getattr(const_value, "raw", None)
+        if isinstance(raw_value, FakeTensor) and name not in used_names:
+            del initializers[name]
+
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +277,8 @@ class QEFFBaseModel(ABC):
         export_dir: Optional[str] = None,
         offload_pt_weights: bool = True,
         prefill_only: Optional[bool] = False,
+        use_dynamo: bool = False,
+        dynamic_shapes: Optional[Dict[str, Dict[int, any]]] = None,
         **export_kwargs,
     ) -> str:
         """
@@ -336,17 +355,85 @@ class QEFFBaseModel(ABC):
                 else:
                     input_names.append(param)
 
+        # Rearrange example_inputs and dynamic_shapes to follow model.forward signature
+        sig = inspect.signature(self.model.forward)
+
+        ordered_example_inputs = OrderedDict()
+        ordered_dynamic_shapes = OrderedDict() if dynamic_shapes is not None else None
+
+        # First, add keys that are in the forward signature (in that order)
+        for name, param in sig.parameters.items():
+            if name in example_inputs:
+                ordered_example_inputs[name] = example_inputs[name]
+
+            if dynamic_shapes is not None and name in dynamic_shapes:
+                ordered_dynamic_shapes[name] = dynamic_shapes[name]
+
+        # Optionally, append any extra keys not in the forward signature
+        for name, value in example_inputs.items():
+            if name not in ordered_example_inputs:
+                ordered_example_inputs[name] = value
+
+        if dynamic_shapes is not None:
+            for name, value in dynamic_shapes.items():
+                if name not in ordered_dynamic_shapes:
+                    ordered_dynamic_shapes[name] = value
+
+        example_inputs = ordered_example_inputs
+        dynamic_shapes = ordered_dynamic_shapes
+
         try:
-            torch.onnx.export(
-                self.model,
-                (example_inputs,),
-                str(onnx_path),
-                input_names=input_names,
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                opset_version=constants.ONNX_EXPORT_OPSET,
-                **export_kwargs,
-            )
+            export_kwargs = {} if export_kwargs is None else export_kwargs
+
+            if use_dynamo:
+                dynamic_axes = None
+                export_kwargs = dict(export_kwargs)
+                export_kwargs.setdefault("report", False)
+                export_kwargs.setdefault("optimize", False)
+                export_kwargs["dynamo"] = True
+                export_kwargs["custom_translation_table"] = {
+                    **(export_kwargs.pop("custom_translation_table", None) or {}),
+                    torch.ops.qefficient.rms_norm.default: CustomRMSNorm,
+                    torch.ops.qefficient.ctx_gather.default: CtxGather,
+                    torch.ops.qefficient.ctx_scatter.default: CtxScatter,
+                }
+
+                prev_invoke_fallback = os.environ.get("TORCH_INVOKE_ALLOW_CREATE_FALLBACK")
+                os.environ["TORCH_INVOKE_ALLOW_CREATE_FALLBACK"] = "1"
+                try:
+                    onnx_program = torch.onnx.export(
+                        self.model,
+                        args=(),
+                        f=None,
+                        kwargs=example_inputs,
+                        input_names=input_names,
+                        output_names=output_names,
+                        dynamic_axes=dynamic_axes,
+                        dynamic_shapes=dynamic_shapes,
+                        opset_version=constants.ONNX_EXPORT_OPSET,
+                        **export_kwargs,
+                    )
+                    if onnx_program is None:
+                        raise RuntimeError("torch.onnx.export returned None for dynamo export")
+                    _prune_unused_fake_initializers(onnx_program)
+                    onnx_program.save(str(onnx_path))
+                finally:
+                    if prev_invoke_fallback is None:
+                        os.environ.pop("TORCH_INVOKE_ALLOW_CREATE_FALLBACK", None)
+                    else:
+                        os.environ["TORCH_INVOKE_ALLOW_CREATE_FALLBACK"] = prev_invoke_fallback
+            else:
+                torch.onnx.export(
+                    self.model,
+                    (example_inputs,),
+                    str(onnx_path),
+                    input_names=input_names,
+                    output_names=output_names,
+                    dynamic_axes=dynamic_axes,
+                    opset_version=constants.ONNX_EXPORT_OPSET,
+                    dynamo=False,
+                    **export_kwargs,
+                )
             logger.info("PyTorch export successful")
             _ = self._offload_model_weights(offload_pt_weights)
             model = onnx.load(onnx_path, load_external_data=False)
@@ -357,6 +444,7 @@ class QEFFBaseModel(ABC):
             transform_kwargs = {
                 "onnx_base_dir": str(export_dir) if needs_external_tensor_data else None,
                 "model_name": self.model_name,
+                "dynamic_axes": dynamic_axes,
             }
             if onnx_transform_kwargs is not None:
                 transform_kwargs.update(onnx_transform_kwargs)
@@ -391,6 +479,7 @@ class QEFFBaseModel(ABC):
         specializations: Optional[List[Dict[str, int]]] = None,
         offload_pt_weights: Optional[bool] = True,
         use_onnx_subfunctions: Optional[bool] = False,
+        use_dynamo: Optional[bool] = False,
         retain_full_kv: Optional[bool] = False,
         mla_absorption: Optional[Dict[str, bool]] = None,
         qaic_config: Optional[dict] = None,
@@ -399,6 +488,7 @@ class QEFFBaseModel(ABC):
         kwargs = {
             "offload_pt_weights": offload_pt_weights,
             "use_onnx_subfunctions": use_onnx_subfunctions,
+            "use_dynamo": use_dynamo,
             "retain_full_kv": retain_full_kv,
             "mla_absorption": mla_absorption,
         }
@@ -501,6 +591,7 @@ class QEFFBaseModel(ABC):
         mla_absorption: Optional[Dict[str, bool]] = None,
         qaic_config: Optional[dict] = None,
         specialization_module_name: Optional[str] = None,
+        use_dynamo: Optional[bool] = False,
         **compiler_options,
     ) -> str:
         """
@@ -538,6 +629,7 @@ class QEFFBaseModel(ABC):
                 specializations,
                 offload_pt_weights,
                 use_onnx_subfunctions,
+                use_dynamo,
                 retain_full_kv,
                 mla_absorption,
                 num_devices=mdp_ts_num_devices,
@@ -545,6 +637,7 @@ class QEFFBaseModel(ABC):
                 **compiler_options,
             )
         )
+
         compile_dir = Path(compile_dir or onnx_path.parent)
         qpc_path = compile_dir / "qpc"
         if not onnx_path.is_file():
@@ -581,24 +674,14 @@ class QEFFBaseModel(ABC):
         # MDP partition config: prioritize dump over load
         mdp_dump_json_path = compiler_options.pop("mdp_dump_partition_config", None)
         mdp_ts_json_path = compiler_options.pop("mdp_load_partition_config", None)
-        mdp_ts_json = None
-
         if mdp_dump_json_path:
             if mdp_ts_json_path:
                 logger.warning(
                     "Loading and Dumping partition is not supported at the same time. Prioritizing dump config over load config!"
                 )
+                mdp_ts_json_path = None
             command.append(f"-mdp-dump-partition-config={mdp_dump_json_path}")
-        elif mdp_ts_json_path:
-            command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
-            mdp_ts_json = load_json(str(mdp_ts_json_path))
-        elif mdp_ts_num_devices > 1:
-            # Generate mdp config only if neither dump nor load is provided and num_devices > 1
-            mdp_ts_json = generate_mdp_partition_config(
-                mdp_ts_num_devices, compiler_options.get("aic_num_cores", constants.DEFAULT_AIC_NUM_CORES)
-            )
-            mdp_ts_json_path = compile_dir / f"mdp_ts_{mdp_ts_num_devices}.json"
-            create_json(str(mdp_ts_json_path), mdp_ts_json)
+        elif mdp_ts_json_path is not None:
             command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
 
         for key, value in compiler_options.items():
@@ -608,6 +691,16 @@ class QEFFBaseModel(ABC):
                     command.append(option)
                 continue
             command.append(f"{option}={value}")
+
+        # Create a dummy mdp_ts_json if mdp-load-partition-config not provided and num_devices > 1
+        if mdp_ts_json_path is not None:
+            mdp_ts_json = load_json(str(mdp_ts_json_path))
+        elif mdp_ts_num_devices > 1:
+            mdp_ts_json = generate_mdp_partition_config(
+                mdp_ts_num_devices, compiler_options.get("aic_num_cores", constants.DEFAULT_AIC_NUM_CORES)
+            )
+        else:
+            mdp_ts_json = None
 
         if use_onnx_subfunctions:
             logger.info("Using ONNX subfunctions for compilation.")
@@ -635,7 +728,11 @@ class QEFFBaseModel(ABC):
             # Probably compilation failure last time, delete directory to start over
             shutil.rmtree(qpc_path)
 
-        # Write the generated MDP partition config file (not if user provided it)
+        # write the MDP partition config file if not provided
+        if mdp_ts_json is not None:
+            mdp_ts_json_path = compile_dir / f"mdp_ts_{mdp_ts_num_devices}.json"
+            create_json(str(mdp_ts_json_path), mdp_ts_json)
+            command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
 
         # Write specializations.json file
         if specializations is not None:
@@ -664,6 +761,7 @@ class QEFFBaseModel(ABC):
                 command.append(f"-custom-IO-list-file={custom_io_yaml}")
 
         command.append(f"-aic-binary-dir={qpc_path}")
+        print(command)
         logger.info(f"Running compiler: {' '.join(command)}")
 
         try:
