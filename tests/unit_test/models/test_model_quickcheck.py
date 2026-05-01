@@ -76,6 +76,11 @@ CAUSAL_RUNTIME_MODEL_IDS = {
     "granite": "hf-internal-testing/tiny-random-GraniteForCausalLM",
     "olmo2": "hf-internal-testing/tiny-random-Olmo2ForCausalLM",
     "gpt_oss": "tiny-random/gpt-oss-bf16",
+    "gemma2": "hf-internal-testing/tiny-random-Gemma2ForCausalLM",
+    "gpt_bigcode": "hf-internal-testing/tiny-random-GPTBigCodeForCausalLM",
+    "qwen3": "tiny-random/qwen3",
+    "qwen3_moe": "tiny-random/qwen3-moe",
+    "granitemoe": "hf-internal-testing/tiny-random-GraniteMoeForCausalLM",
 }
 CAUSAL_MULTI_SUBFUNCTION_MODEL_TYPES = {
     "codegen",
@@ -83,7 +88,8 @@ CAUSAL_MULTI_SUBFUNCTION_MODEL_TYPES = {
     "starcoder2",
     "mixtral",
     "gpt_oss",
-    # "granitemoe" is intentionally not listed in CAUSAL_RUNTIME_MODEL_IDS yet.
+    "qwen3_moe",
+    "granitemoe",
 }
 
 VLM_TEXT_RUNTIME_MODEL_ID = "tiny-random/gemma-3"
@@ -1205,9 +1211,10 @@ def _assert_no_repeated_block_functions(onnx_path: Path, expected_classnames) ->
 def _build_vlm_text_qeff_model(model_id: str):
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
 
-    if getattr(config, "model_type", "") in {"qwen2_5_vl", "qwen2_5_vl_text"} and getattr(
-        config, "text_config", None
-    ) is not None:
+    if (
+        getattr(config, "model_type", "") in {"qwen2_5_vl", "qwen2_5_vl_text"}
+        and getattr(config, "text_config", None) is not None
+    ):
         qwen2_cfg_dict = config.text_config.to_dict()
         qwen2_cfg_dict["model_type"] = "qwen2"
         qwen2_allowed_keys = set(Qwen2Config().to_dict().keys())
@@ -1280,8 +1287,6 @@ def test_vlm_text_side_repeated_subfunction_export(vlm_name, model_id, tmp_path)
 
     expected = [cls.__name__ for cls in qeff_text_model.model.get_submodules_for_export()]
     onnx_path = _exported_onnx_path(
-        qeff_text_model.export(
-            tmp_path / f"vlm-text-repeated-{vlm_name}", use_dynamo=True, use_onnx_subfunctions=True
-        )
+        qeff_text_model.export(tmp_path / f"vlm-text-repeated-{vlm_name}", use_dynamo=True, use_onnx_subfunctions=True)
     )
     _assert_repeated_block_functions(onnx_path, expected)
