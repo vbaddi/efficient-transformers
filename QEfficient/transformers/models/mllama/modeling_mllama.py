@@ -30,6 +30,7 @@ from transformers.models.mllama.modeling_mllama import (
     MllamaTextCrossAttention,
     MllamaTextModel,
     MllamaTextSelfAttention,
+    MllamaVisionEncoderLayer,
     MllamaVisionModel,
     logger,
     repeat_kv,
@@ -750,6 +751,7 @@ class QEffMllamaVisionEncoder(nn.Module):
             Downstream code can use this to find/build subfunctions for repeated blocks.
         """
         return {self.model.vision_model.transformer.layers[0].__class__}
+
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
@@ -1358,3 +1360,9 @@ class QEffMllamaForConditionalGeneration(MllamaForConditionalGeneration):
             ),
             IOInfo(name="attention_mask", datatype=torch.int64, shape=("batch_size", "seq_len")),
         ]
+
+
+class QEffMllamaVisionEncoderLayer(MllamaVisionEncoderLayer):
+    @torch.compiler.nested_compile_region
+    def forward(self, *args, **kwargs):
+        return super().forward(*args, **kwargs)

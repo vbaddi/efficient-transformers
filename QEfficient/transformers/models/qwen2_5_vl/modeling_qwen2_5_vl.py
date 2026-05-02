@@ -26,6 +26,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLRotaryEmbedding,
     Qwen2_5_VLTextModel,
     Qwen2_5_VLVisionAttention,
+    Qwen2_5_VLVisionBlock,
     apply_rotary_pos_emb_vision,
     repeat_kv,
     rotate_half,
@@ -1297,3 +1298,9 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                 shape=("batch_size", 3, "image_size", "image_size"),
             ),
         ]
+
+
+class QEffQwen2_5_VLVisionBlock(Qwen2_5_VLVisionBlock):
+    @torch.compiler.nested_compile_region
+    def forward(self, *args, **kwargs):
+        return super().forward(*args, **kwargs)

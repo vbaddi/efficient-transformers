@@ -24,6 +24,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextModel,
     Qwen3VLTextRotaryEmbedding,
     Qwen3VLVisionAttention,
+    Qwen3VLVisionBlock,
     Qwen3VLVisionModel,
     apply_rotary_pos_emb_vision,
     repeat_kv,
@@ -1185,3 +1186,9 @@ class QEffQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
             IOInfo(name="attention_mask", datatype=torch.int64, shape=("batch_size", "seq_len")),
             IOInfo(name="pixel_values", datatype=torch.float32, shape=("batch_size", 3, "image_size", "image_size")),
         ]
+
+
+class QEffQwen3VLVisionBlock(Qwen3VLVisionBlock):
+    @torch.compiler.nested_compile_region
+    def forward(self, *args, **kwargs):
+        return super().forward(*args, **kwargs)
