@@ -13,6 +13,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict
 
+import torch
 import torch.nn as nn
 
 from QEfficient.base.onnx_transforms import (
@@ -191,7 +192,21 @@ def export_wrapper(func):
             # 4. Execute the actual export
             try:
                 with export_context:
-                    onnx_path = func(self, *args, **kwargs)
+                    # For the dynamo+subfunctions path each decoder layer must be
+                    # preserved as a repeated_subgraph ONNX function so that
+                    # PreserveNestedCacheRetainedStateTransform can rename the
+                    # _RetainedState inputs to plain past_key.X / past_value.X.
+                    # The default inline_single_use_invoke_subgraph=True would
+                    # inline single-use layers before the ONNX translation,
+                    # leaving CtxScatter nodes at top level with _RetainedState
+                    # input names that the ORT runner doesn't know to feed.
+                    dynamo_patch = (
+                        torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
+                        if use_onnx_subfunctions and use_dynamo
+                        else nullcontext()
+                    )
+                    with dynamo_patch:
+                        onnx_path = func(self, *args, **kwargs)
             except Exception as export_exc:
                 if use_onnx_subfunctions and use_dynamo and decoder_layer_classes:
                     raise RuntimeError(

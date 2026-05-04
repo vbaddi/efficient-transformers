@@ -170,7 +170,9 @@ def _patch_function_from_source(owner, attr_name, rewrite_source):
 
 
 def _rewrite_functional_tensor_dispatch(source: str) -> str:
-    if "skip\n                                continue" in source:
+    # Already patched if the original unconditional raise is gone — covers
+    # both the qeff-style rewrite and the upstreamed PyTorch fix.
+    if 'f"cannot find {unwrapped} in tensor_tracker"' not in source:
         return source
     old = """                            tracker_entry = m.tracer.tensor_tracker[unwrapped]
                             curr_node = tracker_entry.proxy.node
