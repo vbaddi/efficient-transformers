@@ -6,7 +6,7 @@
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 WEIGHT_SPEC_VERSION = 1
 
@@ -18,12 +18,20 @@ class TiedWeightAlias:
 
 
 @dataclass
+class WeightSpecLocation:
+    type: str
+    file: str
+    key: str
+
+
+@dataclass
 class WeightSpecInput:
     name: str
     fqn: str
     kind: str
     shape: List[int]
     dtype: str
+    location: Optional[WeightSpecLocation] = None
 
 
 @dataclass
@@ -31,6 +39,7 @@ class WeightSpec:
     model_name: str
     model_id: str
     checkpoint_files: List[str]
+    checkpoint_base_dir: Optional[str]
     inputs: List[WeightSpecInput]
     tied_weights: List[TiedWeightAlias] = field(default_factory=list)
     version: int = WEIGHT_SPEC_VERSION
@@ -53,7 +62,18 @@ def load_weight_spec(path: Path) -> WeightSpec:
         model_name=data["model_name"],
         model_id=data["model_id"],
         checkpoint_files=list(data["checkpoint_files"]),
-        inputs=[WeightSpecInput(**entry) for entry in data["inputs"]],
+        checkpoint_base_dir=data.get("checkpoint_base_dir"),
+        inputs=[
+            WeightSpecInput(
+                name=entry["name"],
+                fqn=entry["fqn"],
+                kind=entry["kind"],
+                shape=list(entry["shape"]),
+                dtype=entry["dtype"],
+                location=(WeightSpecLocation(**entry["location"]) if entry.get("location") is not None else None),
+            )
+            for entry in data["inputs"]
+        ],
         tied_weights=[TiedWeightAlias(**entry) for entry in data.get("tied_weights", [])],
         version=data.get("version", WEIGHT_SPEC_VERSION),
     )

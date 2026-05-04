@@ -7,6 +7,7 @@
 
 import gc
 import inspect
+import json
 import logging
 import os
 import shutil
@@ -62,6 +63,14 @@ def _prune_unused_fake_initializers(onnx_program) -> None:
         raw_value = getattr(const_value, "raw", None)
         if isinstance(raw_value, FakeTensor) and name not in used_names:
             del initializers[name]
+
+
+def _upsert_metadata_prop(model, key: str, value: str) -> None:
+    for entry in model.metadata_props:
+        if entry.key == key:
+            entry.value = value
+            return
+    model.metadata_props.append(onnx.StringStringEntryProto(key=key, value=value))
 
 
 logger = logging.getLogger(__name__)
@@ -505,6 +514,9 @@ class QEFFBaseModel(ABC):
                     key="qeff_transforms", value=",".join(effective_transform_owner._transform_names())
                 )
             )
+            if tmp_weight_spec_path.is_file():
+                weight_spec_json = json.dumps(load_json(tmp_weight_spec_path), separators=(",", ":"), sort_keys=True)
+                _upsert_metadata_prop(model, "aic_weightspec", weight_spec_json)
             logger.info("ONNX transforms applied")
 
             onnx_path_tmp = onnx_path.with_suffix(onnx_path.suffix + ".tmp")
