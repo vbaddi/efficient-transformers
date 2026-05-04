@@ -6,9 +6,9 @@
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
-WEIGHT_SPEC_VERSION = 1
+WEIGHT_SPEC_VERSION = 2
 
 
 @dataclass
@@ -20,7 +20,7 @@ class TiedWeightAlias:
 @dataclass
 class WeightSpecLocation:
     type: str
-    file: str
+    file: Union[int, str]
     key: str
 
 
@@ -39,7 +39,7 @@ class WeightSpec:
     model_name: str
     model_id: str
     checkpoint_files: List[str] = field(default_factory=list)
-    checkpoint_base_dir: Optional[str] = None
+    weights_root: Optional[str] = None
     inputs: List[WeightSpecInput] = field(default_factory=list)
     tied_weights: List[TiedWeightAlias] = field(default_factory=list)
     version: int = WEIGHT_SPEC_VERSION
@@ -62,7 +62,7 @@ def load_weight_spec(path: Path) -> WeightSpec:
         model_name=data["model_name"],
         model_id=data["model_id"],
         checkpoint_files=list(data["checkpoint_files"]),
-        checkpoint_base_dir=data.get("checkpoint_base_dir"),
+        weights_root=data.get("weights_root", data.get("checkpoint_base_dir")),
         inputs=[
             WeightSpecInput(
                 name=entry["name"],
