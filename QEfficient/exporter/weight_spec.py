@@ -38,9 +38,9 @@ class WeightSpecInput:
 class WeightSpec:
     model_name: str
     model_id: str
-    checkpoint_files: List[str]
-    checkpoint_base_dir: Optional[str]
-    inputs: List[WeightSpecInput]
+    checkpoint_files: List[str] = field(default_factory=list)
+    checkpoint_base_dir: Optional[str] = None
+    inputs: List[WeightSpecInput] = field(default_factory=list)
     tied_weights: List[TiedWeightAlias] = field(default_factory=list)
     version: int = WEIGHT_SPEC_VERSION
 

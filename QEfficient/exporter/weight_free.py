@@ -4,9 +4,9 @@
 #
 
 import copy
-import os
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import onnx_ir as ir
@@ -51,6 +51,7 @@ def _to_meta(value: Any) -> Any:
     return value
 
 
+@lru_cache(maxsize=None)
 def _resolve_checkpoint_dir(model_id_or_path: str) -> Path:
     candidate = Path(model_id_or_path).expanduser()
     if candidate.exists():
@@ -67,7 +68,7 @@ def _resolve_checkpoint_dir(model_id_or_path: str) -> Path:
 
 def _resolve_checkpoint_files(model_id_or_path: str) -> List[str]:
     checkpoint_dir = _resolve_checkpoint_dir(model_id_or_path)
-    checkpoint_files = sorted(str(path.resolve()) for path in checkpoint_dir.glob("*.safetensors"))
+    checkpoint_files = sorted(str(path) for path in checkpoint_dir.glob("*.safetensors"))
     if not checkpoint_files:
         raise FileNotFoundError(f"No safetensors checkpoint files found for {model_id_or_path}")
     return checkpoint_files
@@ -130,12 +131,19 @@ def _kind_map_for_model(model: nn.Module) -> Dict[str, Tuple[str, str]]:
     return mapping
 
 
-def _checkpoint_base_dir(checkpoint_files: List[str]) -> Optional[Path]:
+def _checkpoint_root(model_id_or_path: str, checkpoint_files: Sequence[str]) -> Optional[Path]:
     if not checkpoint_files:
         return None
 
-    parent_dirs = [str(Path(checkpoint_file).resolve().parent) for checkpoint_file in checkpoint_files]
-    return Path(os.path.commonpath(parent_dirs))
+    candidate = Path(model_id_or_path).expanduser()
+    if candidate.exists():
+        return candidate.parent
+
+    first_checkpoint = Path(checkpoint_files[0])
+    for parent in first_checkpoint.parents:
+        if parent.name.startswith("models--"):
+            return parent.parent
+    return first_checkpoint.parent
 
 
 def _load_checkpoint_index(checkpoint_files: List[str]) -> Dict[str, str]:
@@ -148,18 +156,18 @@ def _load_checkpoint_index(checkpoint_files: List[str]) -> Dict[str, str]:
 
 
 def _build_location(
-    checkpoint_base_dir: Optional[Path],
+    checkpoint_root: Optional[Path],
     checkpoint_file: Optional[str],
     tensor_key: str,
 ) -> Optional[WeightSpecLocation]:
     if checkpoint_file is None:
         return None
 
-    checkpoint_path = Path(checkpoint_file).resolve()
-    if checkpoint_base_dir is not None:
-        file_ref = str(checkpoint_path.relative_to(checkpoint_base_dir))
+    checkpoint_path = Path(checkpoint_file)
+    if checkpoint_root is not None:
+        file_ref = str(checkpoint_path.relative_to(checkpoint_root))
     else:
-        file_ref = str(checkpoint_path)
+        file_ref = checkpoint_path.name
 
     return WeightSpecLocation(type="safetensors", file=file_ref, key=tensor_key)
 
@@ -170,7 +178,7 @@ def _promote_initializers_and_build_spec(onnx_program, model_ref: str, model_nam
     tied_weights = _collect_tied_weights(qeff_model.model)
     tied_weight_map = {entry.alias: entry.canonical for entry in tied_weights}
     checkpoint_files = _resolve_checkpoint_files(model_ref)
-    checkpoint_base_dir = _checkpoint_base_dir(checkpoint_files)
+    checkpoint_root = _checkpoint_root(model_ref, checkpoint_files)
     checkpoint_index = _load_checkpoint_index(checkpoint_files)
     promoted_inputs: List[WeightSpecInput] = []
 
@@ -195,15 +203,19 @@ def _promote_initializers_and_build_spec(onnx_program, model_ref: str, model_nam
                 kind=kind,
                 shape=[int(dim) for dim in init_value.shape],
                 dtype=str(init_value.dtype),
-                location=_build_location(checkpoint_base_dir, checkpoint_index.get(location_key), location_key),
+                location=_build_location(checkpoint_root, checkpoint_index.get(location_key), location_key),
             )
         )
 
     return WeightSpec(
         model_name=model_name,
         model_id=model_ref,
-        checkpoint_files=checkpoint_files,
-        checkpoint_base_dir=str(checkpoint_base_dir) if checkpoint_base_dir is not None else None,
+        checkpoint_files=[
+            str(Path(checkpoint_file).relative_to(checkpoint_root))
+            if checkpoint_root is not None
+            else Path(checkpoint_file).name
+            for checkpoint_file in checkpoint_files
+        ],
         inputs=promoted_inputs,
         tied_weights=tied_weights,
     )
@@ -301,15 +313,43 @@ def _load_checkpoint_tensor(checkpoint_file: str, key: str, dtype: str) -> np.nd
     return tensor.numpy()
 
 
-def _resolve_location_file(spec, location: WeightSpecLocation) -> Path:
+def _default_weights_roots(weight_spec_path: Path, spec) -> List[Path]:
+    roots = [weight_spec_path.parent]
+
+    candidate = Path(spec.model_id).expanduser()
+    if candidate.exists():
+        roots.append(candidate.parent)
+    else:
+        checkpoint_dir = _resolve_checkpoint_dir(spec.model_id)
+        checkpoint_root = _checkpoint_root(spec.model_id, [str(path) for path in checkpoint_dir.glob("*.safetensors")])
+        if checkpoint_root is not None:
+            roots.append(checkpoint_root)
+
+    deduped_roots: List[Path] = []
+    seen = set()
+    for root in roots:
+        resolved = root.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped_roots.append(resolved)
+    return deduped_roots
+
+
+def _resolve_location_file(
+    location: WeightSpecLocation,
+    candidate_roots: Sequence[Path],
+) -> Path:
     location_path = Path(location.file)
     if location_path.is_absolute():
         return location_path
 
-    if spec.checkpoint_base_dir is not None:
-        return Path(spec.checkpoint_base_dir) / location_path
+    for root in candidate_roots:
+        candidate = root / location_path
+        if candidate.exists():
+            return candidate
 
-    return location_path
+    return candidate_roots[0] / location_path if candidate_roots else location_path
 
 
 def _materialize_buffer_from_config(config, fqn: str, dtype: str) -> np.ndarray:
@@ -331,11 +371,20 @@ def _materialize_buffer_from_config(config, fqn: str, dtype: str) -> np.ndarray:
     raise KeyError(fqn)
 
 
-def load_weight_free_ort_inputs(weight_spec_path: Path, runtime_inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+def load_weight_free_ort_inputs(
+    weight_spec_path: Path,
+    runtime_inputs: Dict[str, np.ndarray],
+    weights_root: Optional[Path] = None,
+) -> Dict[str, np.ndarray]:
+    weight_spec_path = Path(weight_spec_path)
     spec = load_weight_spec(weight_spec_path)
     config = AutoConfig.from_pretrained(spec.model_id)
     tied_weights = {entry.alias: entry.canonical for entry in spec.tied_weights}
     checkpoint_index = None
+    candidate_roots = []
+    if weights_root is not None:
+        candidate_roots.append(Path(weights_root).expanduser().resolve())
+    candidate_roots.extend(_default_weights_roots(weight_spec_path, spec))
 
     ort_inputs = dict(runtime_inputs)
     for spec_input in spec.inputs:
@@ -344,7 +393,7 @@ def load_weight_free_ort_inputs(weight_spec_path: Path, runtime_inputs: Dict[str
 
         try:
             if spec_input.location is not None:
-                checkpoint_file = _resolve_location_file(spec, spec_input.location)
+                checkpoint_file = _resolve_location_file(spec_input.location, candidate_roots)
                 ort_inputs[spec_input.name] = _load_checkpoint_tensor(
                     str(checkpoint_file), spec_input.location.key, spec_input.dtype
                 )
@@ -352,7 +401,12 @@ def load_weight_free_ort_inputs(weight_spec_path: Path, runtime_inputs: Dict[str
 
             key = tied_weights.get(spec_input.fqn, spec_input.fqn)
             if checkpoint_index is None:
-                checkpoint_index = _load_checkpoint_index(spec.checkpoint_files)
+                checkpoint_index = _load_checkpoint_index(
+                    [
+                        str(_resolve_location_file(WeightSpecLocation("safetensors", file, ""), candidate_roots))
+                        for file in spec.checkpoint_files
+                    ]
+                )
             checkpoint_file = checkpoint_index.get(key)
             if checkpoint_file is None:
                 raise KeyError(key)
