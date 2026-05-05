@@ -12,12 +12,51 @@ import numpy as np
 import onnxruntime as ort
 import torch
 from accelerate import init_empty_weights
+from safetensors.torch import load_file, save_file
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from QEfficient.exporter.weight_free import load_weight_free_ort_inputs
-from QEfficient.exporter.weight_spec import resolve_weight_spec_path
+from QEfficient.exporter.weight_free import _default_weights_roots, load_weight_free_ort_inputs
+from QEfficient.exporter.weight_spec import CheckpointFile, load_weight_spec, resolve_weight_spec_path, save_weight_spec
 from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
 from QEfficient.utils.run_utils import ApiRunner
+
+
+def convert_checkpoint_to_fp32(onnx_path: Path, weight_spec_path: Path) -> None:
+    """
+    Load each safetensors checkpoint file, cast all tensors to FP32,
+    save next to the ONNX, and update weight_spec.json to point there.
+
+    This ensures the compiler sees matching dtypes between the ONNX (FLOAT)
+    and the safetensors files (also FLOAT after conversion).
+    """
+    spec = load_weight_spec(weight_spec_path)
+    export_dir = onnx_path.parent
+    candidate_roots = _default_weights_roots(weight_spec_path, spec)
+
+    new_checkpoint_files = []
+    for idx, ckpt_file in enumerate(spec.checkpoint_files):
+        rel_path = Path(ckpt_file.path)
+        abs_path = rel_path if rel_path.is_absolute() else None
+        if abs_path is None:
+            for root in candidate_roots:
+                candidate = root / rel_path
+                if candidate.exists():
+                    abs_path = candidate
+                    break
+        if abs_path is None or not abs_path.exists():
+            raise FileNotFoundError(f"Cannot resolve checkpoint file: {ckpt_file.path}")
+
+        tensors = load_file(str(abs_path))
+        fp32_tensors = {k: v.to(torch.float32) for k, v in tensors.items()}
+
+        out_name = f"model_{idx:04d}.safetensors" if len(spec.checkpoint_files) > 1 else "model.safetensors"
+        save_file(fp32_tensors, str(export_dir / out_name))
+        new_checkpoint_files.append(CheckpointFile(path=out_name, format="safetensors"))
+        print(f"  {abs_path.name}  ({next(iter(tensors.values())).dtype})  →  {out_name}  (float32)")
+
+    spec.checkpoint_files = new_checkpoint_files
+    save_weight_spec(weight_spec_path, spec)
+
 
 # model_name = "meta-llama/Llama-3.3-70B-Instruct"
 model_name = "meta-llama/Llama-3.2-1B"
@@ -61,6 +100,9 @@ onnx_path = Path(
     )
 )
 weight_spec_path = resolve_weight_spec_path(onnx_path)
+
+print("Converting checkpoint to FP32 ...")
+convert_checkpoint_to_fp32(onnx_path, weight_spec_path)
 
 session = ort.InferenceSession(str(onnx_path))
 ort_inputs = load_weight_free_ort_inputs(weight_spec_path, runner.input_handler.prepare_ort_inputs())
