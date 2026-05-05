@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -26,6 +27,7 @@ model_name = "meta-llama/Llama-3.2-1B"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 config = AutoConfig.from_pretrained(model_name)
 # config.num_hidden_layers = 2
+config.torch_dtype = torch.float32
 print(config)
 
 runner = ApiRunner(

@@ -492,7 +492,8 @@ class QEFFBaseModel(ABC):
                 )
             logger.info("PyTorch export successful")
             _ = self._offload_model_weights(offload_pt_weights)
-            model = onnx.load(onnx_path, load_external_data=False)
+            load_onnx_path = tmp_onnx_path if use_weight_free_export else onnx_path
+            model = onnx.load(load_onnx_path, load_external_data=False)
 
             needs_external_tensor_data = any(
                 transform in self._onnx_transforms for transform in (FP16ClipTransform, SplitTensorsTransform)

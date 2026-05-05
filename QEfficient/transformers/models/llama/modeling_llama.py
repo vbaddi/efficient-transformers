@@ -74,8 +74,11 @@ def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim).to(device=q.device)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim).to(device=q.device)
+    if position_ids is not None:
+        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    cos = cos.to(device=q.device)
+    sin = sin.to(device=q.device)
 
     # Apply rotation
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -138,50 +141,43 @@ class QEffLlamaAttention(LlamaAttention):
         key_states = self.k_proj(hidden_states, **kwargs).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states, **kwargs).view(hidden_shape).transpose(1, 2)
 
-        # Keep rotary cache length static inside nested compile regions to avoid
-        # Python cache-object calls (e.g., get_seq_length) that break invoke_subgraph capture.
-        past_seen_tokens = position_ids.max() + 1 if position_ids is not None else 0
+        # kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position)
+        past_seen_tokens = past_key_values.get_seq_length(self.layer_idx) if past_key_values is not None else 0
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos_cached, sin_cached)
-
-        cache_kwargs = {}
-        if past_key_values is not None:
-            if num_kv_blocks is not None:
-                cache_kwargs = {
-                    "batch_index": batch_index,
-                    "position_ids": position_ids,
-                    "past_seen_tokens": past_seen_tokens,
-                }
-                past_key_values.write_only(key_states, value_states, self.layer_idx, cache_kwargs)
-            else:
-                cache_kwargs = {"batch_index": batch_index, "position_ids": position_ids}
-                if comp_ctx_lengths is not None:
-                    attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
-                    cache_kwargs["CCL"] = attention_mask.shape[-1]
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs
-                )
-
-        if num_kv_blocks is not None:
-            attention_interface = eager_attention_forward_blockedKV
-            attn_output, attn_weights = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
+        blocking_config = getattr(self, "attn_blocking_config", AttentionBlockingConfig())
+        use_blocking = blocking_config is not None and (blocking_config.mode != BlockingMode.NONE)
+        if use_blocking:
+            attn_output, attn_weights = generic_blocked_attention_interface(
+                module=self,
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                attention_mask=attention_mask,
                 scaling=self.scaling,
-                num_kv_blocks=num_kv_blocks,
-                cache_kwargs=cache_kwargs,
                 layer_idx=self.layer_idx,
                 past_key_value=past_key_values,
-                **kwargs,
+                blocking_config=blocking_config,
+                comp_ctx_length=comp_ctx_lengths,
+                batch_index=batch_index,
+                position_ids=position_ids,
+                past_seen_tokens=past_seen_tokens,
             )
         else:
+            key, value, _ = past_key_value_update(
+                module=self,
+                key=key_states,
+                value=value_states,
+                attention_mask=attention_mask,
+                past_key_value=past_key_values,
+                comp_ctx_lengths=comp_ctx_lengths,
+                batch_index=batch_index,
+                position_ids=position_ids,
+            )
             attn_output, attn_weights = eager_attention_forward(
                 self,
                 query_states,
-                key_states,
-                value_states,
+                key,
+                value,
                 attention_mask,
                 scaling=self.scaling,
                 **kwargs,
@@ -246,8 +242,12 @@ class QEffLlamaModel(LlamaModel):
 
     def __qeff_init__(self):
         self.rotary_emb = QEffLlamaRotaryEmbedding(config=self.config)
-        self.sin_cached = torch.nn.Parameter(self.rotary_emb.sin_cached * self.rotary_emb.attention_scaling)
-        self.cos_cached = torch.nn.Parameter(self.rotary_emb.cos_cached * self.rotary_emb.attention_scaling)
+        self.register_buffer(
+            "sin_cached", self.rotary_emb.sin_cached * self.rotary_emb.attention_scaling, persistent=False
+        )
+        self.register_buffer(
+            "cos_cached", self.rotary_emb.cos_cached * self.rotary_emb.attention_scaling, persistent=False
+        )
 
     def forward(
         self,

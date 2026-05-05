@@ -19,6 +19,7 @@ from transformers import AutoConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 from QEfficient.exporter.weight_spec import (
+    CheckpointFile,
     TiedWeightAlias,
     WeightSpec,
     WeightSpecInput,
@@ -163,7 +164,7 @@ def _build_location(
     if checkpoint_file is None:
         return None
 
-    return WeightSpecLocation(type="safetensors", file=list(checkpoint_files).index(checkpoint_file), key=tensor_key)
+    return WeightSpecLocation(file=list(checkpoint_files).index(checkpoint_file), key=tensor_key)
 
 
 def _promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name: str, qeff_model) -> WeightSpec:
@@ -175,9 +176,12 @@ def _promote_initializers_and_build_spec(onnx_program, model_ref: str, model_nam
     checkpoint_root = _checkpoint_root(model_ref, checkpoint_files)
     checkpoint_index = _load_checkpoint_index(checkpoint_files)
     relative_checkpoint_files = [
-        str(Path(checkpoint_file).relative_to(checkpoint_root))
-        if checkpoint_root is not None
-        else Path(checkpoint_file).name
+        CheckpointFile(
+            path=str(Path(checkpoint_file).relative_to(checkpoint_root))
+            if checkpoint_root is not None
+            else Path(checkpoint_file).name,
+            format="safetensors",
+        )
         for checkpoint_file in checkpoint_files
     ]
     promoted_inputs: List[WeightSpecInput] = []
@@ -336,11 +340,11 @@ def _default_weights_roots(weight_spec_path: Path, spec) -> List[Path]:
 
 def _resolve_location_file(
     location: WeightSpecLocation,
-    checkpoint_files: Sequence[str],
+    checkpoint_files: Sequence[CheckpointFile],
     candidate_roots: Sequence[Path],
 ) -> Path:
     if isinstance(location.file, int):
-        location_path = Path(checkpoint_files[location.file])
+        location_path = Path(checkpoint_files[location.file].path)
     else:
         location_path = Path(location.file)
     if location_path.is_absolute():
@@ -407,7 +411,7 @@ def load_weight_free_ort_inputs(
                     [
                         str(
                             _resolve_location_file(
-                                WeightSpecLocation("safetensors", file_index, ""),
+                                WeightSpecLocation(file_index, ""),
                                 spec.checkpoint_files,
                                 candidate_roots,
                             )

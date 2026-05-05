@@ -6,23 +6,15 @@
 # -----------------------------------------------------------------------------
 
 
-import shutil
-from pathlib import Path
-
-import numpy as np
-import onnxruntime as ort
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from QEfficient.exporter.weight_free import load_weight_free_ort_inputs
-from QEfficient.exporter.weight_spec import resolve_weight_spec_path
 from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
 from QEfficient.utils.run_utils import ApiRunner
 
 # model_name = "openai/gpt-oss-20b"
-# model_name = "meta-llama/Llama-3.2-1B"
+model_name = "meta-llama/Llama-3.2-1B"
 # model_name = "gpt2"
 # model_name = "hf-internal-testing/tiny-random-Olmo2ForCausalLM"
-model_name = "hf-internal-testing/tiny-random-LlamaForCausalLM"
 # model_name = "tiny-random/gpt-oss-bf16"
 # model_name = "hf-internal-testing/tiny-random-LlamaForCausalLM"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -43,38 +35,13 @@ hf_model = AutoModelForCausalLM.from_pretrained(model_name)
 hf_tokens = runner.run_hf_model_on_pytorch(hf_model)
 print(hf_tokens)
 
-qeff_model = QEFFAutoModelForCausalLM.from_pretrained(model_name)
+qeff_model = QEFFAutoModelForCausalLM(hf_model)
 pt_tokens = runner.run_kv_model_on_pytorch(qeff_model.model)
 print(pt_tokens)
 
-export_dir = Path("test_models/weightfree_dynamo")
-for stale_export in export_dir.parent.glob(export_dir.name + "-*"):
-    shutil.rmtree(stale_export, ignore_errors=True)
-
-onnx_path = Path(
-    qeff_model.export(
-        export_dir=export_dir,
-        use_dynamo=True,
-        use_onnx_subfunctions=True,
-        use_weight_free_export=True,
-        offload_pt_weights=False,
-    )
-)
-weight_spec_path = resolve_weight_spec_path(onnx_path)
-session = ort.InferenceSession(str(onnx_path))
-ort_inputs = load_weight_free_ort_inputs(weight_spec_path, runner.input_handler.prepare_ort_inputs())
-ort_outputs = runner.run_ort_session(ort_inputs, session)
-ort_outputs = runner.input_handler.update_ort_outputs(ort_outputs)
-ort_tokens = []
-for _ in range(1, runner.gen_len):
-    ort_tokens.append(ort_outputs["logits"].argmax(-1).reshape(-1, 1))
-    ort_inputs = runner.input_handler.update_ort_inputs(ort_inputs, ort_outputs)
-    ort_inputs = load_weight_free_ort_inputs(weight_spec_path, ort_inputs)
-    ort_outputs = runner.run_ort_session(ort_inputs, session)
-    ort_outputs = runner.input_handler.update_ort_outputs(ort_outputs)
-
-ort_tokens.append(ort_outputs["logits"].argmax(-1).reshape(-1, 1))
-ort_tokens = runner.input_handler.tokenizer.batch_decode(np.concatenate(ort_tokens, axis=1), skip_special_tokens=True)
+onnx_path = qeff_model.export(use_dynamo=True, use_onnx_subfunctions=True)
+ort_inputs = runner.input_handler.prepare_ort_inputs()
+ort_tokens = runner.run_kv_model_on_ort(onnx_path)
 print(ort_tokens)
 
 qeff_model.compile(prefill_seq_len=8, ctx_len=32, use_onnx_subfunctions=True)
