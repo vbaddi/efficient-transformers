@@ -6,7 +6,7 @@
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 WEIGHT_SPEC_VERSION = 3
 
@@ -34,9 +34,22 @@ class WeightSpecInput:
     name: str
     fqn: str
     kind: str
-    shape: List[int]
-    dtype: str
     location: Optional[WeightSpecLocation] = None
+    # dtype and shape are omitted for safetensors-backed tensors (location is not None).
+    # The compiler reads them directly from the safetensors header; storing them here
+    # would cause a mismatch failure when the checkpoint dtype differs from the ONNX dtype.
+    # They are kept for computed tensors (buffers with location=None) so that
+    # _materialize_buffer_from_config knows what precision to produce.
+    dtype: Optional[str] = None
+    shape: Optional[List[int]] = None
+
+
+def _drop_none(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _drop_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_drop_none(v) for v in obj]
+    return obj
 
 
 @dataclass
@@ -49,8 +62,8 @@ class WeightSpec:
     tied_weights: List[TiedWeightAlias] = field(default_factory=list)
     version: int = WEIGHT_SPEC_VERSION
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def to_dict(self) -> Dict[str, Any]:
+        return _drop_none(asdict(self))
 
 
 def save_weight_spec(path: Path, spec: WeightSpec) -> Path:
@@ -89,9 +102,9 @@ def load_weight_spec(path: Path) -> WeightSpec:
                 name=entry["name"],
                 fqn=entry["fqn"],
                 kind=entry["kind"],
-                shape=list(entry["shape"]),
-                dtype=entry["dtype"],
                 location=_load_location(entry.get("location")),
+                dtype=entry.get("dtype"),
+                shape=entry.get("shape"),
             )
             for entry in data["inputs"]
         ],

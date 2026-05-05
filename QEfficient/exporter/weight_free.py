@@ -200,14 +200,19 @@ def _promote_initializers_and_build_spec(onnx_program, model_ref: str, model_nam
         del model_ir.graph.initializers[name]
         kind, fqn = kind_map[name]
         location_key = tied_weight_map.get(fqn, fqn)
+        location = _build_location(checkpoint_files, checkpoint_index.get(location_key), location_key)
         promoted_inputs.append(
             WeightSpecInput(
                 name=name,
                 fqn=fqn,
                 kind=kind,
-                shape=[int(dim) for dim in init_value.shape],
-                dtype=str(init_value.dtype),
-                location=_build_location(checkpoint_files, checkpoint_index.get(location_key), location_key),
+                location=location,
+                # dtype and shape are only stored for computed tensors (buffers).
+                # For safetensors-backed tensors the compiler reads them from the
+                # safetensors header directly; storing them here would cause a
+                # mismatch failure when checkpoint dtype != ONNX dtype.
+                dtype=None if location is not None else str(init_value.dtype),
+                shape=None if location is not None else [int(dim) for dim in init_value.shape],
             )
         )
 
@@ -304,13 +309,9 @@ def _spec_dtype_to_torch(dtype: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype in weight spec: {dtype}")
 
 
-def _load_checkpoint_tensor(checkpoint_file: str, key: str, dtype: str) -> np.ndarray:
+def _load_checkpoint_tensor(checkpoint_file: str, key: str) -> np.ndarray:
     handle = safe_open(checkpoint_file, framework="pt")
-    tensor = handle.get_tensor(key).detach().cpu()
-    target_dtype = _spec_dtype_to_torch(dtype)
-    if tensor.dtype != target_dtype:
-        tensor = tensor.to(target_dtype)
-    return tensor.numpy()
+    return handle.get_tensor(key).detach().cpu().numpy()
 
 
 def _default_weights_roots(weight_spec_path: Path, spec) -> List[Path]:
@@ -400,9 +401,7 @@ def load_weight_free_ort_inputs(
         try:
             if spec_input.location is not None:
                 checkpoint_file = _resolve_location_file(spec_input.location, spec.checkpoint_files, candidate_roots)
-                ort_inputs[spec_input.name] = _load_checkpoint_tensor(
-                    str(checkpoint_file), spec_input.location.key, spec_input.dtype
-                )
+                ort_inputs[spec_input.name] = _load_checkpoint_tensor(str(checkpoint_file), spec_input.location.key)
                 continue
 
             key = tied_weights.get(spec_input.fqn, spec_input.fqn)
@@ -422,7 +421,7 @@ def load_weight_free_ort_inputs(
             checkpoint_file = checkpoint_index.get(key)
             if checkpoint_file is None:
                 raise KeyError(key)
-            ort_inputs[spec_input.name] = _load_checkpoint_tensor(checkpoint_file, key, spec_input.dtype)
+            ort_inputs[spec_input.name] = _load_checkpoint_tensor(checkpoint_file, key)
         except KeyError:
             if spec_input.kind != "buffer":
                 raise
