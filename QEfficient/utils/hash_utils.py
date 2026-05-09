@@ -8,6 +8,7 @@
 import hashlib
 import json
 from dataclasses import asdict, is_dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Dict
 
@@ -17,6 +18,8 @@ from QEfficient.utils.constants import HASH_HEXDIGEST_STR_LEN
 def json_serializable(obj):
     if isinstance(obj, Path):
         return str(obj)
+    if isinstance(obj, Enum):
+        return obj.value
     if isinstance(obj, set):
         # Convert set to a sorted list of strings for consistent hashing
         return sorted([cls.__name__ if isinstance(cls, type) else str(cls) for cls in obj])

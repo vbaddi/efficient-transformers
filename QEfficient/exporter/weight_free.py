@@ -6,7 +6,7 @@
 import copy
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import onnx_ir as ir
@@ -15,7 +15,6 @@ from accelerate import init_empty_weights
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from torch import nn
-from transformers import AutoConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 from QEfficient.exporter.weight_spec import (
@@ -126,10 +125,11 @@ def _build_meta_qeff_model(qeff_model):
     return meta_qeff_model
 
 
-def _kind_map_for_model(model: nn.Module) -> Dict[str, Tuple[str, str]]:
-    mapping = {name: ("parameter", name) for name, _ in model.named_parameters()}
-    mapping.update({name: ("buffer", name) for name, _ in model.named_buffers()})
-    return mapping
+def _fqn_map_for_model(model: nn.Module) -> Dict[str, str]:
+    """Map ONNX initializer name → model FQN for checkpoint key lookup."""
+    fqn_map = {name: name for name, _ in model.named_parameters()}
+    fqn_map.update({name: name for name, _ in model.named_buffers()})
+    return fqn_map
 
 
 def _checkpoint_root(model_id_or_path: str, checkpoint_files: Sequence[str]) -> Optional[Path]:
@@ -169,7 +169,7 @@ def _build_location(
 
 def _promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name: str, qeff_model) -> WeightSpec:
     model_ir = onnx_program.model
-    kind_map = _kind_map_for_model(qeff_model.model)
+    fqn_map = _fqn_map_for_model(qeff_model.model)
     tied_weights = _collect_tied_weights(qeff_model.model)
     tied_weight_map = {entry.alias: entry.canonical for entry in tied_weights}
     checkpoint_files = _resolve_checkpoint_files(model_ref)
@@ -187,7 +187,16 @@ def _promote_initializers_and_build_spec(onnx_program, model_ref: str, model_nam
     promoted_inputs: List[WeightSpecInput] = []
 
     for name, init_value in list(model_ir.graph.initializers.items()):
-        if name not in kind_map:
+        if name not in fqn_map:
+            continue
+
+        fqn = fqn_map[name]
+        location_key = tied_weight_map.get(fqn, fqn)
+        location = _build_location(checkpoint_files, checkpoint_index.get(location_key), location_key)
+
+        if location is None:
+            # Computed buffer (e.g. sin_cached, cos_cached) — leave as ONNX initializer.
+            # The compiler embeds it in the model; it is not loaded from a checkpoint file.
             continue
 
         model_ir.graph.inputs.append(
@@ -198,29 +207,12 @@ def _promote_initializers_and_build_spec(onnx_program, model_ref: str, model_nam
             )
         )
         del model_ir.graph.initializers[name]
-        kind, fqn = kind_map[name]
-        location_key = tied_weight_map.get(fqn, fqn)
-        location = _build_location(checkpoint_files, checkpoint_index.get(location_key), location_key)
-        promoted_inputs.append(
-            WeightSpecInput(
-                name=name,
-                fqn=fqn,
-                kind=kind,
-                location=location,
-                # dtype and shape are only stored for computed tensors (buffers).
-                # For safetensors-backed tensors the compiler reads them from the
-                # safetensors header directly; storing them here would cause a
-                # mismatch failure when checkpoint dtype != ONNX dtype.
-                dtype=None if location is not None else str(init_value.dtype),
-                shape=None if location is not None else [int(dim) for dim in init_value.shape],
-            )
-        )
+        promoted_inputs.append(WeightSpecInput(name=name, fqn=fqn, location=location))
 
     return WeightSpec(
         model_name=model_name,
         model_id=model_ref,
         checkpoint_files=relative_checkpoint_files,
-        weights_root=None,
         inputs=promoted_inputs,
         tied_weights=tied_weights,
     )
@@ -316,9 +308,6 @@ def _load_checkpoint_tensor(checkpoint_file: str, key: str) -> np.ndarray:
 
 def _default_weights_roots(weight_spec_path: Path, spec) -> List[Path]:
     roots = [weight_spec_path.parent]
-    if getattr(spec, "weights_root", None) is not None:
-        roots.append(Path(spec.weights_root).expanduser())
-
     candidate = Path(spec.model_id).expanduser()
     if candidate.exists():
         roots.append(candidate.parent)
@@ -385,9 +374,6 @@ def load_weight_free_ort_inputs(
 ) -> Dict[str, np.ndarray]:
     weight_spec_path = Path(weight_spec_path)
     spec = load_weight_spec(weight_spec_path)
-    config = AutoConfig.from_pretrained(spec.model_id)
-    tied_weights = {entry.alias: entry.canonical for entry in spec.tied_weights}
-    checkpoint_index = None
     candidate_roots = []
     if weights_root is not None:
         candidate_roots.append(Path(weights_root).expanduser().resolve())
@@ -397,35 +383,8 @@ def load_weight_free_ort_inputs(
     for spec_input in spec.inputs:
         if spec_input.name in ort_inputs:
             continue
-
-        try:
-            if spec_input.location is not None:
-                checkpoint_file = _resolve_location_file(spec_input.location, spec.checkpoint_files, candidate_roots)
-                ort_inputs[spec_input.name] = _load_checkpoint_tensor(str(checkpoint_file), spec_input.location.key)
-                continue
-
-            key = tied_weights.get(spec_input.fqn, spec_input.fqn)
-            if checkpoint_index is None:
-                checkpoint_index = _load_checkpoint_index(
-                    [
-                        str(
-                            _resolve_location_file(
-                                WeightSpecLocation(file_index, ""),
-                                spec.checkpoint_files,
-                                candidate_roots,
-                            )
-                        )
-                        for file_index in range(len(spec.checkpoint_files))
-                    ]
-                )
-            checkpoint_file = checkpoint_index.get(key)
-            if checkpoint_file is None:
-                raise KeyError(key)
-            ort_inputs[spec_input.name] = _load_checkpoint_tensor(checkpoint_file, key)
-        except KeyError:
-            if spec_input.kind != "buffer":
-                raise
-            ort_inputs[spec_input.name] = _materialize_buffer_from_config(config, spec_input.fqn, spec_input.dtype)
+        checkpoint_file = _resolve_location_file(spec_input.location, spec.checkpoint_files, candidate_roots)
+        ort_inputs[spec_input.name] = _load_checkpoint_tensor(str(checkpoint_file), spec_input.location.key)
 
     return ort_inputs
 

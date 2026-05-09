@@ -6,9 +6,9 @@
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
-WEIGHT_SPEC_VERSION = 3
+WEIGHT_SPEC_VERSION = 4
 
 
 @dataclass
@@ -33,23 +33,7 @@ class WeightSpecLocation:
 class WeightSpecInput:
     name: str
     fqn: str
-    kind: str
-    location: Optional[WeightSpecLocation] = None
-    # dtype and shape are omitted for safetensors-backed tensors (location is not None).
-    # The compiler reads them directly from the safetensors header; storing them here
-    # would cause a mismatch failure when the checkpoint dtype differs from the ONNX dtype.
-    # They are kept for computed tensors (buffers with location=None) so that
-    # _materialize_buffer_from_config knows what precision to produce.
-    dtype: Optional[str] = None
-    shape: Optional[List[int]] = None
-
-
-def _drop_none(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {k: _drop_none(v) for k, v in obj.items() if v is not None}
-    if isinstance(obj, list):
-        return [_drop_none(v) for v in obj]
-    return obj
+    location: WeightSpecLocation  # required: every spec entry must point to a file
 
 
 @dataclass
@@ -57,13 +41,12 @@ class WeightSpec:
     model_name: str
     model_id: str
     checkpoint_files: List[CheckpointFile] = field(default_factory=list)
-    weights_root: Optional[str] = None
     inputs: List[WeightSpecInput] = field(default_factory=list)
     tied_weights: List[TiedWeightAlias] = field(default_factory=list)
     version: int = WEIGHT_SPEC_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
-        return _drop_none(asdict(self))
+        return asdict(self)
 
 
 def save_weight_spec(path: Path, spec: WeightSpec) -> Path:
@@ -81,9 +64,7 @@ def _load_checkpoint_files(raw: list) -> List[CheckpointFile]:
     return [CheckpointFile(**entry) for entry in raw]
 
 
-def _load_location(raw: Optional[dict]) -> Optional[WeightSpecLocation]:
-    if raw is None:
-        return None
+def _load_location(raw: dict) -> WeightSpecLocation:
     # Backward compat: old format had a redundant "type" field on the location
     return WeightSpecLocation(file=raw["file"], key=raw["key"])
 
@@ -96,17 +77,14 @@ def load_weight_spec(path: Path) -> WeightSpec:
         model_name=data["model_name"],
         model_id=data["model_id"],
         checkpoint_files=_load_checkpoint_files(data.get("checkpoint_files", [])),
-        weights_root=data.get("weights_root", data.get("checkpoint_base_dir")),
         inputs=[
             WeightSpecInput(
                 name=entry["name"],
                 fqn=entry["fqn"],
-                kind=entry["kind"],
-                location=_load_location(entry.get("location")),
-                dtype=entry.get("dtype"),
-                shape=entry.get("shape"),
+                location=_load_location(entry["location"]),
             )
             for entry in data["inputs"]
+            if entry.get("location") is not None  # backward compat: skip old buffer-only entries
         ],
         tied_weights=[TiedWeightAlias(**entry) for entry in data.get("tied_weights", [])],
         version=data.get("version", WEIGHT_SPEC_VERSION),

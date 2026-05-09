@@ -5,10 +5,12 @@
 #
 # -----------------------------------------------------------------------------
 
+import json
 import shutil
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 import torch
 from accelerate import init_empty_weights
@@ -57,6 +59,18 @@ def convert_checkpoint_to_fp32(onnx_path: Path, weight_spec_path: Path) -> None:
     spec.checkpoint_files = new_checkpoint_files
     save_weight_spec(weight_spec_path, spec)
 
+    # Sync aic_weightspec metadata in the ONNX so the compiler sees the same
+    # (local FP32) paths as weight_spec.json.
+    updated_json = json.dumps(json.loads(weight_spec_path.read_text()), separators=(",", ":"), sort_keys=True)
+    onnx_model = onnx.load(str(onnx_path), load_external_data=False)
+    for entry in onnx_model.metadata_props:
+        if entry.key == "aic_weightspec":
+            entry.value = updated_json
+            break
+    tmp = onnx_path.with_suffix(onnx_path.suffix + ".tmp")
+    onnx.save(onnx_model, str(tmp))
+    tmp.replace(onnx_path)
+
 
 # model_name = "meta-llama/Llama-3.3-70B-Instruct"
 model_name = "meta-llama/Llama-3.2-1B"
@@ -69,6 +83,9 @@ config = AutoConfig.from_pretrained(model_name)
 config.torch_dtype = torch.float32
 print(config)
 
+CONTINUOUS_BATCHING = False
+FULL_BATCH_SIZE = 4  # slots in the KV cache; active batch_size stays at 1 here # NOT VERIFIED, WIP
+
 runner = ApiRunner(
     batch_size=1,
     tokenizer=tokenizer,
@@ -76,6 +93,7 @@ runner = ApiRunner(
     prompt=["My name is"],
     prompt_len=8,
     ctx_len=32,
+    full_batch_size=FULL_BATCH_SIZE if CONTINUOUS_BATCHING else None,
 )
 
 with init_empty_weights():
@@ -84,6 +102,7 @@ with init_empty_weights():
 qeff_model = QEFFAutoModelForCausalLM(
     meta_model,
     pretrained_model_name_or_path=model_name,
+    continuous_batching=CONTINUOUS_BATCHING,
 )
 
 export_dir = Path("test_models/weightfree_from_config")
