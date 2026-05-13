@@ -517,7 +517,7 @@ class QEFFBaseModel(ABC):
             )
             if tmp_weight_spec_path.is_file():
                 weight_spec_json = json.dumps(load_json(tmp_weight_spec_path), separators=(",", ":"), sort_keys=True)
-                _upsert_metadata_prop(model, "aic_weightspec", weight_spec_json)
+                _upsert_metadata_prop(model, "com.qti.aisw.extdata", weight_spec_json)
             logger.info("ONNX transforms applied")
 
             onnx_path_tmp = onnx_path.with_suffix(onnx_path.suffix + ".tmp")
@@ -690,11 +690,6 @@ class QEFFBaseModel(ABC):
 
                 For QNN Compilation path, when enable_qnn is set to True, any parameter passed in compiler_options will be ignored.
         """
-
-        if use_weight_free_export:
-            raise NotImplementedError(
-                "Weight-free export is wired for Torch-to-ONNX verification, but AI100 compile integration is not implemented yet."
-            )
 
         onnx_path = Path(
             onnx_path

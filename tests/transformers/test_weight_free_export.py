@@ -92,12 +92,13 @@ def test_causal_lm_weight_free_export_and_parity(tmp_path):
 
     spec = load_weight_spec(spec_path)
     assert spec.model_id == str(checkpoint_dir)
+    assert spec.files
     assert spec.inputs
 
     onnx_model = onnx.load(onnx_path, load_external_data=False)
     metadata_props = {entry.key: entry.value for entry in onnx_model.metadata_props}
-    assert "aic_weightspec" in metadata_props
-    assert json.loads(metadata_props["aic_weightspec"]) == json.loads(spec_path.read_text())
+    assert "com.qti.aisw.extdata" in metadata_props
+    assert json.loads(metadata_props["com.qti.aisw.extdata"]) == json.loads(spec_path.read_text())
 
     initializer_names = {initializer.name for initializer in onnx_model.graph.initializer}
     assert not initializer_names.intersection({entry.name for entry in spec.inputs})

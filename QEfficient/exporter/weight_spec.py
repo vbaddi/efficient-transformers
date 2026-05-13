@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
-WEIGHT_SPEC_VERSION = 4
+WEIGHT_SPEC_VERSION = 5
 
 
 @dataclass
@@ -18,9 +18,12 @@ class TiedWeightAlias:
 
 
 @dataclass
-class CheckpointFile:
+class ExternalDataFile:
     path: str
     format: str
+
+
+CheckpointFile = ExternalDataFile
 
 
 @dataclass
@@ -32,7 +35,6 @@ class WeightSpecLocation:
 @dataclass
 class WeightSpecInput:
     name: str
-    fqn: str
     location: WeightSpecLocation  # required: every spec entry must point to a file
 
 
@@ -40,13 +42,14 @@ class WeightSpecInput:
 class WeightSpec:
     model_name: str
     model_id: str
-    checkpoint_files: List[CheckpointFile] = field(default_factory=list)
+    files: List[ExternalDataFile] = field(default_factory=list)
     inputs: List[WeightSpecInput] = field(default_factory=list)
-    tied_weights: List[TiedWeightAlias] = field(default_factory=list)
     version: int = WEIGHT_SPEC_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["model_id"] = str(data["model_id"])
+        return data
 
 
 def save_weight_spec(path: Path, spec: WeightSpec) -> Path:
@@ -55,13 +58,13 @@ def save_weight_spec(path: Path, spec: WeightSpec) -> Path:
     return path
 
 
-def _load_checkpoint_files(raw: list) -> List[CheckpointFile]:
+def _load_files(raw: list) -> List[ExternalDataFile]:
     if not raw:
         return []
     # Backward compat: old format stored plain strings
     if isinstance(raw[0], str):
-        return [CheckpointFile(path=entry, format="safetensors") for entry in raw]
-    return [CheckpointFile(**entry) for entry in raw]
+        return [ExternalDataFile(path=entry, format="safetensors") for entry in raw]
+    return [ExternalDataFile(**entry) for entry in raw]
 
 
 def _load_location(raw: dict) -> WeightSpecLocation:
@@ -76,17 +79,15 @@ def load_weight_spec(path: Path) -> WeightSpec:
     return WeightSpec(
         model_name=data["model_name"],
         model_id=data["model_id"],
-        checkpoint_files=_load_checkpoint_files(data.get("checkpoint_files", [])),
+        files=_load_files(data.get("files", data.get("checkpoint_files", []))),
         inputs=[
             WeightSpecInput(
                 name=entry["name"],
-                fqn=entry["fqn"],
                 location=_load_location(entry["location"]),
             )
             for entry in data["inputs"]
             if entry.get("location") is not None  # backward compat: skip old buffer-only entries
         ],
-        tied_weights=[TiedWeightAlias(**entry) for entry in data.get("tied_weights", [])],
         version=data.get("version", WEIGHT_SPEC_VERSION),
     )
 
