@@ -5,7 +5,6 @@
 #
 # -----------------------------------------------------------------------------
 
-import os
 from typing import List, Optional, Tuple, Type
 
 import torch
@@ -106,10 +105,6 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-EXPERT_BLOCKING_NUM_NSP = int(os.environ.get("EXPERT_BLOCKING_NUM_NSP", "16"))
-EXPERT_BLOCKING_PACKED_CHUNK_SIZE = int(os.environ.get("EXPERT_BLOCKING_PACKED_CHUNK_SIZE", "256"))
-
-
 def _build_matched_idx_from_cumsum(T2Ei: torch.Tensor) -> torch.Tensor:
     """Build packed->original token index"""
     batch_size, seq_len = T2Ei.shape
@@ -137,8 +132,7 @@ def _cumsum_scatter_gather_update_expert_blocked(
     routing_weight: torch.Tensor,
     expert_out: torch.Tensor,
     act_fn,
-    T: int,
-    packed_chunk_size: int,
+    num_packed_chunks: int,
 ) -> torch.Tensor:
     """Cumsum-scatter-gather-update expert helper for NSP-blocked dispatch.
 
@@ -155,7 +149,8 @@ def _cumsum_scatter_gather_update_expert_blocked(
         expert_out      : [num_nsp, T, H]         (accumulator, in-out)
     """
     batch_size, seq_len = T2Ei.shape
-    packed_chunk_size = max(1, min(packed_chunk_size, seq_len))
+    num_packed_chunks = max(1, num_packed_chunks)
+    packed_chunk_size = -(-seq_len // num_packed_chunks)
 
     matched_idx = _build_matched_idx_from_cumsum(T2Ei)
     valid_rows = torch.einsum("ij->i", T2Ei.to(torch.int32)).unsqueeze(1)
@@ -195,6 +190,8 @@ def _cumsum_scatter_gather_update_expert_blocked(
 
 
 class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
+    supports_moe_prefill_blocking = True
+
     def __qeff_init__(self):
         self.gate_proj_w = []
         self.up_proj_w = []
@@ -207,36 +204,6 @@ class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             self.gate_proj_w = torch.stack(self.gate_proj_w)  # [E, H, I]
             self.up_proj_w = torch.stack(self.up_proj_w)  # [E, H, I]
             self.down_proj_w = torch.stack(self.down_proj_w)  # [E, I, H]
-
-    def _forward_expert_blocked(self, x: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
-        T, H = x.shape
-        num_nsp = EXPERT_BLOCKING_NUM_NSP
-        if self.num_experts % num_nsp != 0:
-            raise ValueError(
-                f"num_experts ({self.num_experts}) must be divisible by EXPERT_BLOCKING_NUM_NSP ({num_nsp})"
-            )
-        local_experts = self.num_experts // num_nsp
-        rw = routing_weights.transpose(0, 1).contiguous().view(local_experts, num_nsp, T).transpose(0, 1).contiguous()
-        W_g = self.gate_proj_w.view(local_experts, num_nsp, H, -1).transpose(0, 1).contiguous()
-        W_u = self.up_proj_w.view(local_experts, num_nsp, H, -1).transpose(0, 1).contiguous()
-        W_d = self.down_proj_w.view(local_experts, num_nsp, -1, H).transpose(0, 1).contiguous()
-        expert_out = x.new_zeros((num_nsp, T, H))
-        for slot in range(local_experts):
-            routing_weight = rw[:, slot, :]
-            T2Ei = routing_weight > 0
-            expert_out = _cumsum_scatter_gather_update_expert_blocked(
-                x=x,
-                T2Ei=T2Ei,
-                W_g=W_g[:, slot],
-                W_u=W_u[:, slot],
-                W_d=W_d[:, slot],
-                routing_weight=routing_weight,
-                expert_out=expert_out,
-                act_fn=self.experts[0].act_fn,
-                T=T,
-                packed_chunk_size=EXPERT_BLOCKING_PACKED_CHUNK_SIZE,
-            )
-        return torch.einsum("ijk->jk", expert_out)
 
     def orig_forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, S, H = hidden_states.shape
@@ -275,20 +242,34 @@ class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
         routing_weights = torch.zeros_like(router_logits)
         routing_weights.scatter_(1, top_i, top_w)
 
-        if self.num_experts % EXPERT_BLOCKING_NUM_NSP == 0:
-            expert_out = self._forward_expert_blocked(x=x, routing_weights=routing_weights)
-            return expert_out.view(B, S, H), router_logits
+        num_nsp = self.expert_blocking_num_nsp
+        num_packed_chunks = getattr(self, "expert_blocking_num_packed_chunks", 1)
+        if self.num_experts % num_nsp != 0:
+            raise ValueError(
+                f"num_experts ({self.num_experts}) must be divisible by expert_blocking_num_nsp ({num_nsp})"
+            )
 
-        expert_out = x.new_zeros((T, H))
-        for e in range(self.num_experts):
-            routing_weight = routing_weights[:, e].unsqueeze(-1)
-            W_g, W_u = self.experts[e].gate_proj.weight.T, self.experts[e].up_proj.weight.T
-            W_d = self.experts[e].down_proj.weight.T
-            gate = x @ W_g
-            up = x @ W_u
-            down = (up * self.experts[e].act_fn(gate)) @ W_d
-            expert_out += down * routing_weight
-        return expert_out.view(B, S, H), router_logits
+        local_experts = self.num_experts // num_nsp
+        rw = routing_weights.transpose(0, 1).contiguous().view(local_experts, num_nsp, T).transpose(0, 1).contiguous()
+        W_g = self.gate_proj_w.view(local_experts, num_nsp, H, -1).transpose(0, 1).contiguous()
+        W_u = self.up_proj_w.view(local_experts, num_nsp, H, -1).transpose(0, 1).contiguous()
+        W_d = self.down_proj_w.view(local_experts, num_nsp, -1, H).transpose(0, 1).contiguous()
+        expert_out = x.new_zeros((num_nsp, T, H))
+        for slot in range(local_experts):
+            routing_weight = rw[:, slot, :]
+            T2Ei = routing_weight > 0
+            expert_out = _cumsum_scatter_gather_update_expert_blocked(
+                x=x,
+                T2Ei=T2Ei,
+                W_g=W_g[:, slot],
+                W_u=W_u[:, slot],
+                W_d=W_d[:, slot],
+                routing_weight=routing_weight,
+                expert_out=expert_out,
+                act_fn=self.experts[0].act_fn,
+                num_packed_chunks=num_packed_chunks,
+            )
+        return torch.einsum("ijk->jk", expert_out).view(B, S, H), router_logits
 
 
 class QEffQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
