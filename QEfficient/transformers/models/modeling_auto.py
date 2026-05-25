@@ -3000,10 +3000,13 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             for module in self.model.modules():
                 if getattr(module, "supports_moe_prefill_blocking", False):
                     module.expert_blocking_num_nsp = num_cores
+                    module.expert_blocking_packed_chunk_size = moe_prefill_packed_chunk_size
                     module.expert_blocking_num_packed_chunks = num_packed_chunks
             self.hash_params["moe_prefill_num_nsp"] = num_cores
             self.hash_params["moe_prefill_packed_chunk_size"] = moe_prefill_packed_chunk_size
             self.hash_params["moe_prefill_num_packed_chunks"] = num_packed_chunks
+            if self.model.config.model_type in {"qwen3_moe", "gpt_oss"}:
+                return max(prefill_seq_len or 0, constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
             return constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
 
         num_q_blocks = (

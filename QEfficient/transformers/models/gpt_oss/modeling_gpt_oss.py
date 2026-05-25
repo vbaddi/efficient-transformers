@@ -86,7 +86,7 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
     expert_out: torch.Tensor,
     limit: float,
     alpha: float,
-    num_packed_chunks: int,
+    packed_chunk_size: int,
 ) -> torch.Tensor:
     """Cumsum-scatter-gather-update expert helper for GPT-OSS NSP-blocked dispatch.
 
@@ -100,18 +100,16 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
         W_d             : [num_nsp, I, H]
         b_g, b_u        : [num_nsp, I]
         b_d             : [num_nsp, H]
-        routing_weight  : [num_nsp, T]
+        routing_weight  : [num_nsp, T, 1]
         expert_out      : [num_nsp, T, H]         (accumulator, in-out)
     """
     batch_size, seq_len = T2Ei.shape
-    num_packed_chunks = max(1, num_packed_chunks)
-    packed_chunk_size = -(-seq_len // num_packed_chunks)
+    packed_chunk_size = max(1, min(packed_chunk_size, seq_len))
 
     matched_idx = _build_matched_idx_from_cumsum(T2Ei)
-    valid_rows = torch.einsum("ij->i", T2Ei.to(torch.int32)).unsqueeze(1)
+    valid_rows = T2Ei.to(torch.int32).sum(dim=1, keepdim=True)
     row_range = torch.arange(packed_chunk_size, dtype=torch.int32, device=x.device).unsqueeze(0)
     x_expanded = x.unsqueeze(0).expand(batch_size, -1, -1)
-    rw_expanded = routing_weight.unsqueeze(-1)
 
     for packed_start in range(0, seq_len, packed_chunk_size):
         packed_stop = packed_start + packed_chunk_size
@@ -127,18 +125,16 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
         intermediate = (up + 1) * glu
         down_chunk = (intermediate @ W_d) + b_d.unsqueeze(1)
 
-        rw_chunk = CtxGatherFunc3DGeneralized.apply(rw_expanded, chunk_matched_idx)
+        rw_chunk = CtxGatherFunc3DGeneralized.apply(routing_weight, chunk_matched_idx)
         down_chunk = down_chunk * rw_chunk
 
         expert_out_chunk = CtxGatherFunc3DGeneralized.apply(expert_out, chunk_matched_idx)
         updated_chunk = expert_out_chunk + down_chunk
 
-        rows_remaining = valid_rows - packed_start
-        chunk_valid_rows = torch.where(rows_remaining < 0, torch.zeros_like(rows_remaining), rows_remaining)
-        chunk_valid_rows = torch.where(
-            chunk_valid_rows > packed_chunk_size,
-            torch.ones_like(chunk_valid_rows) * packed_chunk_size,
-            chunk_valid_rows,
+        chunk_valid_rows = torch.clamp(
+            valid_rows - packed_start,
+            min=torch.zeros_like(valid_rows),
+            max=torch.full_like(valid_rows, packed_chunk_size),
         )
         updated_chunk = torch.where(
             (row_range < chunk_valid_rows).unsqueeze(-1), updated_chunk, torch.zeros_like(updated_chunk)
@@ -164,7 +160,7 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
         routing_weights.scatter_(1, top_i, top_w)
 
         num_nsp = self.expert_blocking_num_nsp
-        num_packed_chunks = getattr(self, "expert_blocking_num_packed_chunks", 1)
+        packed_chunk_size = self.expert_blocking_packed_chunk_size
         num_experts = self.experts.num_experts
         if num_experts % num_nsp != 0:
             raise ValueError(f"num_experts ({num_experts}) must be divisible by expert_blocking_num_nsp ({num_nsp})")
@@ -182,9 +178,9 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
         b_d = self.experts.down_proj_bias.view(local_experts, num_nsp, H).transpose(0, 1).contiguous()
 
         expert_out = hidden.new_zeros((num_nsp, T, H))
+        routing_weights_unsqueezed = routing_weights_by_expert.unsqueeze(-1)
         for local_slot in range(local_experts):
-            routing_weight = routing_weights_by_expert[:, local_slot, :]
-            T2Ei = routing_weight > 0
+            T2Ei = routing_weights_by_expert[:, local_slot, :] > 0
             expert_out = _cumsum_scatter_gather_update_gptoss_expert_blocked(
                 x=hidden,
                 T2Ei=T2Ei,
@@ -194,14 +190,14 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
                 b_g=b_g[:, local_slot],
                 b_u=b_u[:, local_slot],
                 b_d=b_d[:, local_slot],
-                routing_weight=routing_weight,
+                routing_weight=routing_weights_unsqueezed[:, local_slot],
                 expert_out=expert_out,
                 limit=self.experts.limit,
                 alpha=self.experts.alpha,
-                num_packed_chunks=num_packed_chunks,
+                packed_chunk_size=packed_chunk_size,
             )
 
-        return torch.einsum("ijk->jk", expert_out).view(B, S, H), router_logits
+        return expert_out.sum(dim=0).view(B, S, H), router_logits
 
 
 class QEffPrefillOnlyGptOssMLP(GptOssMLP):

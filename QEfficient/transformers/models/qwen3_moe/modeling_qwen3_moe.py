@@ -132,7 +132,7 @@ def _cumsum_scatter_gather_update_expert_blocked(
     routing_weight: torch.Tensor,
     expert_out: torch.Tensor,
     act_fn,
-    num_packed_chunks: int,
+    packed_chunk_size: int,
 ) -> torch.Tensor:
     """Cumsum-scatter-gather-update expert helper for NSP-blocked dispatch.
 
@@ -145,19 +145,16 @@ def _cumsum_scatter_gather_update_expert_blocked(
         T2Ei            : [num_nsp, T]            (bool)
         W_g, W_u        : [num_nsp, H, I]
         W_d             : [num_nsp, I, H]
-        routing_weight  : [num_nsp, T]
+        routing_weight  : [num_nsp, T, 1]
         expert_out      : [num_nsp, T, H]         (accumulator, in-out)
     """
     batch_size, seq_len = T2Ei.shape
-    num_packed_chunks = max(1, num_packed_chunks)
-    packed_chunk_size = -(-seq_len // num_packed_chunks)
+    packed_chunk_size = max(1, min(packed_chunk_size, seq_len))
 
     matched_idx = _build_matched_idx_from_cumsum(T2Ei)
-    valid_rows = torch.einsum("ij->i", T2Ei.to(torch.int32)).unsqueeze(1)
+    valid_rows = T2Ei.to(torch.int32).sum(dim=1, keepdim=True)
     row_range = torch.arange(packed_chunk_size, dtype=torch.int32, device=x.device).unsqueeze(0)
     x_expanded = x.unsqueeze(0).expand(batch_size, -1, -1)
-    rw_expanded = routing_weight.unsqueeze(-1)
-
     for packed_start in range(0, seq_len, packed_chunk_size):
         packed_stop = packed_start + packed_chunk_size
         chunk_matched_idx = matched_idx[:, packed_start:packed_stop]
@@ -168,18 +165,16 @@ def _cumsum_scatter_gather_update_expert_blocked(
         up_prime = x_chunk @ W_u
         down_chunk = (up_prime * act_fn(gate_prime)) @ W_d
 
-        rw_chunk = CtxGatherFunc3DGeneralized.apply(rw_expanded, chunk_matched_idx)
+        rw_chunk = CtxGatherFunc3DGeneralized.apply(routing_weight, chunk_matched_idx)
         down_chunk = down_chunk * rw_chunk
 
         expert_out_chunk = CtxGatherFunc3DGeneralized.apply(expert_out, chunk_matched_idx)
         updated_chunk = expert_out_chunk + down_chunk
 
-        rows_remaining = valid_rows - packed_start
-        chunk_valid_rows = torch.where(rows_remaining < 0, torch.zeros_like(rows_remaining), rows_remaining)
-        chunk_valid_rows = torch.where(
-            chunk_valid_rows > packed_chunk_size,
-            torch.ones_like(chunk_valid_rows) * packed_chunk_size,
-            chunk_valid_rows,
+        chunk_valid_rows = torch.clamp(
+            valid_rows - packed_start,
+            min=torch.zeros_like(valid_rows),
+            max=torch.full_like(valid_rows, packed_chunk_size),
         )
         updated_chunk = torch.where(
             (row_range < chunk_valid_rows).unsqueeze(-1), updated_chunk, torch.zeros_like(updated_chunk)
@@ -243,7 +238,7 @@ class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
         routing_weights.scatter_(1, top_i, top_w)
 
         num_nsp = self.expert_blocking_num_nsp
-        num_packed_chunks = getattr(self, "expert_blocking_num_packed_chunks", 1)
+        packed_chunk_size = self.expert_blocking_packed_chunk_size
         if self.num_experts % num_nsp != 0:
             raise ValueError(
                 f"num_experts ({self.num_experts}) must be divisible by expert_blocking_num_nsp ({num_nsp})"
@@ -255,21 +250,21 @@ class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
         W_u = self.up_proj_w.view(local_experts, num_nsp, H, -1).transpose(0, 1).contiguous()
         W_d = self.down_proj_w.view(local_experts, num_nsp, -1, H).transpose(0, 1).contiguous()
         expert_out = x.new_zeros((num_nsp, T, H))
+        routing_weights_unsqueezed = rw.unsqueeze(-1)
         for slot in range(local_experts):
-            routing_weight = rw[:, slot, :]
-            T2Ei = routing_weight > 0
+            T2Ei = rw[:, slot, :] > 0
             expert_out = _cumsum_scatter_gather_update_expert_blocked(
                 x=x,
                 T2Ei=T2Ei,
                 W_g=W_g[:, slot],
                 W_u=W_u[:, slot],
                 W_d=W_d[:, slot],
-                routing_weight=routing_weight,
+                routing_weight=routing_weights_unsqueezed[:, slot],
                 expert_out=expert_out,
                 act_fn=self.experts[0].act_fn,
-                num_packed_chunks=num_packed_chunks,
+                packed_chunk_size=packed_chunk_size,
             )
-        return torch.einsum("ijk->jk", expert_out).view(B, S, H), router_logits
+        return expert_out.sum(dim=0).view(B, S, H), router_logits
 
 
 class QEffQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
