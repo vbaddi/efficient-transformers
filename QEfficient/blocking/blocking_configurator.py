@@ -376,4 +376,8 @@ def build_transformer_blocking_config_for_transform(
         if qaic_config.get("skip_kv", False) and enable_blocking:
             blocking_config.skip_kv = qaic_config.get("skip_kv")
 
+        blocking_config.implementation = qaic_config.get("attention_implementation", "default")
+        if qaic_config.get("query_block_size") is not None:
+            blocking_config.query_block_size = _get_valid_num_blocks(qaic_config, "query_block_size")
+
     return blocking_config

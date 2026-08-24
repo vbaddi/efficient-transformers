@@ -31,6 +31,7 @@ def CtxScatterCB(
     # Create indices
     batch_idx = ops.Expand(ops.Unsqueeze(batch_index, [2, 3]), exp_shape)
     head_idx = ops.Expand(ops.Unsqueeze(ops.Range(zero, num_heads, one), [0, 2, 3]), exp_shape)
+    head_idx = ops.Cast(head_idx, to=onnxscript.INT32.dtype)
     ctx_idx = ops.Expand(ops.Unsqueeze(position_ids, [1, 3]), exp_shape)
     indices = ops.Concat(batch_idx, head_idx, ctx_idx, axis=3)
 
@@ -122,6 +123,7 @@ def CtxGatherCB(
     # Create indices
     batch_idx = ops.Expand(ops.Unsqueeze(batch_index, [2, 3]), exp_shape)
     head_idx = ops.Expand(ops.Unsqueeze(ops.Range(zero, num_heads, one), [0, 2, 3]), exp_shape)
+    head_idx = ops.Cast(head_idx, to=onnxscript.INT32.dtype)
     ctx_idx = ops.Expand(ops.Unsqueeze(ctx_indices, [3]), exp_shape)
     indices = ops.Concat(batch_idx, head_idx, ctx_idx, axis=3)
 
@@ -163,6 +165,7 @@ def CtxGatherBlockedKVCB(
     # Create indices
     batch_idx = ops.Expand(ops.Unsqueeze(batch_index, [2, 3]), exp_shape)
     head_idx = ops.Expand(ops.Unsqueeze(ops.Range(zero, num_heads, one), [0, 2, 3]), exp_shape)
+    head_idx = ops.Cast(head_idx, to=onnxscript.INT32.dtype)
     ctx_idx = ops.Expand(ops.Unsqueeze(ctx_indices, [3]), exp_shape)
     indices = ops.Concat(batch_idx, head_idx, ctx_idx, axis=3)
 
@@ -183,7 +186,12 @@ class CtxGatherFuncBlockedKVCB(torch.autograd.Function):
 
     @staticmethod
     def symbolic(g: torch.Graph, data: torch.Value, batch_index: torch.Value, ctx_indices: torch.Value) -> torch.Value:
-        return g.onnxscript_op(CtxGatherBlockedKVCB, data, batch_index, ctx_indices).setTypeAs(data)
+        output = g.onnxscript_op(CtxGatherBlockedKVCB, data, batch_index, ctx_indices)
+        data_sizes = data.type().sizes()
+        index_sizes = ctx_indices.type().sizes()
+        if data_sizes is not None and index_sizes is not None:
+            output.setType(data.type().with_sizes([index_sizes[0], data_sizes[1], index_sizes[2], data_sizes[3]]))
+        return output
 
 
 @qeff_custom_op("com.qualcomm.cloud", 1)

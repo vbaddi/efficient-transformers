@@ -46,6 +46,9 @@ class AttentionBlockingConfig:
     head_block_size: Optional[int] = None
     skip_kv: Optional[bool] = True
     num_batch_blocks: Optional[int] = None
+    implementation: str = "default"
+    query_block_size: Optional[int] = None
+    par_num_split: Optional[int] = None
 
 
 def supports_blocked_kv(past_key_value: Optional[Cache]) -> bool:
@@ -150,7 +153,18 @@ def generic_blocked_attention_interface(
                 sliding_window=sliding_window,
             )
 
-    strategy = _STRATEGIES.get(blocking_config.mode)
+    if blocking_config.implementation == "gqa_v1":
+        if blocking_config.mode != BlockingMode.KV:
+            raise ValueError("attention implementation 'gqa_v1' requires blocking mode 'kv'.")
+        from QEfficient.blocking.gqa_attention import gqa_v1_attention_forward
+
+        strategy = gqa_v1_attention_forward
+    elif blocking_config.implementation == "default":
+        strategy = _STRATEGIES.get(blocking_config.mode)
+    else:
+        raise ValueError(f"Unknown attention implementation: {blocking_config.implementation!r}.")
+    if strategy is None:
+        raise ValueError(f"No attention strategy is registered for blocking mode {blocking_config.mode!r}.")
     attn_output, attn_weights = strategy(
         module=module,
         query=query,
@@ -165,6 +179,7 @@ def generic_blocked_attention_interface(
         num_q_blocks=blocking_config.num_q_blocks,
         head_block_size=blocking_config.head_block_size,
         num_batch_blocks=blocking_config.num_batch_blocks,
+        query_block_size=blocking_config.query_block_size,
         score_mod=score_mod,
         position_bias=position_bias,
         sinks=sinks,

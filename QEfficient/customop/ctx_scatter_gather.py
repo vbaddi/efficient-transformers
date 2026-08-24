@@ -274,4 +274,9 @@ class CtxGatherFuncBlockedKV(torch.autograd.Function):
 
     @staticmethod
     def symbolic(g: torch.Graph, data: torch.Value, ctx_indices: torch.Value) -> torch.Value:
-        return g.onnxscript_op(CtxGatherBlockedKV, data, ctx_indices).setTypeAs(data)
+        output = g.onnxscript_op(CtxGatherBlockedKV, data, ctx_indices)
+        data_sizes = data.type().sizes()
+        index_sizes = ctx_indices.type().sizes()
+        if data_sizes is not None and index_sizes is not None:
+            output.setType(data.type().with_sizes([data_sizes[0], data_sizes[1], index_sizes[2], data_sizes[3]]))
+        return output
