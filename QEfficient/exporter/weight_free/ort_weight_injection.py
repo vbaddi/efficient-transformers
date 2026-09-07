@@ -35,8 +35,9 @@ def _default_weights_roots(weight_spec_path: Path, spec) -> List[Path]:
     roots.append(weight_spec_path.parent)
 
     candidate = Path(spec.model_id).expanduser()
-    if candidate.exists():
-        roots.append(candidate.parent)
+    bundle_candidate = candidate if candidate.is_absolute() else weight_spec_path.parent / candidate
+    if bundle_candidate.exists():
+        roots.append(bundle_candidate.parent)
     else:
         checkpoint_dir = resolve_checkpoint_dir(spec.model_id)
         root = checkpoint_root(spec.model_id, [str(path) for path in checkpoint_dir.glob("*.safetensors")])
@@ -95,10 +96,10 @@ def load_weight_free_ort_inputs(
     """
     weight_spec_path = Path(weight_spec_path)
     spec = load_weight_spec(weight_spec_path)
-    candidate_roots = []
     if weights_root is not None:
-        candidate_roots.append(Path(weights_root).expanduser().resolve())
-    candidate_roots.extend(_default_weights_roots(weight_spec_path, spec))
+        candidate_roots = [Path(weights_root).expanduser().resolve()]
+    else:
+        candidate_roots = _default_weights_roots(weight_spec_path, spec)
 
     ort_inputs = dict(runtime_inputs)
     for spec_input in spec.inputs:

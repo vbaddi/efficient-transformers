@@ -19,10 +19,16 @@ CPU-only. No QAIC hardware required.
 
 from __future__ import annotations
 
-import pytest
-from transformers import AutoConfig
+import json
+from pathlib import Path
 
-from QEfficient.exporter.weight_free import resolve_weight_spec_path
+import onnx
+import pytest
+import torch
+from transformers import AutoConfig, Qwen2Config, Qwen2ForCausalLM
+
+from QEfficient.base.modeling_qeff import QEFFBaseModel
+from QEfficient.exporter.weight_free import prepare_mxfp6_checkpoint, resolve_weight_spec_path
 from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
 from QEfficient.utils import get_num_layers_from_config
 from QEfficient.utils.run_utils import ApiRunner
@@ -43,6 +49,110 @@ from ._helpers import (
     run_weight_free_ort,
     skip_on_model_fetch_error,
 )
+
+
+@pytest.mark.weight_free
+@pytest.mark.weight_free_export
+def test_tiny_qwen_mxfp6_weight_free_dynamo_export(tmp_path, monkeypatch):
+    """Validate the MXFP6 graph/checkpoint/spec contract on a local seeded Qwen."""
+    monkeypatch.setattr(
+        "QEfficient.transformers.models.modeling_auto.validate_dynamo_export_requirements",
+        lambda _feature: None,
+    )
+    monkeypatch.setattr(
+        "QEfficient.utils.export_utils.validate_dynamo_export_requirements",
+        lambda _feature: None,
+    )
+    source = tmp_path / "source"
+    prepared = tmp_path / "prepared"
+    config = Qwen2Config(
+        vocab_size=97,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+    )
+    torch.manual_seed(7)
+    Qwen2ForCausalLM(config).eval().to(torch.bfloat16).save_pretrained(source, safe_serialization=True)
+    prepare_mxfp6_checkpoint(source, prepared, target_dtype=torch.bfloat16)
+
+    qeff_model = QEFFAutoModelForCausalLM.from_pretrained(str(prepared), weight_free=True)
+    onnx_path = Path(
+        qeff_model.export(
+            str(tmp_path / "export"),
+            use_onnx_subfunctions=True,
+            offload_pt_weights=False,
+        )
+    )
+    onnx_model = onnx.load(onnx_path, load_external_data=False)
+    manifest = json.loads((prepared / "qeff_mx_manifest.json").read_text())
+    spec = json.loads(onnx_path.with_name("weight_spec.json").read_text())
+    assert spec["version"] == 6
+    assert (
+        json.loads(next(prop.value for prop in onnx_model.metadata_props if prop.key == "com.qti.aisw.extdata")) == spec
+    )
+    mxfp6_nodes = [
+        node for node in onnx_model.graph.node if node.domain == "com.qualcomm.qeff" and node.op_type == "MXDequantize"
+    ]
+    assert len(mxfp6_nodes) == 14
+    attrs = {attribute.name: attribute for attribute in mxfp6_nodes[0].attribute}
+    assert attrs["format"].s == b"MXFP6_E2M3"
+    assert attrs["axis"].i == -1
+    assert attrs["block_size"].i == 32
+    assert attrs["axis_size"].i == 64
+    assert attrs["output_dtype"].s == b"BFLOAT16"
+    assert all(
+        {attribute.name: attribute for attribute in node.attribute}["output_dtype"].s == b"BFLOAT16"
+        for node in mxfp6_nodes
+    )
+    assert all(
+        key not in {initializer.name for initializer in onnx_model.graph.initializer}
+        for key in manifest["selected_keys"]
+    )
+    graph_inputs = {value.name: value for value in onnx_model.graph.input}
+    for key in manifest["selected_keys"]:
+        assert graph_inputs[key].type.tensor_type.elem_type == onnx.TensorProto.UINT8
+        shape = tuple(dim.dim_value for dim in graph_inputs[key].type.tensor_type.shape.dim)
+        assert shape == tuple(manifest["tensors"][key]["physical_shape"])
+    onnx.checker.check_model(onnx_model)
+    assert (onnx_path.parent / "checkpoint").is_dir()
+
+
+def test_compile_enable_mxfp6_prepares_from_original_weight_free_source(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    config = Qwen2Config(
+        vocab_size=97,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+    )
+    Qwen2ForCausalLM(config).eval().to(torch.bfloat16).save_pretrained(source, safe_serialization=True)
+    qeff_model = QEFFAutoModelForCausalLM.from_pretrained(str(source), config=config, weight_free=True)
+    captured = {}
+
+    def fake_compile(self, **kwargs):
+        captured.update(kwargs)
+        return "compiler-not-run"
+
+    monkeypatch.setattr(QEFFBaseModel, "_compile", fake_compile)
+    assert (
+        qeff_model.compile(
+            use_onnx_subfunctions=True,
+            dynamo=True,
+            enable_mxfp6=True,
+        )
+        == "compiler-not-run"
+    )
+    prepared = Path(qeff_model.hash_params["pretrained_model_name_or_path"])
+    assert (prepared / "qeff_mx_manifest.json").is_file()
+    assert captured["dynamo"] is True
+    assert captured["use_onnx_subfunctions"] is True
+    assert "enable_mxfp6" not in captured
 
 
 @pytest.mark.weight_free

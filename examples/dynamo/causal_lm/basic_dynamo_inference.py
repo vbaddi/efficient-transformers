@@ -66,7 +66,7 @@ def main():
         aic_hw_version=args.aic_hw_version,
         num_devices=(1 if args.device_group is None else len(args.device_group)),
         dynamo=True,
-        use_onnx_subfunctions=True,
+        use_onnx_subfunctions=False,
     )
     print(f"Model compiled to: {qpc_path}")
 

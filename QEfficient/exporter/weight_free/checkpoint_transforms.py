@@ -16,6 +16,7 @@ the source floating-point dtype does not already match the exported ONNX input d
 
 import json
 import re
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -25,6 +26,18 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from QEfficient.base.checkpoint_transforms import CHECKPOINT_PREPARED_SENTINEL, BaseCheckpointTransform
+from QEfficient.exporter.weight_free.mxfp6 import (
+    MXFP6_BLOCK_SIZE,
+    MXFP6_CONVERTER_VERSION,
+    MXFP6_FORMAT,
+    MXFP6_LAYOUT,
+    MXFP6_MANIFEST_VERSION,
+    encode_tensor,
+    logical_dtype_name,
+    selected_qwen_projection_keys,
+    sha256_file,
+    validate_mxfp6_manifest,
+)
 from QEfficient.transformers.quantizers.quantizer_utils import convert_moe_packed_tensors
 from QEfficient.utils.checkpoint_utils import (
     atomic_save,
@@ -100,6 +113,150 @@ def _estimate_layer_stack_gb(
 # Sentinel marking a fully-prepared checkpoint directory
 # ---------------------------------------------------------------------------
 _SENTINEL = CHECKPOINT_PREPARED_SENTINEL
+
+
+def _encode_mxfp6_slice(handle, key: str, row_chunk_size: int) -> torch.Tensor:
+    """Encode one safetensors tensor while keeping source rows bounded in RAM."""
+    tensor_slice = handle.get_slice(key)
+    shape = tuple(tensor_slice.get_shape())
+    if len(shape) != 2:
+        raise ValueError(f"MXFP6 tensor {key!r} must be rank two, got shape {shape}")
+    if tensor_slice.get_dtype() not in {"BF16", "F16"}:
+        raise ValueError(f"MXFP6 tensor {key!r} must be BF16 or F16, got {tensor_slice.get_dtype()}")
+    rows, width = shape
+    physical_width = 25 * ((width + MXFP6_BLOCK_SIZE - 1) // MXFP6_BLOCK_SIZE)
+    encoded = torch.empty((rows, physical_width), dtype=torch.uint8)
+    for start in range(0, rows, row_chunk_size):
+        stop = min(start + row_chunk_size, rows)
+        chunk = tensor_slice[start:stop, :]
+        encoded[start:stop] = encode_tensor(chunk, row_chunk_size=row_chunk_size)
+    return encoded
+
+
+class Mxfp6CheckpointTransform(BaseCheckpointTransform):
+    """Produce a complete Qwen checkpoint with selected projection weights in MXFP6 storage."""
+
+    @classmethod
+    def is_applicable(cls, weight_map: Dict[str, str], model_config=None, **kwargs) -> bool:
+        return bool(selected_qwen_projection_keys(weight_map, model_config))
+
+    @classmethod
+    def apply(
+        cls,
+        src: Path,
+        out: Path,
+        target_dtype: torch.dtype = torch.bfloat16,
+        *,
+        model_config=None,
+        row_chunk_size: int = 128,
+        selected_keys: Optional[List[str]] = None,
+        **kwargs,
+    ) -> bool:
+        """Convert selected projections and pass every other tensor through."""
+        src = Path(src).resolve()
+        out = Path(out).resolve()
+        if src == out:
+            raise ValueError("MXFP6 source and destination directories must differ")
+        sentinel = out / _SENTINEL
+        if sentinel.exists():
+            manifest_path = out / "qeff_mx_manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError(f"Prepared checkpoint {out} is missing qeff_mx_manifest.json")
+            validate_mxfp6_manifest(json.loads(manifest_path.read_text(encoding="utf-8")))
+            return False
+
+        weight_map = read_weight_map(src)
+        selected = sorted(selected_keys or selected_qwen_projection_keys(weight_map, model_config))
+        missing = sorted(set(selected) - set(weight_map))
+        if missing:
+            raise ValueError(f"Selected MXFP6 tensors are absent from the source checkpoint: {missing}")
+        if out.exists() and any(out.iterdir()):
+            raise FileExistsError(
+                f"Refusing to overwrite non-empty destination {out}; choose a new output directory "
+                "or remove it explicitly"
+            )
+
+        staging = out.with_name(out.name + ".mxfp6-tmp")
+        if staging.exists():
+            if staging.is_dir():
+                shutil.rmtree(staging)
+            else:
+                staging.unlink()
+        staging.mkdir(parents=True, exist_ok=True)
+        try:
+            copy_checkpoint_aux_files(src, staging)
+            shard_names = sorted(set(weight_map.values()))
+            new_name_for = {
+                shard: (
+                    "model.safetensors"
+                    if len(shard_names) == 1
+                    else f"model-{index:05d}-of-{len(shard_names):05d}.safetensors"
+                )
+                for index, shard in enumerate(shard_names, start=1)
+            }
+            tensor_manifest: dict[str, dict] = {}
+            new_weight_map: dict[str, str] = {}
+
+            for shard_name in shard_names:
+                tensors: Dict[str, torch.Tensor] = {}
+                with safe_open(str(src / shard_name), framework="pt") as handle:
+                    for key in handle.keys():
+                        if key in selected:
+                            encoded = _encode_mxfp6_slice(handle, key, row_chunk_size)
+                            source_dtype = handle.get_slice(key).get_dtype()
+                            logical_shape = list(handle.get_slice(key).get_shape())
+                            tensor_manifest[key] = {
+                                "format": MXFP6_FORMAT,
+                                "layout": MXFP6_LAYOUT,
+                                "block_size": MXFP6_BLOCK_SIZE,
+                                "axis": -1,
+                                "logical_shape": logical_shape,
+                                "axis_length": logical_shape[-1],
+                                "source_dtype": source_dtype,
+                                "logical_dtype": logical_dtype_name(target_dtype),
+                                "physical_dtype": "UINT8",
+                                "physical_shape": list(encoded.shape),
+                                "output_shard": new_name_for[shard_name],
+                            }
+                            tensors[key] = encoded
+                        else:
+                            tensor = handle.get_tensor(key)
+                            tensors[key] = tensor.to(target_dtype) if tensor.is_floating_point() else tensor
+                        new_weight_map[key] = new_name_for[shard_name]
+                atomic_save(tensors, staging / new_name_for[shard_name])
+
+            source_files = []
+            for shard_name in shard_names:
+                source_path = src / shard_name
+                source_files.append(
+                    {"path": source_path.name, "size": source_path.stat().st_size, "sha256": sha256_file(source_path)}
+                )
+            manifest = {
+                "version": MXFP6_MANIFEST_VERSION,
+                "format": MXFP6_FORMAT,
+                "layout": MXFP6_LAYOUT,
+                "block_size": MXFP6_BLOCK_SIZE,
+                "axis": -1,
+                "converter_version": MXFP6_CONVERTER_VERSION,
+                "target_dtype": logical_dtype_name(target_dtype),
+                "source": {"directory": src.name, "files": source_files},
+                "selected_keys": selected,
+                "tensors": tensor_manifest,
+                "output_files": sorted(set(new_weight_map.values())),
+                "complete": True,
+            }
+            manifest_tmp = staging / "qeff_mx_manifest.json.tmp"
+            manifest_tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+            manifest_tmp.replace(staging / "qeff_mx_manifest.json")
+            write_index(staging, new_weight_map)
+            (staging / _SENTINEL).touch()
+            staging.rename(out)
+        except Exception:
+            if staging.exists():
+                shutil.rmtree(staging)
+            raise
+        logger.info("Mxfp6CheckpointTransform: converted %d projection tensors → %s", len(selected), out)
+        return True
 
 
 def _moe_weights_prefix_from_experts_prefix(prefix: str) -> str:

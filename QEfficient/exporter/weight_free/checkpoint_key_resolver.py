@@ -11,6 +11,12 @@ from typing import Dict, List, Optional
 import onnx_ir as ir
 from torch import nn
 
+from QEfficient.exporter.weight_free.mxfp6 import (
+    MXFP6_BLOCK_SIZE,
+    MXFP6_FORMAT,
+    MXFP6_LAYOUT,
+    manifest_tensor_map,
+)
 from QEfficient.exporter.weight_free.weight_spec import (
     ExternalDataFile,
     TiedWeightAlias,
@@ -139,7 +145,13 @@ def find_checkpoint_key(
     return _find_checkpoint_key(candidates, checkpoint_index, onnx_name)
 
 
-def promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name: str, qeff_model) -> WeightSpec:
+def promote_initializers_and_build_spec(
+    onnx_program,
+    model_ref: str,
+    model_name: str,
+    qeff_model,
+    mxfp6_manifest: Optional[dict] = None,
+) -> WeightSpec:
     """Promote ONNX initializers to graph inputs and create the weight spec.
 
     Parameters
@@ -180,6 +192,7 @@ def promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name
     ]
     backbone = qeff_model.model.base_model if isinstance(qeff_model.model, PooledModel) else qeff_model.model
     promoted_inputs: List[WeightSpecInput] = []
+    mxfp6_tensors = manifest_tensor_map(mxfp6_manifest) if mxfp6_manifest is not None else {}
 
     for name, init_value in list(model_ir.graph.initializers.items()):
         if name not in model_names:
@@ -197,6 +210,17 @@ def promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name
             )
 
         checkpoint_file = checkpoint_index[checkpoint_key]
+        quantization = None
+        if checkpoint_key in mxfp6_tensors:
+            entry = mxfp6_tensors[checkpoint_key]
+            quantization = {
+                "format": MXFP6_FORMAT,
+                "block_size": MXFP6_BLOCK_SIZE,
+                "axis": -1,
+                "layout": MXFP6_LAYOUT,
+                "dequantized_axis_size": entry["axis_length"],
+                "logical_dtype": entry["logical_dtype"],
+            }
         model_ir.graph.inputs.append(
             ir.Value(
                 name=name,
@@ -209,6 +233,7 @@ def promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name
             WeightSpecInput(
                 name=name,
                 location=WeightSpecLocation(file=checkpoint_files.index(checkpoint_file), key=checkpoint_key),
+                quantization=quantization,
             )
         )
 

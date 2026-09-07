@@ -433,6 +433,13 @@ def _generate_export_hash(qeff_model, args, kwargs, func):
     )
     if getattr(qeff_model, "_weight_free", False):
         copy_of_hash_params["weight_free"] = True
+        model_ref = copy_of_hash_params.get("pretrained_model_name_or_path")
+        if model_ref:
+            from QEfficient.exporter.weight_free.mxfp6 import load_mxfp6_manifest, manifest_identity
+
+            manifest = load_mxfp6_manifest(Path(model_ref)) if Path(model_ref).expanduser().is_dir() else None
+            if manifest is not None:
+                copy_of_hash_params["mxfp6_manifest_identity"] = manifest_identity(manifest)
     if getattr(qeff_model, "_use_onnx_subfunctions", False):
         copy_of_hash_params["onnx_subfunction_version"] = 3
     # Generate hash from relevant parameters

@@ -5,7 +5,8 @@
 #
 # ----------------------------------------------------------------------------
 
+from QEfficient.exporter.weight_free.mxfp6 import prepare_mxfp6_checkpoint
 from QEfficient.exporter.weight_free.ort_weight_injection import load_weight_free_ort_inputs
 from QEfficient.exporter.weight_free.weight_spec import resolve_weight_spec_path
 
-__all__ = ["load_weight_free_ort_inputs", "resolve_weight_spec_path"]
+__all__ = ["load_weight_free_ort_inputs", "prepare_mxfp6_checkpoint", "resolve_weight_spec_path"]

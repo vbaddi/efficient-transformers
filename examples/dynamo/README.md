@@ -49,7 +49,7 @@ Enable weight-free export with the same script:
 python examples/dynamo/causal_lm/basic_dynamo_inference.py \
     --model-name Qwen/Qwen2-1.5B-Instruct \
     --prompt "My name is" \
-    --prefill-seq-len 128 \
+    --prefill-seq-len 32 \
     --ctx-len 128 \
     --num-cores 16 \
     --use-weight-free-export

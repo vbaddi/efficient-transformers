@@ -40,6 +40,13 @@ from QEfficient.exporter.weight_free.checkpoint_transforms import (
     MoEExpertStackingCheckpointTransform,
     MoEFusedExpertSplitCheckpointTransform,
 )
+from QEfficient.exporter.weight_free.mxfp6 import (
+    dtype_from_name,
+    load_mxfp6_manifest,
+    manifest_identity,
+    mxfp6_prepared_cache_dir,
+    prepare_mxfp6_checkpoint,
+)
 from QEfficient.generation.cloud_infer import QAICInferenceSession, is_retained_state_name
 from QEfficient.generation.text_generation_inference import (
     CloudAI100ExecInfoNew,
@@ -3729,6 +3736,26 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             }
         )
 
+        # A prepared MXFP6 checkpoint stores UINT8 tensors, but the model must
+        # still be constructed as its ordinary logical floating-point Qwen
+        # architecture.  Infer the graph dtype from the authoritative manifest
+        # only when the caller did not specify one; never pass packed storage to
+        # Transformers' quantizer machinery.
+        mxfp6_manifest = None
+        if weight_free and Path(pretrained_model_name_or_path).expanduser().is_dir():
+            mxfp6_manifest = load_mxfp6_manifest(Path(pretrained_model_name_or_path).expanduser())
+        if mxfp6_manifest is not None:
+            manifest_dtype = dtype_from_name(mxfp6_manifest["target_dtype"])
+            requested_dtype = kwargs.get("torch_dtype", kwargs.get("dtype"))
+            if requested_dtype is None:
+                kwargs["torch_dtype"] = manifest_dtype
+                kwargs["dtype"] = manifest_dtype
+            elif requested_dtype != manifest_dtype:
+                raise ValueError(
+                    f"MXFP6 checkpoint was prepared for {manifest_dtype}, but from_pretrained requested "
+                    f"{requested_dtype}; use a matching prepared checkpoint"
+                )
+
         _resolve_torch_dtype(kwargs)
         if layerwise:
             warnings.warn(
@@ -4385,6 +4412,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         num_cores: int = 16,  # FIXME: Make this mandatory arg
         mxfp6_matmul: bool = False,
         mxint8_kv_cache: bool = False,
+        enable_mxfp6: bool = False,
+        dynamo: bool = False,
         num_speculative_tokens: Optional[Union[int, List[int]]] = None,
         prefill_only: Optional[bool] = None,
         use_onnx_subfunctions: bool = False,
@@ -4428,6 +4457,13 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             Number of cores to use for compilation.
         mxfp6_matmul : bool, optional
             Use MXFP6 compression for weights. Default is False.
+        enable_mxfp6 : bool, optional
+            Prepare selected dense Qwen projection weights as offline MXFP6
+            safetensors for weight-free Dynamo export. This is separate from
+            ``mxfp6_matmul`` and is not passed to the compiler. Default is False.
+        dynamo : bool, optional
+            Use the current Dynamo exporter when compiling a non-weight-free
+            model. Weight-free export always uses Dynamo. Default is False.
         mxint8_kv_cache : bool, optional
             Use MXINT8 compression for KV cache. Default is False.
         num_speculative_tokens : int or list[int], optional
@@ -4481,6 +4517,33 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         """
         reject_legacy_moe_prefill_packed_chunk_size(compiler_options)
         _ignore_public_mdp_ts_num_devices(compiler_options)
+        if enable_mxfp6:
+            if not self._weight_free:
+                raise ValueError("enable_mxfp6 requires from_pretrained(..., weight_free=True)")
+            model_ref = self.hash_params.get("pretrained_model_name_or_path")
+            if not model_ref:
+                raise ValueError("enable_mxfp6 requires a model loaded from from_pretrained()")
+            target_dtype = getattr(self.model.config, "dtype", None) or getattr(
+                self.model.config, "torch_dtype", torch.float32
+            )
+            source_dir = Path(model_ref).expanduser()
+            if not source_dir.is_dir():
+                from QEfficient.utils.checkpoint_utils import resolve_checkpoint_dir
+
+                source_dir = resolve_checkpoint_dir(model_ref)
+            manifest = load_mxfp6_manifest(source_dir)
+            if manifest is None:
+                from QEfficient.utils.cache import QEFF_CHECKPOINT_HOME
+
+                prepared_dir = mxfp6_prepared_cache_dir(source_dir, target_dtype)
+                if QEFF_CHECKPOINT_HOME is not None:
+                    prepared_dir = QEFF_CHECKPOINT_HOME.expanduser() / prepared_dir.name
+                prepare_mxfp6_checkpoint(source_dir, prepared_dir, target_dtype=target_dtype)
+            else:
+                prepared_dir = source_dir
+            manifest = load_mxfp6_manifest(prepared_dir)
+            self.hash_params["pretrained_model_name_or_path"] = str(prepared_dir)
+            self.hash_params["mxfp6_manifest_identity"] = manifest_identity(manifest)
         enable_chunking = override_gptoss_prefill_chunking(self.model.config, prefill_only, enable_chunking)
         if layerwise:
             warnings.warn(
@@ -4747,6 +4810,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             specializations=specializations,
             convert_to_fp16=(CUSTOM_IO_DTYPE_MAP[target_dtype] == "float16"),
             mxfp6_matmul=mxfp6_matmul,
+            dynamo=dynamo,
             custom_io=custom_io,
             mdp_ts_num_devices=num_devices,
             num_speculative_tokens=num_speculative_tokens,

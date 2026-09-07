@@ -8,9 +8,10 @@
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 WEIGHT_SPEC_VERSION = 5
+QUANTIZED_WEIGHT_SPEC_VERSION = 6
 
 
 @dataclass
@@ -46,6 +47,7 @@ class WeightSpecInput:
 
     name: str
     location: WeightSpecLocation  # required: every spec entry must point to a file
+    quantization: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -66,6 +68,12 @@ class WeightSpec:
         """Return a JSON-serializable representation of the weight spec."""
         data = asdict(self)
         data["model_id"] = str(data["model_id"])
+        for input_data in data["inputs"]:
+            if input_data.get("quantization") is None:
+                input_data.pop("quantization", None)
+        if any(item.quantization is not None for item in self.inputs):
+            if self.version < QUANTIZED_WEIGHT_SPEC_VERSION:
+                data["version"] = QUANTIZED_WEIGHT_SPEC_VERSION
         return data
 
 
@@ -121,19 +129,44 @@ def load_weight_spec(path: Path) -> WeightSpec:
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
 
+    version = data.get("version", WEIGHT_SPEC_VERSION)
+    if version not in {WEIGHT_SPEC_VERSION, QUANTIZED_WEIGHT_SPEC_VERSION}:
+        raise ValueError(f"Unsupported weight spec version: {version}")
+    inputs = []
+    for entry in data["inputs"]:
+        if entry.get("location") is None:  # backward compat: skip old buffer-only entries
+            continue
+        quantization = entry.get("quantization")
+        if quantization is not None:
+            required = {
+                "format",
+                "block_size",
+                "axis",
+                "layout",
+                "dequantized_axis_size",
+                "logical_dtype",
+            }
+            missing = sorted(required - set(quantization))
+            if missing:
+                raise ValueError(f"Quantized weight spec entry {entry['name']!r} is missing {missing}")
+            if quantization["format"] != "mxfp6_e2m3" or quantization["layout"] != "inline_e8m0_fp6_lsb_v1":
+                raise ValueError(f"Unknown quantized weight spec schema for {entry['name']!r}")
+            if version < QUANTIZED_WEIGHT_SPEC_VERSION:
+                raise ValueError("Quantized weight metadata requires weight spec version 6")
+        inputs.append(
+            WeightSpecInput(
+                name=entry["name"],
+                location=_load_location(entry["location"]),
+                quantization=quantization,
+            )
+        )
+
     return WeightSpec(
         model_name=data["model_name"],
         model_id=data["model_id"],
         files=_load_files(data.get("files", data.get("checkpoint_files", []))),
-        inputs=[
-            WeightSpecInput(
-                name=entry["name"],
-                location=_load_location(entry["location"]),
-            )
-            for entry in data["inputs"]
-            if entry.get("location") is not None  # backward compat: skip old buffer-only entries
-        ],
-        version=data.get("version", WEIGHT_SPEC_VERSION),
+        inputs=inputs,
+        version=version,
     )
 
 

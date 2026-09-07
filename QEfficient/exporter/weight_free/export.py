@@ -6,6 +6,7 @@
 # ----------------------------------------------------------------------------
 
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,12 @@ import torch
 from accelerate import init_empty_weights
 
 from QEfficient.exporter.weight_free.checkpoint_key_resolver import promote_initializers_and_build_spec
+from QEfficient.exporter.weight_free.mxfp6 import (
+    dtype_from_name,
+    load_mxfp6_manifest,
+    manifest_identity,
+    rewrite_mxfp6_weight_inputs,
+)
 from QEfficient.exporter.weight_free.weight_spec import load_weight_spec, resolve_weight_spec_path, save_weight_spec
 from QEfficient.utils import load_json
 from QEfficient.utils.checkpoint_utils import resolve_checkpoint_dir
@@ -132,6 +139,15 @@ def _prepare_checkpoint_for_weight_free_export(
     from QEfficient.utils.cache import QEFF_CHECKPOINT_HOME
 
     source_dir = resolve_checkpoint_dir(model_ref)
+    mxfp6_manifest = load_mxfp6_manifest(source_dir)
+    if mxfp6_manifest is not None:
+        expected_dtype = dtype_from_name(mxfp6_manifest["target_dtype"])
+        if expected_dtype != target_dtype:
+            raise ValueError(
+                f"MXFP6 checkpoint graph dtype is {expected_dtype}, but the traced model expects {target_dtype}; "
+                "rebuild the prepared checkpoint with the matching target_dtype"
+            )
+        return str(source_dir)
     dtype_suffix = str(target_dtype).replace("torch.", "")
     # TODO(wf): For different flavours of the model that expect different checkpoint weight layouts,
     # we end up overriding old one. We need to add support of hashing/caching here.
@@ -228,15 +244,27 @@ def export_weight_free_onnx(
         prepared_model_ref,
     )
 
+    mxfp6_manifest = load_mxfp6_manifest(Path(prepared_model_ref))
     spec = promote_initializers_and_build_spec(
         onnx_program=onnx_program,
         model_ref=prepared_model_ref,
         model_name=qeff_model.model_name,
         qeff_model=meta_qeff_model,
+        mxfp6_manifest=mxfp6_manifest,
     )
+    if mxfp6_manifest is not None:
+        rewritten = rewrite_mxfp6_weight_inputs(onnx_program, spec, mxfp6_manifest)
+        if rewritten != len(mxfp6_manifest["tensors"]):
+            raise ValueError(
+                f"MXFP6 manifest/graph mismatch: rewrote {rewritten} tensors, "
+                f"manifest contains {len(mxfp6_manifest['tensors'])}"
+            )
     _prune_unused_fake_initializers(onnx_program)
     onnx_program.save(str(onnx_path))
-    save_weight_spec(resolve_weight_spec_path(onnx_path), spec)
+    spec_path = resolve_weight_spec_path(onnx_path)
+    save_weight_spec(spec_path, spec)
+    if mxfp6_manifest is not None:
+        _materialize_mxfp6_bundle(Path(prepared_model_ref), onnx_path, spec_path, spec, mxfp6_manifest)
 
     return meta_qeff_model, onnx_transform_kwargs
 
@@ -261,6 +289,10 @@ def link_prepared_checkpoint_dir(onnx_path: Path, weight_spec_path: Path) -> Non
     """
     spec = load_weight_spec(Path(weight_spec_path))
     prepared_out = Path(spec.model_id)
+    if not prepared_out.is_absolute():
+        bundle_dir = Path(onnx_path).parent / prepared_out
+        if bundle_dir.exists():
+            return
     symlink = Path(onnx_path).parent / prepared_out.name
     if prepared_out.exists() and not symlink.exists():
         try:
@@ -273,3 +305,25 @@ def link_prepared_checkpoint_dir(onnx_path: Path, weight_spec_path: Path) -> Non
                 prepared_out,
                 exc,
             )
+
+
+def _materialize_mxfp6_bundle(prepared_dir: Path, onnx_path: Path, spec_path: Path, spec, manifest: dict) -> None:
+    """Copy MXFP6 checkpoint bytes beside the ONNX and make spec paths portable."""
+    bundle_dir = Path(onnx_path).parent / "checkpoint"
+    if bundle_dir.exists():
+        existing = load_mxfp6_manifest(bundle_dir)
+        if existing is None or manifest_identity(existing) != manifest_identity(manifest):
+            raise FileExistsError(f"Refusing to overwrite an unrelated checkpoint bundle: {bundle_dir}")
+    else:
+        shutil.copytree(prepared_dir, bundle_dir)
+    # The generic preparation cache manifest contains absolute source paths and
+    # is not part of the portable compiler handoff.  The MX manifest is the
+    # authoritative bundle-side provenance record.
+    prepared_cache_manifest = bundle_dir / ".checkpoint_prepared.json"
+    if prepared_cache_manifest.exists():
+        prepared_cache_manifest.unlink()
+
+    spec.model_id = "checkpoint"
+    for file_entry in spec.files:
+        file_entry.path = f"checkpoint/{Path(file_entry.path).name}"
+    save_weight_spec(spec_path, spec)

@@ -28,7 +28,7 @@ import torch
 from onnx import TensorProto, helper
 from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM
 
 from QEfficient.base.checkpoint_transforms import CHECKPOINT_PREPARED_MANIFEST, CheckpointTransformPipeline
 from QEfficient.base.onnx_transforms import (
@@ -44,6 +44,17 @@ from QEfficient.exporter.weight_free.checkpoint_transforms import (
     MoEExpertStackingCheckpointTransform,
     MoEFusedExpertSplitCheckpointTransform,
 )
+from QEfficient.exporter.weight_free.mxfp6 import (
+    MXFP6_LAYOUT,
+    dequantize_packed_tensor,
+    encode_tensor,
+    pack_codes,
+    prepare_mxfp6_checkpoint,
+    quantize_block_scalar,
+    quantize_tensor_vectorized,
+    unpack_codes,
+)
+from QEfficient.exporter.weight_free.weight_spec import load_weight_spec, save_weight_spec
 from QEfficient.transformers.models.llama.modeling_llama import QEffLlamaDecoderLayer
 from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
 from QEfficient.utils import runtime_requirements
@@ -158,6 +169,142 @@ def _load_prepared_tensors(root):
 
 
 class TestWeightFreeCheckpointTransforms:
+    def test_mxfp6_pack_unpack_covers_all_codes_and_cross_byte_boundaries(self):
+        codes = torch.arange(64, dtype=torch.uint8).reshape(2, 1, 32)
+        scales = torch.tensor([[-127], [127]], dtype=torch.int16)
+        packed = pack_codes(codes, scales)
+        unpacked, unpacked_scales = unpack_codes(packed)
+        assert torch.equal(unpacked, codes)
+        assert torch.equal(unpacked_scales, scales)
+
+    def test_mxfp6_preserves_signed_zero_and_handles_unaligned_widths(self):
+        block = torch.tensor([[-0.0] + [0.0] * 31])
+        codes, scales = quantize_tensor_vectorized(block)
+        assert codes[0, 0, 0].item() == 0x20
+        assert scales[0, 0].item() == -2
+
+        for width in (31, 32, 33, 64, 65):
+            values = torch.arange(width, dtype=torch.float32).reshape(1, width)
+            packed = encode_tensor(values)
+            assert packed.shape == (1, 25 * ((width + 31) // 32))
+            decoded = dequantize_packed_tensor(packed, (1, width))
+            assert decoded.shape == values.shape
+
+    def test_mxfp6_rejects_nonfinite_input(self):
+        with pytest.raises(ValueError, match="NaN or Inf"):
+            quantize_tensor_vectorized(torch.tensor([[float("nan")] + [0.0] * 31]))
+
+    def test_mxfp6_golden_codec_and_scalar_oracle(self):
+        block = torch.tensor([[0.0, 1.0, -1.0, 2.0, 4.0] + [0.0] * 27])
+        packed = encode_tensor(block)
+        assert packed[0, :25].tolist() == [
+            0x80,
+            0x00,
+            0x41,
+            0x22,
+            0x10,
+            *([0x00] * 20),
+        ]
+        decoded = dequantize_packed_tensor(packed, (1, 32))
+        torch.testing.assert_close(decoded, block)
+        scalar_codes, scalar_scale = quantize_block_scalar(block[0].tolist())
+        vector_codes, vector_scales = quantize_tensor_vectorized(block)
+        assert scalar_scale == vector_scales[0, 0].item()
+        assert scalar_codes == vector_codes[0, 0].tolist()
+
+    @pytest.mark.parametrize("source_dtype", [torch.float16, torch.bfloat16])
+    def test_mxfp6_preparation_selects_qwen_projections_and_preserves_other_weights(self, tmp_path, source_dtype):
+        source = tmp_path / "source"
+        prepared = tmp_path / "prepared"
+        config = Qwen2Config(
+            vocab_size=97,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+        )
+        model = Qwen2ForCausalLM(config).eval().to(source_dtype)
+        model.save_pretrained(source, safe_serialization=True)
+        source_bytes = {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}
+
+        prepare_mxfp6_checkpoint(source, prepared, target_dtype=source_dtype)
+        assert source_bytes == {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}
+        manifest = json.loads((prepared / "qeff_mx_manifest.json").read_text())
+        assert manifest["layout"] == MXFP6_LAYOUT
+        assert len(manifest["selected_keys"]) == 14
+
+        tensors = _load_prepared_tensors(prepared)
+        with safe_open(str(source / "model.safetensors"), framework="pt") as handle:
+            source_tensors = {key: handle.get_tensor(key) for key in handle.keys()}
+        for key in manifest["selected_keys"]:
+            assert tensors[key].dtype == torch.uint8
+            assert list(tensors[key].shape) == manifest["tensors"][key]["physical_shape"]
+            decoded = dequantize_packed_tensor(
+                tensors[key], manifest["tensors"][key]["logical_shape"], output_dtype=torch.float32
+            )
+            original = source_tensors[key].to(torch.float32)
+            assert decoded.shape == original.shape
+            assert torch.isfinite(decoded).all()
+        torch.testing.assert_close(tensors["model.embed_tokens.weight"], source_tensors["model.embed_tokens.weight"])
+
+    def test_mxfp6_weight_spec_round_trips_optional_quantization(self, tmp_path):
+        from QEfficient.exporter.weight_free.weight_spec import (
+            ExternalDataFile,
+            WeightSpec,
+            WeightSpecInput,
+            WeightSpecLocation,
+        )
+
+        path = tmp_path / "weight_spec.json"
+        spec = WeightSpec(
+            model_name="Qwen2ForCausalLM",
+            model_id="checkpoint",
+            files=[ExternalDataFile("checkpoint/model.safetensors", "safetensors")],
+            inputs=[
+                WeightSpecInput(
+                    "model.layers.0.self_attn.q_proj.weight",
+                    WeightSpecLocation(0, "model.layers.0.self_attn.q_proj.weight"),
+                    {
+                        "format": "mxfp6_e2m3",
+                        "block_size": 32,
+                        "axis": -1,
+                        "layout": MXFP6_LAYOUT,
+                        "dequantized_axis_size": 64,
+                        "logical_dtype": "BFLOAT16",
+                    },
+                )
+            ],
+        )
+        save_weight_spec(path, spec)
+        loaded = load_weight_spec(path)
+        assert loaded.version == 6
+        assert loaded.inputs[0].quantization["layout"] == MXFP6_LAYOUT
+
+    def test_legacy_v5_weight_spec_round_trips_plain_inputs(self, tmp_path):
+        path = tmp_path / "weight_spec.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 5,
+                    "model_name": "Qwen2ForCausalLM",
+                    "model_id": "checkpoint",
+                    "files": ["checkpoint/model.safetensors"],
+                    "inputs": [
+                        {
+                            "name": "model.embed_tokens.weight",
+                            "location": {"file": 0, "key": "model.embed_tokens.weight"},
+                        }
+                    ],
+                }
+            )
+        )
+        loaded = load_weight_spec(path)
+        assert loaded.version == 5
+        assert loaded.inputs[0].quantization is None
+        assert loaded.files[0].format == "safetensors"
+
     def test_checkpoint_pipeline_rebuilds_when_source_changes(self, tmp_path):
         src = tmp_path / "src"
         out = tmp_path / "out"
