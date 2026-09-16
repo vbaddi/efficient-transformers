@@ -393,6 +393,11 @@ def blocked_kv_attention_forward_headpar_offline(
     sum_blocks = []
     out_blocks = []
 
+    # Prime the K stream. Later iterations consume the K block read before
+    # the preceding block's value matmul. These reads expose scheduling
+    # opportunities; the compiler owns asynchronous DMA and buffer allocation.
+    k_block = past_key_value.read_only_blocked_K(0, min(kv_block_size, past_seen_tokens), layer_idx, cache_kwargs)
+
     for j in range(num_kv_blocks):
         start_index = j * kv_block_size
         if j == num_kv_blocks - 1:
@@ -409,7 +414,6 @@ def blocked_kv_attention_forward_headpar_offline(
                 if skip_future.item():
                     break
 
-        k_block = past_key_value.read_only_blocked_K(start_index, end_index, layer_idx, cache_kwargs)
         block_len = kv_len_block
         pad_len = 0
         if block_len % split != 0:
@@ -419,6 +423,13 @@ def blocked_kv_attention_forward_headpar_offline(
         split_block_len = block_len // split
 
         key_5d = k_block.view(batch_size, num_kv_heads, split, split_block_len, head_dim)
+
+        # V is independent of QK/softmax: expose its read before that compute.
+        v_block = past_key_value.read_only_blocked_V(start_index, end_index, layer_idx, cache_kwargs)
+        if pad_len > 0:
+            v_block = nn.functional.pad(v_block, (0, 0, 0, pad_len))
+        value_5d = v_block.view(batch_size, num_kv_heads, split, split_block_len, head_dim)
+
         attn_weights_block = torch.matmul(query_5d, key_5d.transpose(-1, -2)) * scaling
 
         if pad_len > 0:
@@ -457,10 +468,18 @@ def blocked_kv_attention_forward_headpar_offline(
             max_block = torch.where(skip_future, torch.full_like(max_block, HEADPAR_MASKED_ATTENTION_VALUE), max_block)
             exp_block = torch.where(skip_future, torch.zeros_like(exp_block), exp_block)
 
-        v_block = past_key_value.read_only_blocked_V(start_index, end_index, layer_idx, cache_kwargs)
-        if pad_len > 0:
-            v_block = nn.functional.pad(v_block, (0, 0, 0, pad_len))
-        value_5d = v_block.view(batch_size, num_kv_heads, split, split_block_len, head_dim)
+        # Prefetch the next raw K block while this block's value matmul runs.
+        # Its padding/view use the NEXT block's length on the next iteration.
+        # The last iteration drains the pipeline without an out-of-range read.
+        if j + 1 < num_kv_blocks:
+            next_start = end_index
+            next_end = min(next_start + kv_block_size, past_seen_tokens)
+            read_next = True
+            if skip_kv and not torch.onnx.is_in_onnx_export() and not torch.jit.is_tracing():
+                read_next = not (torch.tensor(next_start, device=query.device) > current_position).all().item()
+            if read_next:
+                k_block = past_key_value.read_only_blocked_K(next_start, next_end, layer_idx, cache_kwargs)
+
         sum_block = exp_block.sum(dim=-1)
         out_block = torch.matmul(exp_block, value_5d)
         if skip_kv and (torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()):

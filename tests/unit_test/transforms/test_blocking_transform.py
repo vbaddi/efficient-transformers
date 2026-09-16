@@ -454,3 +454,192 @@ class TestBlockingWrapperFallbackAndParity:
         assert torch.equal(original_token, transformed_token), (
             "Original and transformed model outputs diverged for same CPU input"
         )
+
+
+def _headpar_pipeline_inputs(ctx_len, positions, groups=4, dtype=torch.float32, continuous_batching=False):
+    """Tiny GQA decode tensors; no model download or device required."""
+    torch.manual_seed(53)
+    batch = len(positions)
+    cache_batch = batch + 1 if continuous_batching else batch
+    query = torch.randn(batch, 2 * groups, 1, 8, dtype=dtype)
+    key = torch.randn(cache_batch, 2, ctx_len, 8, dtype=dtype)
+    value = torch.randn_like(key)
+    position_ids = torch.tensor(positions, dtype=torch.int64).reshape(batch, 1)
+    batch_index = torch.tensor([[2], [0]]) if continuous_batching else None
+    return query, key, value, position_ids, batch_index
+
+
+def _headpar_pipeline_forward(
+    query, key, value, position_ids, batch_index, blocks, split, skip_kv, sinks=None, ctx_len=None
+):
+    from QEfficient.blocking.blocked_attention_forwards import blocked_kv_attention_forward_headpar_offline
+    from QEfficient.transformers.cache_utils import QEffDynamicCache
+
+    module = nn.Module()
+    module.num_key_value_groups = query.shape[1] // key.shape[1]
+    cache = QEffDynamicCache.from_legacy_cache(((key, value),))
+    output, _ = blocked_kv_attention_forward_headpar_offline(
+        module,
+        query,
+        key,
+        value,
+        None,
+        query.shape[-1] ** -0.5,
+        blocks,
+        {"position_ids": position_ids, "batch_index": batch_index},
+        0,
+        cache,
+        key.shape[2] if ctx_len is None else ctx_len,
+        configured_split=split,
+        skip_kv=skip_kv,
+        sinks=sinks,
+    )
+    return output
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("groups", [1, 4])
+@pytest.mark.parametrize("skip_kv", [False, True])
+@pytest.mark.parametrize(
+    "ctx_len,blocks,split,positions,continuous_batching,with_sinks",
+    [
+        (32, 4, 2, (31,), False, False),
+        (17, 4, 3, (16,), False, False),
+        (17, 1, 4, (0,), False, True),
+        (32, 4, 2, (7,), False, False),
+        (32, 4, 2, (8,), False, False),
+        (32, 4, 2, (0, 17), True, True),
+        (17, 4, 3, (4, 16), False, False),
+        (32, 4, 4, (31,), False, True),
+    ],
+)
+def test_headpar_pipeline_dense_parity(
+    dtype, groups, skip_kv, ctx_len, blocks, split, positions, continuous_batching, with_sinks
+):
+    query, key, value, position_ids, batch_index = _headpar_pipeline_inputs(
+        ctx_len, positions, groups, dtype, continuous_batching
+    )
+    saved_key, saved_value = key.clone(), value.clone()
+    sinks = torch.linspace(-1, 1, query.shape[1], dtype=dtype) if with_sinks else None
+    actual = _headpar_pipeline_forward(query, key, value, position_ids, batch_index, blocks, split, skip_kv, sinks)
+
+    # Independent dense attention oracle, including per-row positions and sinks.
+    dense_key = key if batch_index is None else key[batch_index.flatten()]
+    dense_value = value if batch_index is None else value[batch_index.flatten()]
+    dense_key = dense_key.repeat_interleave(groups, dim=1).float()
+    dense_value = dense_value.repeat_interleave(groups, dim=1).float()
+    logits = torch.matmul(query.float(), dense_key.transpose(-1, -2)) * (query.shape[-1] ** -0.5)
+    mask = torch.arange(ctx_len).reshape(1, 1, 1, -1) > position_ids.reshape(-1, 1, 1, 1)
+    logits = logits.masked_fill(mask, float("-inf"))
+    if sinks is not None:
+        sink_logits = sinks.float().reshape(1, -1, 1, 1).expand(query.shape[0], -1, -1, -1)
+        logits = torch.cat((logits, sink_logits), dim=-1)
+    probabilities = torch.softmax(logits, dim=-1)[..., :ctx_len]
+    expected = torch.matmul(probabilities, dense_value).transpose(1, 2)
+    tolerance = {torch.float32: 2e-6, torch.float16: 3e-3, torch.bfloat16: 3e-2}[dtype]
+    torch.testing.assert_close(actual.float(), expected, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(key, saved_key, atol=0, rtol=0)
+    torch.testing.assert_close(value, saved_value, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("blocks", [1, 4])
+@pytest.mark.parametrize("position", [0, 4, 16])
+@pytest.mark.parametrize("skip_kv", [False, True])
+def test_headpar_pipeline_read_order(monkeypatch, blocks, position, skip_kv):
+    from QEfficient.transformers.cache_utils import QEffDynamicCache
+
+    events = []
+    original_matmul = torch.matmul
+    original_k = QEffDynamicCache.read_only_blocked_K
+    original_v = QEffDynamicCache.read_only_blocked_V
+
+    def read_k(self, start, end, *args):
+        assert 0 <= start < end <= 17
+        events.append(("K", start, end))
+        return original_k(self, start, end, *args)
+
+    def read_v(self, start, end, *args):
+        assert 0 <= start < end <= 17
+        events.append(("V", start, end))
+        return original_v(self, start, end, *args)
+
+    def matmul(*args, **kwargs):
+        events.append(("compute",))
+        return original_matmul(*args, **kwargs)
+
+    monkeypatch.setattr(QEffDynamicCache, "read_only_blocked_K", read_k)
+    monkeypatch.setattr(QEffDynamicCache, "read_only_blocked_V", read_v)
+    monkeypatch.setattr(torch, "matmul", matmul)
+    inputs = _headpar_pipeline_inputs(17, (position,))
+    _headpar_pipeline_forward(*inputs, blocks, 3, skip_kv)
+
+    block_size = -(-17 // blocks)
+    count = min(blocks, position // block_size + 1) if skip_kv else blocks
+    expected = [("K", 0, min(block_size, 17))]
+    for index in range(count):
+        start, end = index * block_size, min((index + 1) * block_size, 17)
+        expected.extend([("V", start, end), ("compute",)])
+        if index + 1 < count:
+            expected.append(("K", end, min(end + block_size, 17)))
+        expected.append(("compute",))
+    assert events == expected
+
+
+@pytest.mark.parametrize("skip_kv", [False, True])
+def test_headpar_pipeline_onnx_parity(tmp_path, monkeypatch, skip_kv):
+    import onnx
+    import onnxruntime as ort
+
+    from QEfficient.transformers.cache_utils import InvalidIndexProvider
+
+    # Use QEff's existing ORT-safe invalid-index convention. The alternative
+    # INT32_MAX sentinel is understood by QAIC but is out of bounds in ORT.
+    monkeypatch.setattr(InvalidIndexProvider, "SUBFUNC_ENABLED", True)
+
+    class Decode(nn.Module):
+        def forward(self, query, key, value, position_ids):
+            return _headpar_pipeline_forward(query, key, value, position_ids, None, 4, 3, skip_kv, ctx_len=17)
+
+    model = Decode().eval()
+    inputs = _headpar_pipeline_inputs(17, (16,))[:4]
+    path = tmp_path / "headpar_pipeline.onnx"
+    torch.onnx.export(
+        model,
+        inputs,
+        str(path),
+        input_names=["query", "key_cache", "value_cache", "position_ids"],
+        output_names=["output"],
+        # Match retained-cache export: keep the context axis symbolic so the
+        # legacy custom gather's input-like type does not fold a full-cache
+        # zeros_like into a block-sized V mask. This test specializes CL=17.
+        dynamic_axes={"key_cache": {2: "ctx_len"}, "value_cache": {2: "ctx_len"}},
+        opset_version=17,
+        dynamo=False,
+    )
+    graph = onnx.load(path)
+    onnx.checker.check_model(graph)
+    schedule = []
+    for node in graph.graph.node:
+        if node.op_type == "CtxGatherBlockedKV":
+            schedule.append({"key_cache": "K", "value_cache": "V"}[node.input[0]])
+        elif node.op_type == "MatMul":
+            schedule.append("MatMul")
+    expected_schedule = ["K"]
+    for index in range(4):
+        expected_schedule.extend(["V", "MatMul"])
+        if index < 3:
+            expected_schedule.append("K")
+        expected_schedule.append("MatMul")
+    assert schedule == expected_schedule
+
+    # Verify the raw graph numerically; QAIC, not ORT, owns production scheduling.
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    session = ort.InferenceSession(str(path), sess_options=options, providers=["CPUExecutionProvider"])
+    for position in (0, 4, 5, 16):
+        run_inputs = (*inputs[:3], torch.tensor([[position]], dtype=torch.int64))
+        feeds = dict(zip(("query", "key_cache", "value_cache", "position_ids"), run_inputs))
+        actual = torch.from_numpy(session.run(None, {name: tensor.numpy() for name, tensor in feeds.items()})[0])
+        with torch.no_grad():
+            expected = model(*run_inputs)
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
