@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
+from QEfficient.exporter.weight_free.layout_transforms import apply_layout_ops
 from QEfficient.exporter.weight_free.weight_spec import ExternalDataFile, WeightSpecLocation, load_weight_spec
 from QEfficient.utils.checkpoint_utils import checkpoint_root, resolve_checkpoint_dir
 
@@ -105,6 +106,14 @@ def load_weight_free_ort_inputs(
         if spec_input.name in ort_inputs:
             continue
         checkpoint_file = _resolve_location_file(spec_input.location, spec.files, candidate_roots)
-        ort_inputs[spec_input.name] = _load_checkpoint_tensor(str(checkpoint_file), spec_input.location.key)
+        tensor = _load_checkpoint_tensor(str(checkpoint_file), spec_input.location.key)
+        if spec_input.transform:
+            tensor = apply_layout_ops(tensor, spec_input.transform)
+        if spec_input.shape is not None and list(tensor.shape) != list(spec_input.shape):
+            raise ValueError(
+                f"Weight '{spec_input.name}' loaded with shape {list(tensor.shape)}, "
+                f"but the weight spec declares {list(spec_input.shape)}."
+            )
+        ort_inputs[spec_input.name] = tensor
 
     return ort_inputs

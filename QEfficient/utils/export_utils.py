@@ -537,6 +537,13 @@ def _generate_export_hash(qeff_model, args, kwargs, func):
     )
     if getattr(qeff_model, "_weight_free", False):
         copy_of_hash_params["weight_free"] = True
+        from QEfficient.exporter.weight_free.layout_transforms import (  # noqa: PLC0415
+            WEIGHT_SPEC_LAYOUT_VERSION,
+            layout_transforms_enabled,
+        )
+
+        if layout_transforms_enabled():
+            copy_of_hash_params["weight_spec_version"] = WEIGHT_SPEC_LAYOUT_VERSION
     if getattr(qeff_model, "_use_onnx_subfunctions", False):
         copy_of_hash_params["onnx_subfunction_version"] = 3
     # Generate hash from relevant parameters

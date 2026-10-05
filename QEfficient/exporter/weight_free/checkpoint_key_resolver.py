@@ -7,11 +7,12 @@
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import onnx_ir as ir
 from torch import nn
 
+from QEfficient.exporter.weight_free.layout_transforms import expert_parallel_layout_ops, infer_layout_shape
 from QEfficient.exporter.weight_free.weight_spec import (
     ExternalDataFile,
     TiedWeightAlias,
@@ -165,7 +166,40 @@ def find_checkpoint_key(
     )
 
 
-def promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name: str, qeff_model) -> WeightSpec:
+def _checkpoint_tensor_shape(checkpoint_file: str, key: str) -> List[int]:
+    """Read one tensor's shape from a safetensors header without loading data."""
+    from safetensors import safe_open
+
+    with safe_open(str(checkpoint_file), framework="pt") as handle:
+        return [int(d) for d in handle.get_slice(key).get_shape()]
+
+
+def _layout_transform_for_input(
+    onnx_name: str,
+    onnx_shape: List[int],
+    checkpoint_shape: List[int],
+    expert_parallel_layout: Optional[Tuple[int, int]],
+) -> Tuple[Optional[List[int]], Optional[List[dict]]]:
+    """Return ``(shape, transform)`` for a spec v6 entry, or ``(None, None)`` if none is needed."""
+    if onnx_shape == checkpoint_shape:
+        return None, None
+    if expert_parallel_layout is not None and ".moe_weights." in onnx_name:
+        ops = expert_parallel_layout_ops(checkpoint_shape, *expert_parallel_layout)
+        if infer_layout_shape(checkpoint_shape, ops) == onnx_shape:
+            return onnx_shape, ops
+    raise ValueError(
+        f"ONNX input '{onnx_name}' expects shape {onnx_shape} but the checkpoint tensor has shape "
+        f"{checkpoint_shape}, and no layout transform maps one to the other."
+    )
+
+
+def promote_initializers_and_build_spec(
+    onnx_program,
+    model_ref: str,
+    model_name: str,
+    qeff_model,
+    expert_parallel_layout: Optional[Tuple[int, int]] = None,
+) -> WeightSpec:
     """Promote ONNX initializers to graph inputs and create the weight spec.
 
     Parameters
@@ -249,6 +283,14 @@ def promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name
             )
 
         checkpoint_file = checkpoint_index[checkpoint_key]
+        spec_shape, spec_transform = None, None
+        if expert_parallel_layout is not None:
+            spec_shape, spec_transform = _layout_transform_for_input(
+                name,
+                [int(d) for d in init_value.shape],
+                _checkpoint_tensor_shape(checkpoint_file, checkpoint_key),
+                expert_parallel_layout,
+            )
         model_ir.graph.inputs.append(
             ir.Value(
                 name=name,
@@ -261,6 +303,8 @@ def promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name
             WeightSpecInput(
                 name=name,
                 location=WeightSpecLocation(file=checkpoint_files.index(checkpoint_file), key=checkpoint_key),
+                shape=spec_shape,
+                transform=spec_transform,
             )
         )
 

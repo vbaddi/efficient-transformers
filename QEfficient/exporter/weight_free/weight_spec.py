@@ -8,7 +8,9 @@
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
+
+from QEfficient.exporter.weight_free.layout_transforms import WEIGHT_SPEC_LAYOUT_VERSION
 
 WEIGHT_SPEC_VERSION = 5
 
@@ -46,6 +48,8 @@ class WeightSpecInput:
 
     name: str
     location: WeightSpecLocation  # required: every spec entry must point to a file
+    shape: Optional[List[int]] = None
+    transform: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -66,6 +70,12 @@ class WeightSpec:
         """Return a JSON-serializable representation of the weight spec."""
         data = asdict(self)
         data["model_id"] = str(data["model_id"])
+        for entry in data["inputs"]:
+            for optional_key in ("shape", "transform"):
+                if entry.get(optional_key) is None:
+                    entry.pop(optional_key, None)
+        if any(entry.get("transform") for entry in data["inputs"]):
+            data["version"] = max(int(data["version"]), WEIGHT_SPEC_LAYOUT_VERSION)
         return data
 
 
@@ -129,6 +139,8 @@ def load_weight_spec(path: Path) -> WeightSpec:
             WeightSpecInput(
                 name=entry["name"],
                 location=_load_location(entry["location"]),
+                shape=entry.get("shape"),
+                transform=entry.get("transform"),
             )
             for entry in data["inputs"]
             if entry.get("location") is not None  # backward compat: skip old buffer-only entries

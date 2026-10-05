@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1407,3 +1408,204 @@ class TestPruneFakeInitializersTransform:
         changed = PruneFakeInitializersTransform.apply(program)
         assert not changed
         assert "real_weight" in program.model.graph.initializers
+
+
+class TestWeightSpecLayoutTransforms:
+    """One canonical prepared checkpoint plus a load-time expert-parallel view."""
+
+    @pytest.mark.parametrize("layout", [(2, 4), (4, 2), (8, 1)])
+    @pytest.mark.parametrize("tail_shape", [(3, 5), (5,)], ids=["weight", "bias"])
+    def test_expert_parallel_ops_match_model_packing(self, layout, tail_shape):
+        from QEfficient.exporter.weight_free.layout_transforms import apply_layout_ops, expert_parallel_layout_ops
+        from QEfficient.transformers.moe.weights import _pack_expert_parallel_tensor
+
+        stages, experts_per_stage = layout
+        canonical = torch.randn(stages * experts_per_stage, *tail_shape)
+        expected = _pack_expert_parallel_tensor(
+            canonical, num_pipeline_stages=stages, num_parallelized_experts=experts_per_stage
+        ).data
+        actual = apply_layout_ops(
+            canonical.numpy(), expert_parallel_layout_ops(canonical.shape, stages, experts_per_stage)
+        )
+        assert actual.shape == tuple(expected.shape)
+        assert (actual == expected.numpy()).all()
+
+    @pytest.mark.parametrize(
+        ("ops", "message"),
+        [
+            ([{"op": "gather", "indices": [0]}], "unsupported"),
+            ([{"op": "reshape", "shape": [3, 3]}], "element count"),
+            ([{"op": "reshape", "shape": [-1, 4]}], "positive dims"),
+            ([{"op": "transpose", "perm": [0, 0]}], "permutation"),
+            ([{"op": "transpose", "perm": [1, 0, 2]}], "rank"),
+        ],
+    )
+    def test_layout_ops_reject_invalid_ops(self, ops, message):
+        from QEfficient.exporter.weight_free.layout_transforms import infer_layout_shape
+
+        with pytest.raises(ValueError, match=message):
+            infer_layout_shape([2, 4], ops)
+
+    @pytest.mark.parametrize(
+        ("ops", "message"),
+        [
+            ([{"op": "transpose", "perm": [0, 2, 1]}], "only permute leading axes"),
+            ([{"op": "reshape", "shape": [8, 15]}], "keep the block shape"),
+            ([{"op": "reshape", "shape": [2, 4, 5, 3]}], "keep the block shape"),
+        ],
+    )
+    def test_layout_ops_reject_moves_inside_block(self, ops, message):
+        from QEfficient.exporter.weight_free.layout_transforms import infer_layout_shape
+
+        with pytest.raises(ValueError, match=message):
+            infer_layout_shape([8, 3, 5], ops)
+
+    def test_expert_parallel_ops_reject_mismatched_expert_count(self):
+        from QEfficient.exporter.weight_free.layout_transforms import expert_parallel_layout_ops
+
+        with pytest.raises(ValueError, match="E == P"):
+            expert_parallel_layout_ops([6, 3, 5], 4, 2)
+
+    def test_layout_transform_only_for_expert_parallel_moe_weights(self):
+        from QEfficient.exporter.weight_free.checkpoint_key_resolver import _layout_transform_for_input
+
+        name = "model.layers.0.mlp.moe_weights.gate"
+        assert _layout_transform_for_input(name, [8, 3, 5], [8, 3, 5], (2, 4)) == (None, None)
+        shape, ops = _layout_transform_for_input(name, [4, 2, 3, 5], [8, 3, 5], (2, 4))
+        assert shape == [4, 2, 3, 5]
+        assert ops == [
+            {"op": "reshape", "shape": [2, 4, 3, 5]},
+            {"op": "transpose", "perm": [1, 0, 2, 3]},
+        ]
+        with pytest.raises(ValueError, match="no layout transform"):
+            _layout_transform_for_input("model.layers.0.self_attn.q_proj.weight", [4, 2, 3, 5], [8, 3, 5], (2, 4))
+
+    def test_weight_spec_v5_serialization_unchanged_without_transforms(self, tmp_path):
+        from QEfficient.exporter.weight_free.weight_spec import (
+            ExternalDataFile,
+            WeightSpec,
+            WeightSpecInput,
+            WeightSpecLocation,
+            load_weight_spec,
+            save_weight_spec,
+        )
+
+        spec = WeightSpec(
+            model_name="tiny",
+            model_id=str(tmp_path),
+            files=[ExternalDataFile(path="model.safetensors", format="safetensors")],
+            inputs=[WeightSpecInput(name="w", location=WeightSpecLocation(file=0, key="w"))],
+        )
+        path = save_weight_spec(tmp_path / "weight_spec.json", spec)
+        data = json.loads(path.read_text())
+        assert data["version"] == 5
+        assert set(data["inputs"][0]) == {"name", "location"}
+        assert load_weight_spec(path).inputs[0].transform is None
+
+    def test_weight_spec_v6_round_trips_transform(self, tmp_path):
+        from QEfficient.exporter.weight_free.layout_transforms import expert_parallel_layout_ops
+        from QEfficient.exporter.weight_free.weight_spec import (
+            ExternalDataFile,
+            WeightSpec,
+            WeightSpecInput,
+            WeightSpecLocation,
+            load_weight_spec,
+            save_weight_spec,
+        )
+
+        ops = expert_parallel_layout_ops([8, 3, 5], 2, 4)
+        spec = WeightSpec(
+            model_name="tiny",
+            model_id=str(tmp_path),
+            files=[ExternalDataFile(path="model.safetensors", format="safetensors")],
+            inputs=[
+                WeightSpecInput(
+                    name="gate", location=WeightSpecLocation(file=0, key="gate"), shape=[4, 2, 3, 5], transform=ops
+                )
+            ],
+        )
+        path = save_weight_spec(tmp_path / "weight_spec.json", spec)
+        loaded = load_weight_spec(path)
+        assert json.loads(path.read_text())["version"] == 6
+        assert loaded.inputs[0].shape == [4, 2, 3, 5]
+        assert loaded.inputs[0].transform == ops
+
+    def test_ort_injection_applies_layout_transform(self, tmp_path):
+        from QEfficient.exporter.weight_free.layout_transforms import expert_parallel_layout_ops
+        from QEfficient.exporter.weight_free.ort_weight_injection import load_weight_free_ort_inputs
+        from QEfficient.exporter.weight_free.weight_spec import (
+            ExternalDataFile,
+            WeightSpec,
+            WeightSpecInput,
+            WeightSpecLocation,
+            save_weight_spec,
+        )
+        from QEfficient.transformers.moe.weights import _pack_expert_parallel_tensor
+
+        canonical = torch.randn(8, 3, 5)
+        _write_safetensors_checkpoint(tmp_path, {"layers.0.mlp.moe_weights.gate": canonical})
+        spec = WeightSpec(
+            model_name="tiny",
+            model_id=str(tmp_path),
+            files=[ExternalDataFile(path="model.safetensors", format="safetensors")],
+            inputs=[
+                WeightSpecInput(
+                    name="layers.0.mlp.moe_weights.gate",
+                    location=WeightSpecLocation(file=0, key="layers.0.mlp.moe_weights.gate"),
+                    shape=[4, 2, 3, 5],
+                    transform=expert_parallel_layout_ops(canonical.shape, 2, 4),
+                )
+            ],
+        )
+        spec_path = save_weight_spec(tmp_path / "weight_spec.json", spec)
+        loaded = load_weight_free_ort_inputs(spec_path, {}, weights_root=tmp_path)
+        expected = _pack_expert_parallel_tensor(canonical, num_pipeline_stages=2, num_parallelized_experts=4).data
+        assert (loaded["layers.0.mlp.moe_weights.gate"] == expected.numpy()).all()
+
+    @pytest.mark.parametrize(("layout_transforms", "shared"), [("1", True), ("0", False)])
+    def test_prefill_and_decode_share_prepared_checkpoint(self, tmp_path, monkeypatch, layout_transforms, shared):
+        from QEfficient.exporter.weight_free.export import _prepare_checkpoint_for_weight_free_export
+        from QEfficient.utils import cache
+
+        monkeypatch.setenv("QEFF_WF_LAYOUT_TRANSFORMS", layout_transforms)
+        monkeypatch.setattr(cache, "QEFF_CHECKPOINT_HOME", tmp_path / "prepared")
+        src = tmp_path / "src"
+        src.mkdir()
+        prefix = "model.layers.0.block_sparse_moe"
+        tensors = {}
+        for expert_index in range(8):
+            tensors[f"{prefix}.experts.{expert_index}.w1.weight"] = torch.randn(2, 4)
+            tensors[f"{prefix}.experts.{expert_index}.w3.weight"] = torch.randn(2, 4)
+            tensors[f"{prefix}.experts.{expert_index}.w2.weight"] = torch.randn(4, 2)
+        _write_safetensors_checkpoint(src, tensors)
+
+        def fake_model(hash_params):
+            return SimpleNamespace(
+                hash_params=hash_params,
+                _checkpoint_transforms=[
+                    MoEExpertStackingCheckpointTransform,
+                    ExpertParallelPackingCheckpointTransform,
+                    DtypeConversionCheckpointTransform,
+                ],
+                model=SimpleNamespace(config=SimpleNamespace(num_local_experts=8, model_type="mixtral")),
+            )
+
+        decode_dir = _prepare_checkpoint_for_weight_free_export(
+            fake_model({"moe_prefill_flavour": "decode_bmm"}), str(src), torch.float32
+        )
+        prefill_dir = _prepare_checkpoint_for_weight_free_export(
+            fake_model(
+                {
+                    "moe_prefill_flavour": "expert_parallel",
+                    "moe_prefill_num_pipeline_stages": 2,
+                    "moe_prefill_num_parallelized_experts": 4,
+                    "moe_prefill_expert_parallel_chunk_size": 16,
+                }
+            ),
+            str(src),
+            torch.float32,
+        )
+
+        assert (decode_dir == prefill_dir) is shared
+        gate_shape = tuple(_load_prepared_tensors(Path(prefill_dir))[f"{prefix}.moe_weights.gate"].shape)
+        assert gate_shape == ((8, 4, 2) if shared else (4, 2, 4, 2))

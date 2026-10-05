@@ -75,6 +75,28 @@ explicit `weights_root` argument first. If that is not provided, it checks
 `AIC_EXTERNAL_DATA_ROOT`, the ONNX export directory, and the original checkpoint
 location recorded in `weight_spec.json`.
 
+(id-weight-free-layout-transforms)=
+### Shared Prefill/Decode Checkpoint (Weight Spec v6, Experimental)
+
+In disaggregated serving, decode reads MoE expert tensors in the canonical
+`[E, H, I]` layout, while expert-parallel prefill reads the same tensors, under
+the same names, as `[E/P, P, H, I]`. By default QEff writes one prepared
+checkpoint per layout. With `QEFF_WF_LAYOUT_TRANSFORMS=1`, both graphs share
+one canonical prepared checkpoint, and the prefill `weight_spec.json` tells the
+loader how to view it.
+
+The spec carries a `shape` and a `reshape` followed by `transpose` for each
+expert-parallel `*.moe_weights.*` input. The transform is applied at load time,
+never as a runtime graph operation. It may only reorder whole contiguous
+blocks along leading axes, so it cannot move values inside one expert block.
+Entries without a transform behave exactly as version 5, and the top-level
+version is 6 only when at least one transform is present. The loader rejects
+unknown operations, malformed arguments, block-rule violations, and shape
+mismatches. `load_weight_free_ort_inputs()` applies the same NumPy reference
+semantics used for validation.
+
+Keep the flag off for `qaic-compile` until the compiler supports weight spec v6.
+
 ---
 
 (id-proxy-model-export)=

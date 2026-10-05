@@ -118,3 +118,16 @@ python examples/dynamo/causal_lm/disagg_weight_free_inference.py \
 ```
 
 The script prints separate QPC paths for the prefill and decode workers. In standard mode it then runs a prompt through prefill, transfers the retained KV state to decode, and prints generated text. With `--continuous-batching`, it compiles the CB QPCs and leaves the runtime KV-DMA handoff to the serving integration.
+
+### Shared prefill/decode checkpoint (experimental)
+
+`weight_free_shared_checkpoint.py` exports decode and expert-parallel prefill
+with `QEFF_WF_LAYOUT_TRANSFORMS=1`, so both graphs use one prepared checkpoint
+and the prefill `weight_spec.json` carries load-time layout transforms. It only
+exports and checks the transforms against the model's expert-parallel packing.
+
+```bash
+python examples/dynamo/causal_lm/weight_free_shared_checkpoint.py \
+    --model-name tiny-random/qwen3-moe \
+    --output-dir wf_shared_checkpoint
+```

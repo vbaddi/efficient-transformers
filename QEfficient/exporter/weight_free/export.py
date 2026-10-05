@@ -16,6 +16,7 @@ import torch
 from accelerate import init_empty_weights
 
 from QEfficient.exporter.weight_free.checkpoint_key_resolver import promote_initializers_and_build_spec
+from QEfficient.exporter.weight_free.layout_transforms import WEIGHT_SPEC_LAYOUT_VERSION, layout_transforms_enabled
 from QEfficient.exporter.weight_free.weight_spec import load_weight_spec, resolve_weight_spec_path, save_weight_spec
 from QEfficient.utils import load_json
 from QEfficient.utils.checkpoint_utils import resolve_checkpoint_dir
@@ -110,6 +111,28 @@ def _prune_unused_fake_initializers(onnx_program) -> None:
             del initializers[name]
 
 
+_MOE_PREFILL_HASH_PREFIX = "moe_prefill_"
+
+
+def expert_parallel_layout(hash_params: dict) -> tuple[int, int] | None:
+    """Return ``(P, E/P)`` when this export uses the expert-parallel MoE layout."""
+    if hash_params.get("moe_prefill_flavour") != "expert_parallel":
+        return None
+    num_pipeline_stages = hash_params.get("moe_prefill_num_pipeline_stages")
+    num_parallelized_experts = hash_params.get("moe_prefill_num_parallelized_experts")
+    if num_pipeline_stages is None or num_parallelized_experts is None:
+        raise ValueError(
+            "expert_parallel flavour requires moe_prefill_num_pipeline_stages "
+            "and moe_prefill_num_parallelized_experts in hash_params."
+        )
+    return int(num_pipeline_stages), int(num_parallelized_experts)
+
+
+def _canonical_layout_hash_params(hash_params: dict) -> dict:
+    """Return hash params that plan the canonical (unpacked) MoE checkpoint."""
+    return {key: value for key, value in hash_params.items() if not key.startswith(_MOE_PREFILL_HASH_PREFIX)}
+
+
 def _prepared_checkpoint_hash(
     model_ref: str,
     target_dtype: torch.dtype,
@@ -168,6 +191,8 @@ def _prepare_checkpoint_for_weight_free_export(
 
     source_dir = resolve_checkpoint_dir(model_ref)
     hash_params = qeff_model.hash_params
+    if layout_transforms_enabled():
+        hash_params = _canonical_layout_hash_params(hash_params)
 
     prep_pipeline = CheckpointTransformPipeline(transforms=qeff_model._checkpoint_transforms)
     plan, active_group_id = prep_pipeline.build_plan(
@@ -177,6 +202,8 @@ def _prepare_checkpoint_for_weight_free_export(
         hash_params=hash_params,
     )
     moe_prefill_flavour = hash_params.get("moe_prefill_flavour", "none")
+    if layout_transforms_enabled():
+        moe_prefill_flavour = f"canonical-v{WEIGHT_SPEC_LAYOUT_VERSION}"
 
     prepared_hash = _prepared_checkpoint_hash(
         model_ref=model_ref,
@@ -288,6 +315,9 @@ def export_weight_free_onnx(
         model_ref=prepared_model_ref,
         model_name=qeff_model.model_name,
         qeff_model=meta_qeff_model,
+        expert_parallel_layout=(
+            expert_parallel_layout(meta_qeff_model.hash_params) if layout_transforms_enabled() else None
+        ),
     )
     _prune_unused_fake_initializers(onnx_program)
     onnx_program.save(str(onnx_path))
