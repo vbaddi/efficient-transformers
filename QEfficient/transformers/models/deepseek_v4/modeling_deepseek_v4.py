@@ -1227,19 +1227,68 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
 
         candidate_scores = []
         candidate_indices = []
-        for tile_start in range(0, capacity, tile_size):
-            tile_end = min(tile_start + tile_size, capacity)
-            tile_cache = indexer_kv_cache[:, tile_start:tile_end]
-            tile_scores = torch.einsum("bshd,btd->bsht", q_index.float(), tile_cache.float()).relu()
-            tile_scores = (tile_scores * index_weights.unsqueeze(-1)).sum(dim=2)
-            tile_indices = torch.arange(tile_start, tile_end, device=indexer_kv_cache.device).view(1, 1, -1)
-            tile_scores = tile_scores.masked_fill(tile_indices >= causal_threshold, -3.0e4)
-            tile_topk = torch.topk(tile_scores, k=min(topk_per_tile, tile_end - tile_start), dim=-1)
-            candidate_scores.append(tile_topk.values)
-            candidate_indices.append(tile_start + tile_topk.indices)
+        use_loop_op = (
+            torch._dynamo.is_compiling() and capacity % tile_size == 0 and topk_per_tile <= tile_size
+        )
+        if use_loop_op:
+            candidate_scores_tensor = q_index.new_full(
+                (batch_size, chunk_length, num_tiles * topk_per_tile), -3.0e4
+            )
+            candidate_indices_tensor = torch.zeros(
+                (batch_size, chunk_length, num_tiles * topk_per_tile),
+                dtype=torch.long,
+                device=indexer_kv_cache.device,
+            )
+            initial_tile = torch.zeros((), dtype=torch.int64, device=indexer_kv_cache.device)
+            tile_offsets = torch.arange(tile_size, device=indexer_kv_cache.device)
+            candidate_offsets = torch.arange(topk_per_tile, device=indexer_kv_cache.device)
 
-        candidate_scores = torch.cat(candidate_scores, dim=-1)
-        candidate_indices = torch.cat(candidate_indices, dim=-1)
+            def cond_fn(
+                tile_index: torch.Tensor,
+                current_scores: torch.Tensor,
+                current_indices: torch.Tensor,
+            ) -> torch.Tensor:
+                del current_scores, current_indices
+                return tile_index < num_tiles
+
+            def body_fn(
+                tile_index: torch.Tensor,
+                current_scores: torch.Tensor,
+                current_indices: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                tile_indices = tile_index * tile_size + tile_offsets
+                tile_cache = torch.index_select(indexer_kv_cache, 1, tile_indices)
+                tile_scores = torch.einsum("bshd,btd->bsht", q_index.float(), tile_cache.float()).relu()
+                tile_scores = (tile_scores * index_weights.unsqueeze(-1)).sum(dim=2)
+                tile_scores = tile_scores.masked_fill(tile_indices.view(1, 1, -1) >= causal_threshold, -3.0e4)
+                tile_topk = torch.topk(tile_scores, k=topk_per_tile, dim=-1)
+                candidate_positions = tile_index * topk_per_tile + candidate_offsets
+                selected_indices = tile_index * tile_size + tile_topk.indices
+                return (
+                    tile_index + 1,
+                    torch.index_copy(current_scores, 2, candidate_positions, tile_topk.values),
+                    torch.index_copy(current_indices, 2, candidate_positions, selected_indices),
+                )
+
+            _, candidate_scores, candidate_indices = torch.while_loop(
+                cond_fn,
+                body_fn,
+                (initial_tile, candidate_scores_tensor, candidate_indices_tensor),
+            )
+        else:
+            for tile_start in range(0, capacity, tile_size):
+                tile_end = min(tile_start + tile_size, capacity)
+                tile_cache = indexer_kv_cache[:, tile_start:tile_end]
+                tile_scores = torch.einsum("bshd,btd->bsht", q_index.float(), tile_cache.float()).relu()
+                tile_scores = (tile_scores * index_weights.unsqueeze(-1)).sum(dim=2)
+                tile_indices = torch.arange(tile_start, tile_end, device=indexer_kv_cache.device).view(1, 1, -1)
+                tile_scores = tile_scores.masked_fill(tile_indices >= causal_threshold, -3.0e4)
+                tile_topk = torch.topk(tile_scores, k=min(topk_per_tile, tile_end - tile_start), dim=-1)
+                candidate_scores.append(tile_topk.values)
+                candidate_indices.append(tile_start + tile_topk.indices)
+
+            candidate_scores = torch.cat(candidate_scores, dim=-1)
+            candidate_indices = torch.cat(candidate_indices, dim=-1)
         candidate_count = candidate_scores.shape[-1]
         if index_topk >= candidate_count:
             selection = torch.arange(candidate_count, device=indexer_kv_cache.device).view(1, 1, -1)
@@ -2894,7 +2943,9 @@ class QEffDeepseekV4HyperConnection(DeepseekV4HyperConnection):
         flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
         pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
-        pre_scale, post_scale, comb_scale = self.scale.unbind(0)
+        pre_scale = self.scale[0]
+        post_scale = self.scale[1]
+        comb_scale = self.scale[2]
 
         pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
         post = 2 * torch.sigmoid(post_w * post_scale + post_b)

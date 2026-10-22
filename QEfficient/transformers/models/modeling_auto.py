@@ -4490,6 +4490,24 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 qaic_config=self.model.qaic_config,
             )
 
+        if is_deepseek_v4 and qaic_config and qaic_config.get("static_export_dims", False):
+            static_dim_names = {
+                "batch_size",
+                "full_batch_size",
+                "seq_len",
+                "ctx_len",
+                "sliding_window",
+                "num_logits_to_keep",
+            }
+            dynamic_axes = {
+                name: {
+                    axis: dim_name
+                    for axis, dim_name in axes.items()
+                    if dim_name not in static_dim_names and not dim_name.startswith("compressed_ctx_len_")
+                }
+                for name, axes in dynamic_axes.items()
+            }
+
         # transformers>=5.3 Gemma3 models require Cache I/O internally; keep tensor/list
         # inputs for tracing and bridge to cache objects inside a temporary wrapper.
         if (

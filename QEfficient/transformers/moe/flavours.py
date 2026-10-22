@@ -203,23 +203,60 @@ def moe_expert_parallel(
     b_d = weights.down_bias
 
     expert_out = x.new_zeros((num_parallelized_experts, T, H))
-    routing_weights_unsqueezed = rw.unsqueeze(-1)
-    for slot in range(num_pipeline_stages):
-        T2Ei = rw[:, slot, :] > 0
-        expert_out = cumsum_scatter_gather_update_expert_blocked(
+
+    def update_expert_out(slot: torch.Tensor | int, current_expert_out: torch.Tensor) -> torch.Tensor:
+        if isinstance(slot, torch.Tensor):
+            slot_index = slot.reshape(1)
+            routing_weights_for_slot = torch.index_select(rw, 1, slot_index).squeeze(1)
+            gate_weights_for_slot = torch.index_select(W_g, 1, slot_index).squeeze(1)
+            up_weights_for_slot = torch.index_select(W_u, 1, slot_index).squeeze(1)
+            down_weights_for_slot = torch.index_select(W_d, 1, slot_index).squeeze(1)
+            gate_bias_for_slot = (
+                torch.index_select(b_g, 1, slot_index).squeeze(1) if b_g is not None else None
+            )
+            up_bias_for_slot = torch.index_select(b_u, 1, slot_index).squeeze(1) if b_u is not None else None
+            down_bias_for_slot = (
+                torch.index_select(b_d, 1, slot_index).squeeze(1) if b_d is not None else None
+            )
+        else:
+            routing_weights_for_slot = rw[:, slot, :]
+            gate_weights_for_slot = W_g[:, slot]
+            up_weights_for_slot = W_u[:, slot]
+            down_weights_for_slot = W_d[:, slot]
+            gate_bias_for_slot = b_g[:, slot] if b_g is not None else None
+            up_bias_for_slot = b_u[:, slot] if b_u is not None else None
+            down_bias_for_slot = b_d[:, slot] if b_d is not None else None
+
+        T2Ei = routing_weights_for_slot > 0
+        return cumsum_scatter_gather_update_expert_blocked(
             x=x,
             T2Ei=T2Ei,
-            W_g=W_g[:, slot],
-            W_u=W_u[:, slot],
-            W_d=W_d[:, slot],
-            routing_weight=routing_weights_unsqueezed[:, slot],
-            expert_out=expert_out,
+            W_g=gate_weights_for_slot,
+            W_u=up_weights_for_slot,
+            W_d=down_weights_for_slot,
+            routing_weight=routing_weights_for_slot.unsqueeze(-1),
+            expert_out=current_expert_out,
             expert_mlp=profile.expert_mlp,
-            b_g=b_g[:, slot] if b_g is not None else None,
-            b_u=b_u[:, slot] if b_u is not None else None,
-            b_d=b_d[:, slot] if b_d is not None else None,
+            b_g=gate_bias_for_slot,
+            b_u=up_bias_for_slot,
+            b_d=down_bias_for_slot,
             num_packed_chunks=num_packed_chunks,
         )
+
+    if torch._dynamo.is_compiling():
+        initial_slot = torch.zeros((), dtype=torch.int64, device=x.device)
+
+        def cond_fn(slot: torch.Tensor, current_expert_out: torch.Tensor) -> torch.Tensor:
+            del current_expert_out
+            return slot < num_pipeline_stages
+
+        def body_fn(slot: torch.Tensor, current_expert_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return slot + 1, update_expert_out(slot, current_expert_out)
+
+        _, expert_out = torch.while_loop(cond_fn, body_fn, (initial_slot, expert_out))
+    else:
+        for slot in range(num_pipeline_stages):
+            expert_out = update_expert_out(slot, expert_out)
 
     if experts_per_soc is not None:
         if num_parallelized_experts % num_devices != 0:

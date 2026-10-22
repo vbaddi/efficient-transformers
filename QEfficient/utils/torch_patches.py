@@ -443,6 +443,99 @@ _MIXED_EXPORT_PATCH_LOCK = threading.RLock()
 _MISSING_META = object()
 
 
+def _same_graph_leaf(left, right, left_names, right_names, node_map):
+    """Compare two FX argument leaves, canonicalizing symbolic values and mapping nodes."""
+    from QEfficient.utils.export_subfunctions import canonical_symbolic_expr
+
+    if isinstance(left, torch.fx.Node):
+        return node_map.get(left) is right
+    if isinstance(left, slice) or isinstance(right, slice):
+        return (
+            isinstance(left, slice)
+            and isinstance(right, slice)
+            and all(
+                _same_graph_leaf(x, y, left_names, right_names, node_map)
+                for x, y in ((left.start, right.start), (left.stop, right.stop), (left.step, right.step))
+            )
+        )
+    if isinstance(left, torch.SymInt) or isinstance(right, torch.SymInt):
+        return (
+            isinstance(left, (int, torch.SymInt))
+            and isinstance(right, (int, torch.SymInt))
+            and canonical_symbolic_expr(left, left_names) == canonical_symbolic_expr(right, right_names)
+        )
+    return left == right
+
+
+def _same_graph_structure(a, b, root=True, names=None):
+    """Compare two flat export bodies by operations, dataflow and constants.
+
+    PyTorch's comparator flattens tensor metadata with a fresh cache key per
+    tensor, so any operand with a symbolic dimension (for example a dynamic
+    context-length cache) never compares equal, and nested bodies such as loop
+    bodies may carry no ``example_value`` at all. Root placeholders are
+    compared with a symbol-renaming-invariant operand key instead, and symbolic
+    constants or ``sym_size`` reads are compared through the same renaming.
+    Nested bodies are compared structurally, since their inputs are tied to the
+    root operands.
+    """
+    from QEfficient.utils.export_subfunctions import canonical_operand_keys, canonical_symbolic_expr
+
+    if root:
+        left_inputs, right_inputs = (
+            [node.meta.get("example_value") for node in gm.graph.nodes if node.op == "placeholder"] for gm in (a, b)
+        )
+        names = ({}, {})
+        if canonical_operand_keys(left_inputs, names[0]) != canonical_operand_keys(right_inputs, names[1]):
+            return False
+    left_names, right_names = names
+    node_map = {}
+    for left, right in zip(a.graph.nodes, b.graph.nodes):
+        if left.op != right.op:
+            return False
+        if left.op == "placeholder":
+            pass
+        elif left.op in {"call_function", "call_method", "output"}:
+            if left.op != "output" and left.target != right.target:
+                return False
+            if (
+                root
+                and left.target is torch.ops.aten.sym_size.int
+                and all(
+                    isinstance(arg, torch.fx.Node)
+                    and arg.op == "placeholder"
+                    and isinstance(arg.meta.get("example_value"), torch.Tensor)
+                    for arg in (left.args[0], right.args[0])
+                )
+                and left.args[1] == right.args[1]
+            ):
+                # Either graph may read the same canonical size from a different operand.
+                dim = left.args[1]
+                left_size = left.args[0].meta["example_value"].shape[dim]
+                right_size = right.args[0].meta["example_value"].shape[dim]
+                if canonical_symbolic_expr(left_size, left_names) != canonical_symbolic_expr(right_size, right_names):
+                    return False
+                node_map[left] = right
+                continue
+            left_leaves, left_spec = pytree.tree_flatten((left.args, left.kwargs))
+            right_leaves, right_spec = pytree.tree_flatten((right.args, right.kwargs))
+            if left_spec != right_spec:
+                return False
+            for left_leaf, right_leaf in zip(left_leaves, right_leaves):
+                if not _same_graph_leaf(left_leaf, right_leaf, left_names, right_names, node_map):
+                    return False
+        elif left.op == "get_attr":
+            left_attr, right_attr = getattr(a, left.target, None), getattr(b, right.target, None)
+            if not (isinstance(left_attr, torch.fx.GraphModule) and isinstance(right_attr, torch.fx.GraphModule)):
+                return False
+            if not _same_graph_structure(left_attr, right_attr, root=False, names=names):
+                return False
+        else:
+            return False
+        node_map[left] = right
+    return True
+
+
 def _same_export_region(a, b, fake_mode, a_operands=None, b_operands=None):
     """Conservatively identify equivalent flat, lifted-input export regions.
 
@@ -504,9 +597,12 @@ def _same_export_region(a, b, fake_mode, a_operands=None, b_operands=None):
         # comparisons in the active export proxy trace and fail on symbols
         # belonging to the separately compiled region.
         with disable_proxy_modes_tracing():
-            return are_same_graph_modules("non_strict_export", a, b, fake_mode)
-    except (KeyError, NotImplementedError):
-        return False
+            try:
+                if are_same_graph_modules("non_strict_export", a, b, fake_mode):
+                    return True
+            except (KeyError, NotImplementedError):
+                pass
+            return _same_graph_structure(a, b)
     finally:
         for node, value in saved:
             if value is _MISSING_META:
