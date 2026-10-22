@@ -753,6 +753,9 @@ class QEFFAutoModel(QEFFTransformersBase):
             Use MXFP6 compression for weights. Default is False.
         use_onnx_subfunctions: bool, optional
             whether to enable ONNX subfunctions during export. Exporting PyTorch model to ONNX with modules as subfunctions helps to reduce export/compile time. Defaults to False
+        convert_to_fp16: bool, optional
+            Override the dtype-based QAIC conversion policy. ``None`` preserves
+            the default policy; ``False`` omits ``-convert-to-fp16``.
         **compiler_options : dict
             Additional compiler options for QAIC or QNN compilers. These are passed directly
             to the underlying compilation command.
@@ -2092,6 +2095,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         kv_cache_prefix: Optional[str] = None,
         artifacts: bool = False,
         log_times: bool = False,
+        convert_to_fp16: bool | None = None,
         **compiler_options,
     ) -> str:
         """
@@ -2306,6 +2310,9 @@ class _QEffAutoModelForImageTextToTextDualQPC:
 
         custom_io_vision = {}
         target_dtype = getattr(self.model.config, "torch_dtype", torch.float32)
+        compiler_convert_to_fp16 = (
+            _should_convert_to_fp16(target_dtype, compiler_options) if convert_to_fp16 is None else convert_to_fp16
+        )
         kv_cache_dtype = "mxint8" if mxint8_kv_cache else CUSTOM_IO_DTYPE_MAP[target_dtype]
         molmo = hasattr(self.model.config, "model_type") and self.model.config.model_type == "molmo"
         if molmo:
@@ -2383,7 +2390,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 compile_dir=compile_dir,
                 specializations=specializations["vision"],
                 specialization_module_name="Vision",
-                convert_to_fp16=_should_convert_to_fp16(target_dtype, compiler_options),
+                convert_to_fp16=compiler_convert_to_fp16,
                 mxfp6_matmul=constants.VISION_MXFP6_MATMUL,
                 mdp_ts_num_devices=num_devices,
                 aic_num_cores=num_cores,
@@ -2446,7 +2453,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 compile_dir=compile_dir,
                 retained_state=True,
                 specializations=specializations,
-                convert_to_fp16=_should_convert_to_fp16(target_dtype, compiler_options),
+                convert_to_fp16=compiler_convert_to_fp16,
                 mxfp6_matmul=mxfp6_matmul,
                 mdp_ts_num_devices=num_devices,
                 aic_num_cores=num_cores,

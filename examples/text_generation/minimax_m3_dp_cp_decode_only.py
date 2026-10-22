@@ -71,6 +71,12 @@ def main():
         help="Generate and pass the MiniMax FP32 node-precision file to QAIC compile.",
     )
     parser.add_argument(
+        "--convert-to-fp16",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply QAIC global FP16 conversion (disabled by default for explicit FP32 decode merge math).",
+    )
+    parser.add_argument(
         "--mxfp6-matmul",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -227,6 +233,7 @@ def main():
         dynamo=True,
         skip_vision=True,
         node_precision_info=args.node_precision_info,
+        convert_to_fp16=args.convert_to_fp16,
         offload_pt_weights=False,
         log_times=True,
         qaic_config={

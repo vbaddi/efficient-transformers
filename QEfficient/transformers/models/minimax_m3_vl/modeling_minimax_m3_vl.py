@@ -5,7 +5,6 @@
 #
 # -----------------------------------------------------------------------------
 
-import math
 import re
 from functools import partial
 from math import lcm
@@ -2247,21 +2246,6 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
         # the data-dependent .item() guard must stay out of the traced graph;
         # export preserves the static loop and applies the skip mask below.
         is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or torch._dynamo.is_compiling()
-        # Online softmax sums exp(score - max_score) over the context. At
-        # long context, the merged denominator can reach ctx_len (65536+),
-        # above FP16's largest finite value (65504), producing inf/NaN.
-        #
-        # Use an exact power-of-two divisor with each headroom;
-        # applying it to each per-block numerator and
-        # denominator preserves the final quotient while keeping the merge
-        # reductions in the finite FP16 range.
-        softmax_scale_log2 = max(0, math.ceil(math.log2(max(ctx_len, 1))) - 14)
-        softmax_scale = float(2.0 ** (-softmax_scale_log2))
-        if tokens_per_core > 2**14:
-            raise ValueError(
-                f"tokens_per_core={tokens_per_core} risks FP16 overflow in the per-block softmax sum; "
-                "increase num_kv_blocks or num_cores_per_device."
-            )
         for batch_idx in range(batch_local):
             q_core = query_rows[batch_idx : batch_idx + 1].unsqueeze(2).expand(1, rows, num_cores, ql_eff, head_dim)
             maxima, sums, outputs = [], [], []
@@ -2318,17 +2302,13 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
                 ).reshape(1, rows, num_cores, ql_eff, head_dim)
                 if skip_kv and is_export:
                     block_output = torch.where(skip_future.unsqueeze(-1), torch.zeros_like(block_output), block_output)
-                if softmax_scale_log2:
-                    # The same factor is applied to numerator and denominator,
-                    # so it cancels in cp_output / cp_sum. Scaling after the
-                    # per-block BMM avoids the subnormal input produced by
-                    # 1 / ctx_len while keeping the cross-block/core/CP
-                    # reductions bounded.
-                    block_sum = block_sum * softmax_scale
-                    block_output = block_output * softmax_scale
-                maxima.append(block_max)
-                sums.append(block_sum)
-                outputs.append(block_output)
+                # Keep per-block attention in the model dtype. Promote only
+                # the cross-block/core/CP merge so long-context reductions do
+                # not overflow FP16; the common factor used by the old
+                # softmax scaling is no longer needed.
+                maxima.append(block_max.float())
+                sums.append(block_sum.float())
+                outputs.append(block_output.float())
             maxima_groups.append(torch.stack(maxima))
             sum_groups.append(torch.stack(sums))
             output_groups.append(torch.stack(outputs))
@@ -2357,6 +2337,7 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
             .view(batch_local, dp, hkv, n_rep, query_len, head_dim)
             .permute(1, 0, 2, 3, 4, 5)
             .reshape(batch, num_heads, query_len, head_dim)
+            .to(query_states.dtype)
         )
 
     def _gqa_dedicated_attention(
