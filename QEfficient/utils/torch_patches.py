@@ -694,14 +694,106 @@ def preserve_mixed_export_subfunctions():
         try:
             onnx_core = importlib.import_module("torch.onnx._internal.exporter._core")
             original_prepare = onnx_core._prepare_exported_program_for_export
+            onnx_registration = importlib.import_module("torch.onnx._internal.exporter._registration")
+            onnx_hop = importlib.import_module("torch.onnx._internal.exporter._torchlib.ops.hop")
+            original_registry_descriptor = onnx_registration.ONNXRegistry.__dict__["from_torchlib"]
+            original_hop_while_loop = onnx_hop.higher_order_while_loop
         except (AttributeError, ModuleNotFoundError):
             onnx_core = original_prepare = None
+            onnx_registration = onnx_hop = None
+            original_registry_descriptor = original_hop_while_loop = None
             logger.warning(
                 "torch.onnx exporter hook '_prepare_exported_program_for_export' not found; "
                 "ONNX subfunction reuse is disabled and repeated layers may be exported as duplicates."
             )
 
         utils._hop_compile_and_call = patched
+        original_materialize = utils.materialize_as_graph
+
+        def materialize_with_values(fn, args, *materialize_args, **materialize_kwargs):
+            graph_module = original_materialize(fn, args, *materialize_args, **materialize_kwargs)
+            placeholders = [node for node in graph_module.graph.nodes if node.op == "placeholder"]
+            for node, value in zip(placeholders, args):
+                node.meta.setdefault("val", value)
+                node.meta.setdefault("example_value", value)
+            return graph_module
+
+        utils.materialize_as_graph = materialize_with_values
+        invoke_subgraph_module = importlib.import_module("torch._higher_order_ops.invoke_subgraph")
+        invoke_subgraph_class = type(invoke_subgraph_module.invoke_subgraph)
+        original_gen_schema = invoke_subgraph_class.gen_schema
+
+        def gen_schema_with_values(self, subgraph, identifier, *operands):
+            candidate = getattr(subgraph, "subgraph", subgraph)
+            if hasattr(candidate, "graph"):
+                placeholders = [node for node in candidate.graph.nodes if node.op == "placeholder"]
+                for node, value in zip(placeholders, operands):
+                    node.meta.setdefault("val", value)
+                    node.meta.setdefault("example_value", value)
+            return original_gen_schema(self, subgraph, identifier, *operands)
+
+        invoke_subgraph_class.gen_schema = gen_schema_with_values
+        verifier_module = importlib.import_module("torch._export.verifier")
+        original_check_graph_module = verifier_module.Verifier._check_graph_module
+
+        def check_graph_module_with_subgraph_values(self, graph_module):
+            for owner in graph_module.modules():
+                for call in owner.graph.nodes:
+                    if call.op != "call_function":
+                        continue
+
+                    if call.target is torch.ops.higher_order.while_loop:
+                        loop_operands = tuple(pytree.tree_leaves(call.args[2])) + tuple(
+                            pytree.tree_leaves(call.args[3])
+                        )
+                        subgraph_refs = call.args[:2]
+                    elif call.target is torch.ops.higher_order.invoke_subgraph:
+                        loop_operands = call.args[2:]
+                        subgraph_refs = (call.args[0],)
+                    else:
+                        continue
+
+                    for subgraph_ref in subgraph_refs:
+                        if isinstance(subgraph_ref, torch.fx.Node) and subgraph_ref.op == "get_attr":
+                            subgraph = owner.get_submodule(subgraph_ref.target)
+                        elif isinstance(subgraph_ref, torch.fx.GraphModule):
+                            subgraph = subgraph_ref
+                        else:
+                            continue
+                        if not isinstance(subgraph, torch.fx.GraphModule):
+                            continue
+                        placeholders = [node for node in subgraph.graph.nodes if node.op == "placeholder"]
+                        for placeholder, operand in zip(placeholders, loop_operands):
+                            if isinstance(operand, torch.fx.Node):
+                                value = operand.meta.get("val", operand.meta.get("example_value"))
+                            else:
+                                value = operand
+                            if value is not None:
+                                placeholder.meta.setdefault("val", value)
+
+                    if call.target is not torch.ops.higher_order.invoke_subgraph:
+                        continue
+                    subgraph_ref = call.args[0]
+                    if isinstance(subgraph_ref, torch.fx.Node) and subgraph_ref.op == "get_attr":
+                        subgraph = owner.get_submodule(subgraph_ref.target)
+                    elif isinstance(subgraph_ref, torch.fx.GraphModule):
+                        subgraph = subgraph_ref
+                    else:
+                        continue
+                    if not isinstance(subgraph, torch.fx.GraphModule):
+                        continue
+                    operands = call.args[2:]
+                    placeholders = [node for node in subgraph.graph.nodes if node.op == "placeholder"]
+                    for placeholder, operand in zip(placeholders, operands):
+                        if isinstance(operand, torch.fx.Node):
+                            value = operand.meta.get("val", operand.meta.get("example_value"))
+                        else:
+                            value = operand
+                        if value is not None:
+                            placeholder.meta.setdefault("val", value)
+            return original_check_graph_module(self, graph_module)
+
+        verifier_module.Verifier._check_graph_module = check_graph_module_with_subgraph_values
         if onnx_core is not None:
             from QEfficient.utils.export_subfunctions import reuse_exported_subfunctions
 
@@ -709,12 +801,45 @@ def preserve_mixed_export_subfunctions():
                 return reuse_exported_subfunctions(original_prepare(*args, **kwargs))
 
             onnx_core._prepare_exported_program_for_export = prepare_with_reuse
+
+            def while_loop_with_scalar_constants(cond_func, body_func, carried_inputs, additional_inputs):
+                normalized_inputs = []
+                for value in additional_inputs:
+                    if isinstance(value, bool):
+                        normalized_inputs.append(onnx_hop.call_op("Constant", value_int=int(value))[0])
+                    elif isinstance(value, int):
+                        normalized_inputs.append(onnx_hop.call_op("Constant", value_int=value)[0])
+                    elif isinstance(value, float):
+                        normalized_inputs.append(onnx_hop.call_op("Constant", value_float=value)[0])
+                    else:
+                        normalized_inputs.append(value)
+                return original_hop_while_loop(
+                    cond_func,
+                    body_func,
+                    carried_inputs,
+                    tuple(normalized_inputs),
+                )
+
+            def registry_from_torchlib(cls, *args, **kwargs):
+                registry = original_registry_descriptor.__func__(cls, *args, **kwargs)
+                for decompositions in registry.functions.values():
+                    for decomposition in decompositions:
+                        if decomposition.onnx_function is original_hop_while_loop:
+                            decomposition.onnx_function = while_loop_with_scalar_constants
+                return registry
+
+            onnx_registration.ONNXRegistry.from_torchlib = classmethod(registry_from_torchlib)
         try:
             yield
         finally:
             if onnx_core is not None:
                 onnx_core._prepare_exported_program_for_export = original_prepare
+            verifier_module.Verifier._check_graph_module = original_check_graph_module
+            invoke_subgraph_class.gen_schema = original_gen_schema
+            utils.materialize_as_graph = original_materialize
             utils._hop_compile_and_call = original
+            if onnx_registration is not None:
+                onnx_registration.ONNXRegistry.from_torchlib = original_registry_descriptor
 
 
 @contextmanager

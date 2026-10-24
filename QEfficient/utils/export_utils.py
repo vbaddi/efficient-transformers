@@ -83,14 +83,14 @@ def reorder_inputs_by_signature(model, example_inputs, dynamic_shapes=None):
 def build_dynamo_export_kwargs(export_kwargs):
     """Prepare export kwargs for dynamo (torch.export) path.
 
-    Sets dynamo=True, default report/optimize flags, and injects DYNAMO_CUSTOM_OP_TABLE
+    Sets dynamo=True, the default optimize flag, and injects DYNAMO_CUSTOM_OP_TABLE
     into custom_translation_table. Returns a new dict; does not mutate the input.
     """
     from QEfficient.customop.dynamo_ops import DYNAMO_CUSTOM_OP_TABLE
     from QEfficient.utils import constants
 
     kwargs = dict(export_kwargs)
-    kwargs.setdefault("report", True)
+    kwargs.setdefault("report", False)
     kwargs.setdefault("optimize", False)
     kwargs["dynamo"] = True
     kwargs["opset_version"] = constants.ONNX_DYNAMO_EXPORT_OPSET

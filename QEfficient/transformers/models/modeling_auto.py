@@ -66,6 +66,7 @@ from QEfficient.transformers.modeling_utils import (
     SPECIALIZED_DISAGG_SERVING_MODEL_ARCH,
     _configure_proxy_for_model,
 )
+from QEfficient.transformers.models.deepseek_v4.onnx_transforms import DeepseekV4StaticPrefillLoopTransform
 from QEfficient.transformers.models.gpt_oss.modeling_gpt_oss import override_gptoss_prefill_chunking
 from QEfficient.transformers.models.pytorch_transforms import (
     CustomOpsTransform,
@@ -3665,7 +3666,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         SimpleDecodeMoeTransform,
     ]
 
-    _onnx_transforms = []
+    _onnx_transforms = [DeepseekV4StaticPrefillLoopTransform]
 
     _checkpoint_transforms = [
         DeepseekV4CheckpointTransform,
@@ -4564,6 +4565,17 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         if getattr(self, "dflash_tlm", None):
             output_names.append("hidden_states")
 
+        onnx_transform_kwargs = {}
+        if is_deepseek_v4 and prefill_only:
+            loop_trip_counts = []
+            for module in self.model.modules():
+                if getattr(module, "_prefill_expert_parallel", False):
+                    stages = getattr(module, "num_pipeline_stages", None)
+                    if stages is not None:
+                        loop_trip_counts.append(int(stages))
+            if loop_trip_counts:
+                onnx_transform_kwargs["deepseek_v4_prefill_loop_trip_counts"] = tuple(loop_trip_counts)
+
         if QEFFBaseModel._layerwise_active:
             return self._export_layerwise(
                 example_inputs,
@@ -4589,6 +4601,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
                 dynamo=dynamo,
                 offload_pt_weights=kwargs.get("offload_pt_weights", True),
+                onnx_transform_kwargs=onnx_transform_kwargs,
             )
 
     def build_prefill_specialization(

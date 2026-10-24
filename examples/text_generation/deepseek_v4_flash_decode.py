@@ -319,12 +319,6 @@ def parse_args(defaults: dict[str, object] | None = None) -> argparse.Namespace:
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--automation", action="store_true")
     parser.add_argument(
-        "--profile-export",
-        choices=("off", "on", "cprofile"),
-        default="off",
-        help="Write weight-free export profiling data; cprofile also writes Python call-profile files.",
-    )
-    parser.add_argument(
         "--static-export-dims",
         action="store_true",
         help="Export Prefill with the requested batch, sequence, and cache dimensions fixed.",
@@ -428,8 +422,6 @@ def main(defaults: dict[str, object] | None = None) -> None:
         raise ValueError("DeepSeek V4 Flash decode requires batch_size to be divisible by the device-group size.")
     os.environ["HF_HUB_CACHE"] = str(args.hf_cache)
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-    if args.profile_export != "off":
-        os.environ["QEFF_EXPORT_PROFILE"] = "cprofile" if args.profile_export == "cprofile" else "1"
     os.environ.setdefault("QEFF_HOME", str(args.artifact_root))
     os.environ.setdefault("QEFF_CHECKPOINT_HOME", str(args.artifact_root / "checkpoints"))
 

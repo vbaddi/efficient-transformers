@@ -17,6 +17,7 @@ Tests verify:
 All tests run on CPU only, using tiny in-memory models.
 """
 
+import onnx
 import pytest
 from transformers import GPT2Config, GPT2LMHeadModel, LlamaConfig, LlamaForCausalLM
 
@@ -80,6 +81,43 @@ class TestONNXTransformsModuleStructure:
 
         assert hasattr(CustomOpTransform, "apply")
         assert callable(CustomOpTransform.apply)
+
+    def test_deepseek_prefill_loop_transform_runs_through_pipeline(self):
+        from QEfficient.base.onnx_transforms import OnnxTransformPipeline
+        from QEfficient.transformers.models.deepseek_v4.onnx_transforms import (
+            DeepseekV4StaticPrefillLoopTransform,
+        )
+
+        body = onnx.helper.make_graph(
+            [onnx.helper.make_node("Identity", ["carry"], ["carry_out"])],
+            "loop_body",
+            [
+                onnx.helper.make_tensor_value_info("iter", onnx.TensorProto.INT64, []),
+                onnx.helper.make_tensor_value_info("cond", onnx.TensorProto.BOOL, []),
+                onnx.helper.make_tensor_value_info("carry", onnx.TensorProto.FLOAT, []),
+            ],
+            [
+                onnx.helper.make_tensor_value_info("body_cond", onnx.TensorProto.BOOL, []),
+                onnx.helper.make_tensor_value_info("carry_out", onnx.TensorProto.FLOAT, []),
+            ],
+        )
+        graph = onnx.helper.make_graph(
+            [onnx.helper.make_node("Loop", ["", "", "carry_init"], ["carry_final"], body=body)],
+            "deepseek_prefill",
+            [onnx.helper.make_tensor_value_info("carry_init", onnx.TensorProto.FLOAT, [])],
+            [onnx.helper.make_tensor_value_info("carry_final", onnx.TensorProto.FLOAT, [])],
+        )
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
+
+        transformed_model, transformed = OnnxTransformPipeline(transforms=[DeepseekV4StaticPrefillLoopTransform]).apply(
+            model, deepseek_v4_prefill_loop_trip_counts=(3,)
+        )
+
+        assert transformed
+        loop = next(node for node in transformed_model.graph.node if node.op_type == "Loop")
+        assert loop.input[0].startswith("qeff_deepseek_v4_prefill_loop_0_trip_count")
+        assert loop.input[1].startswith("qeff_deepseek_v4_prefill_loop_0_cond_true")
+        assert sum(node.op_type == "Constant" for node in transformed_model.graph.node) == 2
 
     def test_custom_op_variants_use_legacy_and_dynamo_opsets(self):
         from QEfficient.customop.ctx_scatter_gather import (

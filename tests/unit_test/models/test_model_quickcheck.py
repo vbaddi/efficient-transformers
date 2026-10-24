@@ -453,6 +453,40 @@ def test_deepseek_v4_csa_prefill_rotates_indexer_queries_per_chunk():
     assert torch.isfinite(output.logits).all()
 
 
+def test_deepseek_v4_swa_prefill_matches_hf_with_inverse_rope():
+    config = _tiny_deepseek_v4_config()
+    config.num_hidden_layers = 1
+    config.layer_types = ["sliding_attention"]
+    config.mlp_layer_types = ["hash_moe"]
+    config.qeff_swa_prefill_only = True
+    config.sliding_window = 8
+    config.torch_dtype = torch.float32
+
+    torch.manual_seed(0)
+    hf_model = DeepseekV4ForCausalLM(config).eval()
+    qeff_model = QEFFAutoModelForCausalLM(deepcopy(hf_model)).model.eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 8))
+    position_ids = torch.arange(8).unsqueeze(0)
+    hf_cache = DynamicCache(config=config)
+    qeff_cache = qeff_model.get_dummy_pkv_cache(config, batch_size=1, ctx_len=8)
+
+    with torch.no_grad():
+        hf_output = hf_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=hf_cache,
+            use_cache=True,
+        )
+        qeff_output = qeff_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=qeff_cache,
+            use_cache=True,
+        )
+
+    torch.testing.assert_close(qeff_output.logits, hf_output.logits[:, -1:, :], atol=2e-4, rtol=2e-4)
+
+
 def test_deepseek_v4_hca_prefill_preserves_rank_four_compressed_cache():
     config = _tiny_deepseek_v4_config()
     config.num_hidden_layers = 1

@@ -1086,6 +1086,12 @@ class OnnxTransformPipeline(BaseOnnxTransform):
         if AdapterWeightsToInputsTransform in requested:
             applied[AdapterWeightsToInputsTransform] = AdapterWeightsToInputsTransform.apply(model, **kwargs)
 
+        # Model-specific transforms can opt into the full pipeline keyword
+        # arguments without requiring another hard-coded dispatch branch here.
+        for transform in self.transforms:
+            if getattr(transform, "_apply_with_pipeline_kwargs", False):
+                applied[transform] = transform.apply(model, **kwargs)
+
         for t, done in applied.items():
             logger.info(f"Transform '{t.__name__}' applied={done}")
 

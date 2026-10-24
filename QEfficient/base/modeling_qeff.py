@@ -67,8 +67,6 @@ from QEfficient.utils import (
 )
 from QEfficient.utils.checkpoint_utils import checkpoint_root, huggingface_hub_cache_dir
 from QEfficient.utils.config_utils import calculate_num_replicate_kv_heads
-from QEfficient.utils.export_profiler import PROFILER, onnx_graph_stats
-from QEfficient.utils.export_profiler import enabled as export_profiling_enabled
 from QEfficient.utils.export_utils import export_from_compile, export_wrapper
 from QEfficient.utils.logging_utils import (
     QEFFLogger,
@@ -804,10 +802,7 @@ class QEFFBaseModel(ABC):
                 self._offload_model_weights(offload_pt_weights)
             logger.info("PyTorch export successful")
             self.weight_spec_path = str(export_result.weight_spec_path) if export_result.weight_spec_path else None
-            with PROFILER.stage("onnx.load (raw export)") as load_record:
-                model = onnx.load(export_result.onnx_path, load_external_data=False)
-                if export_profiling_enabled():
-                    load_record["onnx"] = onnx_graph_stats(model)
+            model = onnx.load(export_result.onnx_path, load_external_data=False)
 
             excluded_transforms = set(export_result.excluded_onnx_transforms)
             active_transforms = [
@@ -827,8 +822,7 @@ class QEFFBaseModel(ABC):
             transform_kwargs.update(export_result.onnx_transform_kwargs)
 
             onnx_transforms = OnnxTransformPipeline(transforms=active_transforms)
-            with PROFILER.stage("ONNX transform pipeline"):
-                model, transformed = onnx_transforms.apply(model, **transform_kwargs)
+            model, transformed = onnx_transforms.apply(model, **transform_kwargs)
 
             # Keep this strictly layerwise-scoped so regular non-layerwise export
             # remains backward compatible.
@@ -843,13 +837,9 @@ class QEFFBaseModel(ABC):
                 embed_weight_spec_as_metadata(model, export_result.weight_spec_path)
             logger.info("ONNX transforms applied")
 
-            with PROFILER.stage("onnx.save (transformed)") as save_record:
-                if export_profiling_enabled():
-                    save_record["onnx"] = onnx_graph_stats(model)
-                onnx_path_tmp = onnx_path.with_suffix(onnx_path.suffix + ".tmp")
-                onnx.save(model, onnx_path_tmp)
-                onnx_path_tmp.replace(onnx_path)
-            PROFILER.dump(onnx_path.parent / "export_profile.json")
+            onnx_path_tmp = onnx_path.with_suffix(onnx_path.suffix + ".tmp")
+            onnx.save(model, onnx_path_tmp)
+            onnx_path_tmp.replace(onnx_path)
             del model
             gc.collect()
             logger.info("Transformed ONNX saved")
