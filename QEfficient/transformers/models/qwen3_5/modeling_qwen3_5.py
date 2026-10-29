@@ -508,7 +508,7 @@ def qeff_torch_causal_conv1d_update(
                 "Grouped conv_state shape mismatch: "
                 f"hidden_size={hidden_size}, num_kv_heads={num_kv_heads}, conv_group_dim={conv_group_dim}"
             )
-        conv_state_flat = conv_state.reshape(bsz, hidden_size, state_len)
+        conv_state_flat = conv_state.reshape(-1, hidden_size, state_len)
     else:
         conv_state_flat = conv_state
 
@@ -535,8 +535,8 @@ def qeff_torch_causal_conv1d_update(
     gathered_conv_state = torch.gather(hidden_states_new, dim=2, index=ctx_idx)
 
     if grouped_conv_state:
-        shifted_conv_state = shifted_conv_state.reshape(bsz, num_kv_heads, conv_group_dim, state_len)
-        gathered_conv_state = gathered_conv_state.reshape(bsz, num_kv_heads, conv_group_dim, state_len)
+        shifted_conv_state = shifted_conv_state.reshape(-1, num_kv_heads, conv_group_dim, state_len)
+        gathered_conv_state = gathered_conv_state.reshape(-1, num_kv_heads, conv_group_dim, state_len)
     updated_conv_state = torch.where(is_decode, shifted_conv_state, gathered_conv_state)
 
     out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
@@ -646,6 +646,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         self.chunk_gated_delta_rule = self.torch_chunk_gated_delta_rule_qeff
         self.torch_dtype = self.out_proj.weight.dtype
         self.chunk_gated_delta_solver = "tree"
+        self.gdn_prefill_only = False
         chunk_size = int(getattr(self, "gdn_chunk_size", 64) or 64)
         if chunk_size <= 0:
             chunk_size = 64
@@ -684,6 +685,29 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         # eye: identity matrix
         self.register_buffer("_eye", torch.eye(chunk_size), persistent=False)
 
+        # Masks selecting the lower-left block introduced at each level of the
+        # tree merge.  Keeping these at the full chunk shape lets the solver
+        # use a fixed-shape tensor loop instead of a Python list whose blocks
+        # change shape at every level.
+        if chunk_size > 0 and (chunk_size & (chunk_size - 1)) == 0:
+            tree_levels = int(math.log2(chunk_size))
+            tree_merge_masks = []
+            indices = torch.arange(chunk_size)
+            for level in range(tree_levels):
+                block_size = 1 << level
+                span = 2 * block_size
+                relative = indices % span
+                pair = indices // span
+                tree_merge_masks.append(
+                    (relative[:, None] >= block_size)
+                    & (relative[None, :] < block_size)
+                    & (pair[:, None] == pair[None, :])
+                )
+            tree_merge_masks = torch.stack(tree_merge_masks)
+        else:
+            tree_merge_masks = torch.empty(0, chunk_size, chunk_size, dtype=torch.bool)
+        self.register_buffer("_tree_merge_masks", tree_merge_masks, persistent=False)
+
     # TODO: It would be better to use it directly from HF
     def _solve_chunk_attn_original(self, attn: torch.Tensor, mask: torch.Tensor, eye: torch.Tensor, chunk_size: int):
         for i in range(1, chunk_size):
@@ -697,36 +721,19 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             raise ValueError(f"tree solver requires power-of-two chunk_size, got {chunk_size}")
 
         source = attn.masked_fill(mask, 0)
-        # Build the inverse of (I - source) bottom-up from 1x1 unit blocks.
-        # Starting from full chunk_size x chunk_size blocks causes shape mismatches
-        # in the first merge (block_size=1).
-        unit = torch.ones_like(source[..., :1, :1])
-        blocks = [unit for _ in range(chunk_size)]
-        block_size = 1
-
-        while len(blocks) > 1:
-            merged = []
-            for pair in range(0, len(blocks), 2):
-                left = blocks[pair]
-                right = blocks[pair + 1]
-                row0 = pair * block_size
-                row1 = row0 + block_size
-                lower_left = source[..., row1 : row1 + block_size, row0 : row0 + block_size]
-                solved_lower_left = right @ lower_left @ left
-                zeros = torch.zeros_like(left)
-                merged.append(
-                    torch.cat(
-                        [
-                            torch.cat([left, zeros], dim=-1),
-                            torch.cat([solved_lower_left, right], dim=-1),
-                        ],
-                        dim=-2,
-                    )
-                )
-            blocks = merged
-            block_size *= 2
-
-        return blocks[0].to(attn.dtype)
+        merge_masks = self._tree_merge_masks.to(device=source.device)
+        blocks = eye.to(dtype=source.dtype, device=source.device).reshape(1, 1, 1, chunk_size, chunk_size)
+        blocks = blocks.expand_as(source).clone()
+        num_levels = int(math.log2(chunk_size))
+        for level in range(num_levels):
+            # `blocks` is block diagonal.  The selected source entries are the
+            # lower-left coupling for each adjacent pair at this level, so the
+            # full-shape products perform all pair merges in parallel.
+            merge_mask = merge_masks[level]
+            lower_left = source * merge_mask
+            cross = blocks @ lower_left @ blocks
+            blocks = blocks + cross
+        return blocks.to(attn.dtype)
 
     def _solve_chunk_attn_recursive_sns(
         self, attn: torch.Tensor, mask: torch.Tensor, eye: torch.Tensor, chunk_size: int
@@ -871,7 +878,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         query = torch.where(mask.unsqueeze(-1), query, qkv_zeros)
         value = torch.where(mask.unsqueeze(-1), value, qkv_zeros)
 
-        batch_size, num_heads, sequence_length, k_head_dim = key.shape
+        _, num_heads, sequence_length, k_head_dim = key.shape
         v_head_dim = value.shape[-1]
         pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
         # QAIC's LoadPad kernel only supports float32/int32/int64 inputs, so bf16/fp16
@@ -928,11 +935,10 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         value = attn @ v_beta
         k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
 
-        last_recurrent_state = (
-            torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
-            if initial_state is None
-            else initial_state.to(value)
-        )
+        if initial_state is None:
+            last_recurrent_state = torch.zeros_like(value[:, :, :1, :]).expand(-1, -1, k_head_dim, -1).clone()
+        else:
+            last_recurrent_state = initial_state.to(value)
         core_attn_out = torch.zeros_like(value)
         mask = mask_strict
 
@@ -988,11 +994,14 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         gdn_num_head_blocks: int = 1,
         return_cache_states: bool = False,
     ):
-        batch_size, seq_len, _ = hidden_states.shape
+        seq_len = hidden_states.shape[1]
 
         # ── Projections ──────────────────────────────────────
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
+        if batch_fold:
+            z = self.in_proj_z(hidden_states).reshape(-1, 1, self.num_v_heads, self.head_v_dim)
+        else:
+            z = self.in_proj_z(hidden_states).reshape(-1, seq_len, self.num_v_heads, self.head_v_dim)
         beta = self.in_proj_b(hidden_states).sigmoid()
         g = -self.A_log.float().exp() * F.softplus(self.in_proj_a(hidden_states).float() + self.dt_bias)
 
@@ -1037,7 +1046,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                 text_position_ids = position_ids[0] if position_ids.ndim == 3 else position_ids
                 zero_cumsum = torch.cumsum((text_position_ids == 0).to(torch.int32), dim=1)[:, -1:]
                 conv_reset_mask = zero_cumsum.to(dtype=torch.bool, device=conv_state.device).reshape(
-                    conv_state.shape[0], *([1] * (conv_state.ndim - 1))
+                    -1, *([1] * (conv_state.ndim - 1))
                 )
                 # Blend the small reset mask instead of broadcasting it through
                 # a full Select/Where tensor in the folded decode graph.
@@ -1102,9 +1111,14 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         query = mixed_qkv[..., : self.key_dim]
         key = mixed_qkv[..., self.key_dim : 2 * self.key_dim]
         value = mixed_qkv[..., 2 * self.key_dim :]
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        if batch_fold:
+            query = query.reshape(-1, 1, self.num_k_heads, self.head_k_dim)
+            key = key.reshape(-1, 1, self.num_k_heads, self.head_k_dim)
+            value = value.reshape(-1, 1, self.num_v_heads, self.head_v_dim)
+        else:
+            query = query.reshape(-1, seq_len, self.num_k_heads, self.head_k_dim)
+            key = key.reshape(-1, seq_len, self.num_k_heads, self.head_k_dim)
+            value = value.reshape(-1, seq_len, self.num_v_heads, self.head_v_dim)
 
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -1126,14 +1140,6 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             else:
                 # General graphs serve both prefill and decode; select the
                 # matching branch at runtime after export.
-                recurrent_out, recurrent_state_new = recurrent_gdn_decode_forward(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    recurrent_state,
-                )
                 chunk_out, chunk_state = self.chunk_gated_delta_rule(
                     query,
                     key,
@@ -1150,11 +1156,23 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                     ones_lower=self._ones_lower,
                     eye=self._eye,
                 )
-                position_scalar = position_ids.reshape(-1)[0]
-                seq_len_tensor = torch.full_like(position_scalar, hidden_states.shape[1])
-                is_decode = seq_len_tensor == torch.ones_like(seq_len_tensor)
-                core_attn_out = torch.where(is_decode, recurrent_out, chunk_out)
-                last_recurrent_state = torch.where(is_decode, recurrent_state_new, chunk_state)
+                if self.gdn_prefill_only:
+                    core_attn_out = chunk_out
+                    last_recurrent_state = chunk_state
+                else:
+                    recurrent_out, recurrent_state_new = recurrent_gdn_decode_forward(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        recurrent_state,
+                    )
+                    position_scalar = position_ids.reshape(-1)[0]
+                    seq_len_tensor = torch.full_like(position_scalar, hidden_states.shape[1])
+                    is_decode = seq_len_tensor == torch.ones_like(seq_len_tensor)
+                    core_attn_out = torch.where(is_decode, recurrent_out, chunk_out)
+                    last_recurrent_state = torch.where(is_decode, recurrent_state_new, chunk_state)
 
             if batch_index is not None:
                 recurrent_batch_index = batch_index.to(recurrent_state_all.device)
@@ -1192,7 +1210,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
         # ── Output ────────────────────────────────────────────
         core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
-        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1).to(self.out_proj.weight.dtype)
+        core_attn_out = core_attn_out.reshape(z.shape[0], z.shape[1], -1).to(self.out_proj.weight.dtype)
         output = self.out_proj(core_attn_out)
         if return_cache_states:
             return output, updated_conv_state, updated_recurrent_state
@@ -1958,6 +1976,12 @@ class QEffQwen3_5DecoderWrapper(nn.Module):
             cache_batch_index = None
         else:
             cache_batch_index = batch_index
+
+        # Materialize the folded MRoPE layout before entering repeated layer
+        # subfunctions. This prevents Dynamo from representing the logical
+        # batch dimension as aten.sym_stride.
+        if position_ids is not None:
+            position_ids = position_ids.contiguous()
 
         inputs_embeds = self.model.model.get_input_embeddings()(input_ids)
         _, _, channel_size = inputs_embeds.shape

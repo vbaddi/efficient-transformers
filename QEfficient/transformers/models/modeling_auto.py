@@ -1490,6 +1490,7 @@ class QEffCausalLMForTextImageToTextModel(QEFFBaseModel):
                 export_dir=export_dir,
                 offload_pt_weights=offload_pt_weights,
                 use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
+                prefill_only=prefill_only,
             )
 
     def compile(
@@ -4612,6 +4613,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
                 dynamo=dynamo,
                 offload_pt_weights=kwargs.get("offload_pt_weights", True),
+                prefill_only=prefill_only,
             )
 
     def build_prefill_specialization(

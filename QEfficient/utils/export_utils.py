@@ -108,6 +108,7 @@ def convert_dynamic_axes_to_dynamic_shapes(
     dynamic_axes: dict[str, dict[int, str]],
     model_config=None,
     example_inputs=None,
+    static_sequence_length: bool = False,
 ) -> dict[str, Any]:
     """
     Convert ONNX dynamic_axes format to torch.export dynamic_shapes format.
@@ -128,6 +129,13 @@ def convert_dynamic_axes_to_dynamic_shapes(
         Concrete export inputs used to identify dimensions that are statically
         specialized by the traced graph, such as singleton vision axes and
         one-token decode sequence length.
+    static_sequence_length : bool
+        Treat a single observed ``seq_len`` as static. Prefill graphs are
+        compiled for one fixed chunk length, and blocked attention/GDN may
+        legitimately specialize that dimension during tracing. Leaving it
+        dynamic in that case makes ``torch.export`` generate an impossible
+        dynamic-shape constraint and forces the ONNX exporter to retry with
+        ``strict=True``.
 
     Returns
     -------
@@ -159,6 +167,8 @@ def convert_dynamic_axes_to_dynamic_shapes(
     def resolve_dim(dim_name: str):
         if dim_name not in dim_registry:
             if (
+                "seq_len" in dim_name and static_sequence_length and len(observed_dim_values.get(dim_name, ())) == 1
+            ) or (
                 "seq_len" in dim_name
                 and observed_dim_values.get(dim_name) == {1}
                 and model_type
@@ -441,9 +451,25 @@ def export_wrapper(func):
             if dynamic_axes is not None:
                 model_config = getattr(self.model, "config", None)
                 example_inputs = bound_export_args.arguments.get("example_inputs")
-                kwargs["dynamic_shapes"] = convert_dynamic_axes_to_dynamic_shapes(
-                    dynamic_axes, model_config, example_inputs
+                export_kwargs = bound_export_args.arguments.get("export_kwargs", {})
+                prefill_only = (
+                    bound_export_args.arguments.get("prefill_only") is True
+                    or isinstance(export_kwargs, dict)
+                    and export_kwargs.get("prefill_only") is True
                 )
+                kwargs["dynamic_shapes"] = convert_dynamic_axes_to_dynamic_shapes(
+                    dynamic_axes,
+                    model_config,
+                    example_inputs,
+                    static_sequence_length=prefill_only,
+                )
+                # ``prefill_only`` is a QEff compile/export option, not a
+                # torch.onnx.export option. Keep it only for decorated
+                # methods that explicitly consume it (for example the
+                # layerwise path); the base _export method receives it via
+                # **export_kwargs and must not forward it to PyTorch.
+                if "prefill_only" not in inspect.signature(func).parameters:
+                    kwargs.pop("prefill_only", None)
 
         # Cache probe flag (used for layerwise inspection runs)
         cache_probe = kwargs.pop("_layerwise_cache_probe", False)

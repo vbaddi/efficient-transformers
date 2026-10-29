@@ -5,6 +5,7 @@
 #
 # -----------------------------------------------------------------------------
 
+import onnxscript
 import torch
 
 from QEfficient.customop.ctx_scatter_gather import (
@@ -26,6 +27,25 @@ from QEfficient.customop.ctx_scatter_gather_cb import (
 )
 from QEfficient.customop.onnxscript_utils import get_dynamo_onnxscript_func
 from QEfficient.customop.rms_norm import CustomRMSNorm
+from QEfficient.utils import constants
+
+_default_ops = getattr(onnxscript, f"opset{constants.ONNX_DYNAMO_EXPORT_OPSET}")
+
+
+@onnxscript.script(onnxscript.values.Opset("", constants.ONNX_DYNAMO_EXPORT_OPSET))
+def SymStrideAsBatch(value: onnxscript.INT64, dim: int) -> onnxscript.INT64:
+    """Lower Qwen MRoPE stride-0 batch reads to a shape read.
+
+    Qwen's folded decode position tensor has shape [4, batch, seq] and a
+    contiguous stride-0 equal to ``batch``. The dynamo exporter represents
+    that equivalent value as aten.sym_stride, which has no ONNX lowering.
+    This translation is intentionally tied to the folded MRoPE layout.
+    """
+    return _default_ops.Gather(
+        _default_ops.Shape(value),
+        _default_ops.Constant(value_int=1),
+        axis=0,
+    )
 
 
 @torch.library.custom_op("qefficient::rms_norm", mutates_args=())
@@ -417,6 +437,7 @@ def _(data: torch.Tensor, position_ids: torch.Tensor, updates: torch.Tensor) -> 
 # ---------------------------------------------------------------------------
 
 DYNAMO_CUSTOM_OP_TABLE = {
+    torch.ops.aten.sym_stride.int: SymStrideAsBatch,
     torch.ops.qefficient.rms_norm.default: get_dynamo_onnxscript_func(CustomRMSNorm),
     torch.ops.qefficient.ctx_scatter.default: get_dynamo_onnxscript_func(CtxScatter),
     torch.ops.qefficient.ctx_scatter_3d.default: get_dynamo_onnxscript_func(CtxScatter3D),

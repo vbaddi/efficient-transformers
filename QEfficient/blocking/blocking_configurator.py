@@ -430,9 +430,11 @@ def build_transformer_blocking_config_for_transform(
 
 
 def build_gated_delta_config_for_transform(
-    seq_len: Optional[int] = None, qaic_config: Optional[dict] = None
+    seq_len: Optional[int] = None,
+    qaic_config: Optional[dict] = None,
+    *,
+    prefill_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    del seq_len
     if not qaic_config:
         return None
 
@@ -446,5 +448,8 @@ def build_gated_delta_config_for_transform(
 
     if qaic_config.get("gdn_full_state_update") is True:
         gated_delta_config["full_state_update"] = True
+
+    if prefill_only:
+        gated_delta_config["prefill_only"] = True
 
     return gated_delta_config or None

@@ -1543,7 +1543,8 @@ class BlockingAttentionTransform:
         model_architectures = getattr(model_config, "architectures", None) or []
         supported_attention_classes = {
             qeff_class
-            for qeff_class in KVCacheTransform._module_mapping.values()
+            for transform in (KVCacheTransform, PrefillOnlyTransform, PrefillOnlyChunkedTransform)
+            for qeff_class in transform._module_mapping.values()
             if qeff_class.__name__.endswith("Attention")
         }
         supported_attention_classes.add(QEffPrefillOnlyChunkedGptOssAttention)
@@ -1564,6 +1565,8 @@ class GatedDeltaConfigTransform:
     def apply(cls, model: nn.Module, gated_delta_config: dict | None = None) -> tuple[nn.Module, bool]:
         gated_delta_config = gated_delta_config or {}
         full_state_update = bool(gated_delta_config.get("full_state_update", False))
+        prefill_only = bool(gated_delta_config.get("prefill_only", False))
+        transformed = False
         target_modules = [module for module in model.modules() if hasattr(module, "torch_chunk_gated_delta_rule_qeff")]
         full_state_targets = [module for module in target_modules if hasattr(module, "gdn_full_state_update")]
         if full_state_update and not full_state_targets:
@@ -1574,12 +1577,14 @@ class GatedDeltaConfigTransform:
         if not gated_delta_config:
             # Preserve the legacy chunk-size reset and independently clear the
             # model-specific full-state mode between prefill/decode compiles.
-            transformed = False
             for module in target_modules:
                 if getattr(module, "gdn_chunk_size", 64) != 64:
                     module.gdn_chunk_size = 64
                     if hasattr(module, "__qeff_init__"):
                         module.__qeff_init__()
+                    transformed = True
+                if getattr(module, "gdn_prefill_only", False):
+                    module.gdn_prefill_only = False
                     transformed = True
             for module in full_state_targets:
                 if bool(module.gdn_full_state_update):
@@ -1590,7 +1595,6 @@ class GatedDeltaConfigTransform:
         chunk_size = gated_delta_config.get("chunk_size")
         chunk_size = int(chunk_size) if chunk_size is not None else None
 
-        transformed = False
         for module in target_modules:
             if chunk_size is not None and chunk_size > 0:
                 module.gdn_chunk_size = chunk_size
@@ -1601,6 +1605,10 @@ class GatedDeltaConfigTransform:
             if full_state_update or bool(module.gdn_full_state_update) != full_state_update:
                 transformed = True
             module.gdn_full_state_update = full_state_update
+        for module in target_modules:
+            if getattr(module, "gdn_prefill_only", False) != prefill_only:
+                module.gdn_prefill_only = prefill_only
+                transformed = True
 
         return model, transformed
 

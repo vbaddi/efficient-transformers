@@ -165,7 +165,7 @@ def blocked_gdn_decode_forward(
     head dimensions for each block, keeping recurrent-state contractions local.
     """
     dtype = query.dtype
-    batch_size, sequence_length, num_heads, key_head_dim = query.shape
+    _, sequence_length, num_heads, key_head_dim = query.shape
     value_head_dim = value.shape[-1]
 
     if sequence_length != 1:
@@ -192,14 +192,16 @@ def blocked_gdn_decode_forward(
             break
         head_end = min(head_start + heads_per_block, num_heads)
         block_heads = head_end - head_start
-        folded_batch_heads = batch_size * block_heads
-
-        q_block = q[:, :, head_start:head_end].reshape(1, folded_batch_heads, sequence_length, key_head_dim)
-        k_block = k[:, :, head_start:head_end].reshape(1, folded_batch_heads, sequence_length, key_head_dim)
-        v_block = v[:, :, head_start:head_end].reshape(1, folded_batch_heads, sequence_length, value_head_dim)
-        beta_block = b[:, :, head_start:head_end].reshape(1, folded_batch_heads, sequence_length, 1)
-        decay_block = decay[:, :, head_start:head_end].reshape(1, folded_batch_heads, 1, 1)
-        state_block = state[:, head_start:head_end].reshape(1, folded_batch_heads, key_head_dim, value_head_dim)
+        # Infer the folded batch/head dimension from the sliced tensors. Using
+        # batch_size * block_heads here can become aten.sym_stride inside a
+        # repeated Dynamo subfunction when the batch symbol is tied to an
+        # expanded position-id tensor; QAIC does not lower that op.
+        q_block = q[:, :, head_start:head_end].reshape(1, -1, sequence_length, key_head_dim)
+        k_block = k[:, :, head_start:head_end].reshape(1, -1, sequence_length, key_head_dim)
+        v_block = v[:, :, head_start:head_end].reshape(1, -1, sequence_length, value_head_dim)
+        beta_block = b[:, :, head_start:head_end].reshape(1, -1, sequence_length, 1)
+        decay_block = decay[:, :, head_start:head_end].reshape(1, -1, 1, 1)
+        state_block = state[:, head_start:head_end].reshape(1, -1, key_head_dim, value_head_dim)
 
         decayed_state = state_block * decay_block
         kv_memory = torch.matmul(k_block, decayed_state)
@@ -207,10 +209,10 @@ def blocked_gdn_decode_forward(
         updated_state = decayed_state + k_block[:, :, 0].unsqueeze(-1) * delta[:, :, 0].unsqueeze(-2)
         block_output = torch.matmul(q_block, updated_state)
 
-        output_blocks.append(block_output.reshape(batch_size, block_heads, sequence_length, value_head_dim))
-        state_blocks.append(updated_state.reshape(batch_size, block_heads, key_head_dim, value_head_dim))
+        output_blocks.append(block_output.reshape(-1, block_heads, sequence_length, value_head_dim))
+        state_blocks.append(updated_state.reshape(-1, block_heads, key_head_dim, value_head_dim))
 
-    output = torch.cat(output_blocks, dim=1).reshape(batch_size, sequence_length, num_heads, value_head_dim)
+    output = torch.cat(output_blocks, dim=1).reshape(-1, sequence_length, num_heads, value_head_dim)
     updated_state = torch.cat(state_blocks, dim=1)
     return output.to(dtype), updated_state.to(recurrent_state.dtype)
 
@@ -371,6 +373,7 @@ def generic_blocked_attention_interface(
     mla_kwargs: Optional[Dict[str, Any]] = None,
     is_mla: bool = False,
     prefill_only: bool = False,
+    skip_kv: Optional[bool] = None,
     **kwargs,
 ):
     blocking_mode = BlockingMode.resolve(blocking_config.mode)
@@ -486,7 +489,7 @@ def generic_blocked_attention_interface(
         configured_split=blocking_config.headpar_split,
         ctx_len=blocking_config.ctx_len,
         kv_block_unroll=blocking_config.kv_block_unroll,
-        skip_kv=blocking_config.skip_kv or False,
+        skip_kv=(blocking_config.skip_kv or False) if skip_kv is None else skip_kv,
         paged_attention=blocking_config.paged_attention,
         # prefill-specific
         n_rep_chunk=blocking_config.n_rep_chunk,
